@@ -35,6 +35,12 @@ function serial<T>(state: SharedState, operation: () => Promise<T>): Promise<T> 
   return result
 }
 
+/** 角色 preset 的租用句柄；release 由 RunManager 在运行结束时调用。 */
+export interface DetailedRolePresetHandle extends RolePresetHandle {
+  /** 组合里的插件包名（按声明顺序），供 AgentTrace 记录当时真实选用的组合。 */
+  plugins: string[]
+}
+
 /**
  * 节点开始前 acquire，最后一个节点完成后注销动态声明。
  * 服务缺失、角色缺失或组合损坏都明确失败，不退回宽权限 preset。
@@ -52,7 +58,7 @@ export class DshRolePresets implements RolePresets {
     return new DshRolePresets(this.ctx, { profiles })
   }
 
-  async acquire(space: SpaceHandle, role: string, variant: Variant): Promise<RolePresetHandle> {
+  async acquire(space: SpaceHandle, role: string, variant: Variant): Promise<DetailedRolePresetHandle> {
     if (variant.allowBash) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', 'P0 角色不支持 shell（allowBash）')
     const registry = this.ctx?.get<Registry>('agentPresets')
     if (registry === undefined || typeof registry.list !== 'function') {
@@ -81,6 +87,7 @@ export class DshRolePresets implements RolePresets {
         instructions: profile.instructions, skills: [...profile.skills], readOnly: variant.readOnly,
       } },
     ]
+    const pluginNames = plugins.map((plugin) => String((plugin as { name: string }).name))
     const cfgHash = hash({ profile, plugins, variant })
     const id = `takt-${hash(space.root)}-${role}-${cfgHash}`
     let state = sharedOwners.get(this.ctx!)
@@ -109,8 +116,8 @@ export class DshRolePresets implements RolePresets {
       }
     })
     let released: Promise<void> | undefined
-    return {
-      id, cfgHash,
+    const handle: DetailedRolePresetHandle = {
+      id, cfgHash, plugins: pluginNames,
       // 冻结接口允许返回 void；实际返回 Promise，执行器等待注销完成。
       release: () => {
         if (released !== undefined) return released
@@ -126,6 +133,7 @@ export class DshRolePresets implements RolePresets {
         return released
       },
     }
+    return handle
   }
 }
 

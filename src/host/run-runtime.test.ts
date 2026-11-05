@@ -96,6 +96,10 @@ it('空间同名角色覆盖默认档案，并进入运行冻结', async () => {
     writeScope: ['custom/**'],
     allowBash: false,
   })
+  // 来源在开始时冻结：默认角色 bundled，空间同名覆盖为 space。
+  expect(before.profileSources.dev).toBe('bundled')
+  expect(after.profileSources.dev).toBe('space')
+  expect(after.profileSources.analyst).toBe('bundled')
   // 运行开始时冻结：之后改磁盘不影响已加载的 runtime。
   await writeFile(join(root, 'takt.config.json'), JSON.stringify({ ...stores.config, contextBudgetTokens: 4321 }))
   expect(after.space.stores.config.contextBudgetTokens).not.toBe(4321)

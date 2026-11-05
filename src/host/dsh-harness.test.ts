@@ -2,8 +2,9 @@ import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { HarnessEvent, HarnessRequest } from '@taktflow/core'
-import type { Agent, SubagentActivation, SubagentActivationSpec, SubagentResult } from './dsh-types.js'
+import type { AgentProfile, HarnessEvent, HarnessRequest } from '@taktflow/core'
+import type { AgentTraceHandle, AgentTraceHub, AgentTraceOutcome, AgentTraceStart } from './agent-trace.js'
+import type { Agent, SessionEvent, SubagentActivation, SubagentActivationSpec, SubagentResult } from './dsh-types.js'
 import { createDshHarness, type DshHarnessDeps } from './dsh-harness.js'
 import { FakeHostContext } from './testing/fake-ctx.js'
 import type { PermissionScope, SpaceHandle } from './types.js'
@@ -15,11 +16,41 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+function traceSpy() {
+  const starts: AgentTraceStart[] = []
+  const outcomes: AgentTraceOutcome[] = []
+  const events: SessionEvent[] = []
+  const handle = {
+    running: vi.fn((_model?: string, _effort?: string) => {}),
+    sessionEvent: vi.fn((event: SessionEvent) => { events.push(event) }),
+    denial: vi.fn(),
+    finish: vi.fn(async (outcome: AgentTraceOutcome) => { outcomes.push(outcome) }),
+    dispose: vi.fn(async () => {}),
+  } satisfies AgentTraceHandle
+  const begin = vi.fn(async (_space: SpaceHandle, input: AgentTraceStart) => {
+    starts.push(input)
+    return handle
+  })
+  const hub = { begin, read: vi.fn(), recordDenial: vi.fn(), disposeAll: vi.fn() } as unknown as AgentTraceHub
+  return { hub, begin, handle, starts, outcomes, events }
+}
+
+const devProfile: AgentProfile = {
+  role: 'dev',
+  title: '开发',
+  description: '负责实现',
+  instructions: '实现需求',
+  harness: { harness: 'dsh-host' },
+  skills: ['coding'],
+  writeScope: ['out/**'],
+  allowBash: false,
+}
+
 let root: string
 beforeEach(async () => { root = await realpath(await mkdtemp(path.join(tmpdir(), 'takt-dsh-harness-'))) })
 afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
-function fixture() {
+function fixture(options: { trace?: boolean } = {}) {
   const ctx = new FakeHostContext()
   const calls: string[] = []
   const permissions = new Map<string, PermissionScope>()
@@ -28,11 +59,13 @@ function fixture() {
   const releasePreset = vi.fn(async () => { calls.push('release-preset') })
   const acquire = vi.fn(async () => {
     calls.push('preset')
-    return { id: 'role-preset', cfgHash: 'abcdef12', release: releasePreset }
+    return { id: 'role-preset', cfgHash: 'abcdef12', plugins: ['persona', 'tool-fs'], release: releasePreset }
   })
   const space = { root, stores: { runs: { get: async () => ({ requirementId: 'REQ-1', nodes: { build: { attempts: 2 } } }) } } } as unknown as SpaceHandle
+  const traces = options.trace === true ? traceSpy() : undefined
   const deps: DshHarnessDeps = {
     ctx, space, ownerSessionId: parent.id, presets: { acquire }, queueIntervalMs: 1,
+    ...(traces === undefined ? {} : { traces: traces.hub, profiles: { dev: devProfile }, profileSources: { dev: 'space' } }),
     permissions: {
       register: (scope) => {
         calls.push('register')
@@ -53,7 +86,7 @@ function fixture() {
   })
   const req: HarnessRequest = { prompt: '任务', cwd: root, env: { TAKT_ROLE: 'dev', TAKT_RUN_ID: 'run-1', TAKT_NODE: 'build', TAKT_REQ: 'REQ-1' }, tools: { writeScope: ['out/**'] } }
   const events: HarnessEvent[] = []
-  return { ctx, calls, permissions, parent, acquire, releasePreset, deps, dispose, req, events, run: () => createDshHarness(deps).run(req, (event) => events.push(event)) }
+  return { ctx, calls, permissions, parent, acquire, releasePreset, deps, dispose, req, events, traces, run: () => createDshHarness(deps).run(req, (event) => events.push(event)) }
 }
 
 describe('dsh-host 节点生命周期', () => {
@@ -106,7 +139,7 @@ describe('dsh-host 节点生命周期', () => {
     const f = fixture()
     const controller = new AbortController()
     f.req.signal = controller.signal
-    f.acquire.mockImplementationOnce(async () => { controller.abort(new Error('取消')); return { id: 'preset', cfgHash: 'hash', release: f.releasePreset } })
+    f.acquire.mockImplementationOnce(async () => { controller.abort(new Error('取消')); return { id: 'preset', cfgHash: 'hash', plugins: [], release: f.releasePreset } })
     await expect(f.run()).rejects.toThrow('取消')
     expect(f.ctx.subagents.startActivation).not.toHaveBeenCalled()
     expect(f.permissions.size).toBe(0)
@@ -254,5 +287,156 @@ describe('dsh-host 节点生命周期', () => {
     f.req.tools.allowBash = false
     f.req.cwd = tmpdir()
     await expect(f.run()).rejects.toMatchObject({ code: 'TAKT_SPACE_ROOT_MISMATCH' })
+  })
+})
+
+describe('dsh-host 追溯接线', () => {
+  it('启动前订阅会话事件，记录冻结的 preset/profile/prompt 和真实 model/effort', async () => {
+    const f = fixture({ trace: true })
+    const trace = f.traces!
+    const captured: Array<(...args: never[]) => void> = []
+    let listenersAtStart = 0
+    let childId = ''
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
+      childId = spec.childId!
+      listenersAtStart = f.ctx.listeners.filter((entry) => entry.event === 'session/event').length
+      captured.push(...f.ctx.listeners.filter((entry) => entry.event === 'session/event').map((entry) => entry.listener))
+      const child: Agent = {
+        id: spec.childId!, options: { provider: 'local', model: 'model-x', reasoningEffort: 'high' },
+        session: { header: { id: spec.childId!, cwd: root } }, followup() {}, inject() {},
+      }
+      f.ctx.agents.get = (id) => id === spec.childId ? child : f.parent
+      return {
+        childId: spec.childId!,
+        result: Promise.resolve({ output: [{ type: 'text', text: 'done' }], stopReason: 'completed' }),
+        dispose: f.dispose,
+      }
+    })
+
+    await f.run()
+    expect(listenersAtStart).toBe(1)
+    expect(trace.begin).toHaveBeenCalledOnce()
+    const input = trace.starts[0]!
+    expect(input).toMatchObject({
+      runId: 'run-1', nodeId: 'build', attempt: 2, role: 'dev', label: 'REQ-1/build#2', prompt: '任务',
+    })
+    expect(input.sessionId).toBe(childId)
+    expect(input.preset).toEqual({ id: 'role-preset', cfgHash: 'abcdef12', plugins: ['persona', 'tool-fs'] })
+    expect(input.profile).toMatchObject({ title: '开发', description: '负责实现', skills: ['coding'], writeScope: ['out/**'], source: 'space' })
+    expect(trace.handle.running).toHaveBeenCalledWith('model-x', 'high')
+    expect(trace.outcomes[0]).toMatchObject({ status: 'completed', stopReason: 'completed', finalText: 'done' })
+
+    const notify = captured[0] as unknown as (session: { id?: string }, event: SessionEvent) => void
+    const event: SessionEvent = { type: 'tool/call', seq: 1, time: 1_000, data: { callId: 'call-1', name: 'read', arguments: '{}' } }
+    notify({ id: childId }, event)
+    notify({ id: 'other-child' }, event)
+    expect(trace.handle.sessionEvent).toHaveBeenCalledTimes(1)
+    expect(trace.handle.dispose).toHaveBeenCalledOnce()
+    // 运行结束后订阅必须注销，不能留下监听器。
+    expect(f.ctx.listeners.filter((entry) => entry.event === 'session/event')).toHaveLength(0)
+  })
+
+  it('启动失败写 failed，不伪造 completed', async () => {
+    const f = fixture({ trace: true })
+    f.ctx.subagents.startActivation = async () => { throw new Error('启动失败') }
+    await expect(f.run()).rejects.toThrow('启动失败')
+    expect(f.traces!.outcomes[0]).toMatchObject({ status: 'failed', error: '启动失败' })
+    expect(f.traces!.handle.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('取消写 cancelled，保留取消原因', async () => {
+    const f = fixture({ trace: true })
+    const controller = new AbortController()
+    f.req.signal = controller.signal
+    const result = deferred<SubagentResult>()
+    const started = deferred<void>()
+    f.ctx.subagents.startActivation = async (spec) => ({
+      childId: spec.childId!, result: result.promise,
+      dispose: vi.fn(async () => { result.resolve({ output: [], stopReason: 'aborted' }) }),
+    })
+    const running = createDshHarness(f.deps).run(f.req, (event) => { if (event.type === 'started') started.resolve() })
+    const rejection = expect(running).rejects.toThrow('运行取消')
+    await started.promise
+    controller.abort(new Error('运行取消'))
+    await rejection
+    expect(f.traces!.outcomes[0]).toMatchObject({ status: 'cancelled', error: '运行取消' })
+  })
+
+  it('清理失败把终态改成 failed 并带清理原因', async () => {
+    const f = fixture({ trace: true })
+    f.dispose.mockRejectedValueOnce(new Error('无法停止 child'))
+    const harness = createDshHarness(f.deps)
+    await expect(harness.run(f.req, () => {})).rejects.toThrow('无法停止 child')
+    expect(f.traces!.outcomes[0]).toMatchObject({ status: 'failed' })
+    expect(f.traces!.outcomes[0]!.error).toContain('清理失败：无法停止 child')
+    await expect(harness.drain()).rejects.toThrow('资源清理失败')
+  })
+
+  it('取消后清理失败仍写 cancelled，并保留清理原因', async () => {
+    const f = fixture({ trace: true })
+    const controller = new AbortController()
+    f.req.signal = controller.signal
+    const result = deferred<SubagentResult>()
+    const started = deferred<void>()
+    f.ctx.subagents.startActivation = async (spec) => ({
+      childId: spec.childId!, result: result.promise,
+      dispose: vi.fn(async () => {
+        result.resolve({ output: [{ type: 'text', text: '已停止' }], stopReason: 'aborted' })
+        throw new Error('停止后清理失败')
+      }),
+    })
+    const running = createDshHarness(f.deps).run(f.req, (event) => { if (event.type === 'started') started.resolve() })
+    const rejection = expect(running).rejects.toThrow('停止后清理失败')
+    await started.promise
+    controller.abort(new Error('运行取消'))
+    await rejection
+    expect(f.traces!.outcomes[0]).toMatchObject({ status: 'cancelled', finalText: '已停止' })
+    expect(f.traces!.outcomes[0]!.error).toContain('运行取消；清理失败：停止后清理失败')
+  })
+
+  it('追溯最终刷新失败时用 failed 终态重试一次，并向引擎传播写盘错误', async () => {
+    const f = fixture({ trace: true })
+    f.traces!.handle.finish.mockRejectedValueOnce(new Error('追溯写盘失败'))
+    const harness = createDshHarness(f.deps)
+    await expect(harness.run(f.req, () => {})).rejects.toThrow('追溯写盘失败')
+    expect(f.traces!.handle.finish).toHaveBeenCalledTimes(2)
+    expect(f.traces!.outcomes.at(-1)).toMatchObject({ status: 'failed' })
+    expect(f.traces!.outcomes.at(-1)!.error).toContain('追溯记录写入失败：追溯写盘失败')
+    await expect(harness.drain()).rejects.toThrow('资源清理失败')
+  })
+
+  it('begin 带上本次请求与冻结 provider 的密钥，仅用于内存脱敏', async () => {
+    const f = fixture({ trace: true })
+    f.req.env = { ...f.req.env, TAKT_TEST_API_KEY: 'harness-env-secret' }
+    const space = f.deps.space as unknown as { stores: { config?: Record<string, unknown> } }
+    space.stores.config = {
+      providers: { local: { protocol: 'openai-chat', headers: { authorization: 'Bearer provider-config-secret' } } },
+    }
+    await f.run()
+    const secrets = f.traces!.starts[0]!.secrets ?? []
+    expect(secrets).toContain('harness-env-secret')
+    expect(secrets).toContain('provider-config-secret')
+    // 密钥只随 begin 进入内存，不能出现在记录输入以外的持久化字段。
+    expect(JSON.stringify(f.traces!.starts[0]!.prompt)).not.toContain('harness-env-secret')
+  })
+
+  it('追溯 begin 失败不启动子 Agent，并释放权限和 preset', async () => {
+    const f = fixture({ trace: true })
+    f.traces!.begin.mockRejectedValueOnce(new Error('追溯写入失败'))
+    await expect(f.run()).rejects.toThrow('追溯写入失败')
+    expect(f.ctx.subagents.startActivation).not.toHaveBeenCalled()
+    expect(f.permissions.size).toBe(0)
+    expect(f.releasePreset).toHaveBeenCalledOnce()
+  })
+
+  it('缺少冻结 profile 或来源时明确失败，不按角色名猜测', async () => {
+    const f = fixture({ trace: true })
+    f.deps.profileSources = {}
+    await expect(f.run()).rejects.toThrow('追溯缺少冻结的角色来源')
+    expect(f.ctx.subagents.startActivation).not.toHaveBeenCalled()
+
+    f.deps.profileSources = { dev: 'space' }
+    f.deps.profiles = {}
+    await expect(f.run()).rejects.toThrow('追溯缺少角色档案')
   })
 })

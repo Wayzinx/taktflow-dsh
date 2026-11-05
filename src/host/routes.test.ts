@@ -13,11 +13,13 @@ import {
   type WorkflowDefinition,
 } from '@taktflow/core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { AgentTraceHub, bindAgentTraceHub, type AgentTraceReader } from './agent-trace.js'
 import { ApprovalInputError } from './approvals.js'
-import { WRITE_OPS, registerRoutes } from './routes.js'
+import { WRITE_OPS, registerRoutes, type RoutesService } from './routes.js'
 import { FakeHostContext } from './testing/fake-ctx.js'
 import {
   TaktToolError,
+  type AgentTrace,
   type Approvals,
   type Bindings,
   type Notifier,
@@ -27,7 +29,6 @@ import {
   type RunManager,
   type SpaceHandle,
   type SpaceRegistry,
-  type TaktflowService,
   type WorkflowCatalog,
 } from './types.js'
 
@@ -52,10 +53,11 @@ interface Fixture {
   space: SpaceHandle
   stores: ProjectStores
   requirementId: string
-  service: TaktflowService
+  service: RoutesService
   ownership: Ownership & { ensureLease: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }
   runs: RunManager & { start: ReturnType<typeof vi.fn>; cancel: ReturnType<typeof vi.fn> }
   approvals: Approvals & { answer: ReturnType<typeof vi.fn>; present: ReturnType<typeof vi.fn> }
+  readTraces: ReturnType<typeof vi.fn>
 }
 
 async function makeFixture(): Promise<Fixture> {
@@ -121,7 +123,8 @@ async function makeFixture(): Promise<Fixture> {
     bySession: vi.fn(async () => undefined),
   } satisfies Bindings
 
-  const service: TaktflowService = {
+  const readTraces = vi.fn(async (): Promise<AgentTrace[]> => [])
+  const service: RoutesService = {
     spaces: registry,
     ownership,
     runs,
@@ -131,13 +134,14 @@ async function makeFixture(): Promise<Fixture> {
     approvals,
     notifier: { attach: async () => {}, detach: async () => {} } satisfies Notifier,
     workflows: { ids: () => [], load: async () => { throw new Error('no workflow') } } satisfies WorkflowCatalog,
+    traces: { read: readTraces } satisfies AgentTraceReader,
   }
 
   const host = new FakeHostContext()
   hosts.push(host)
   registerRoutes(host, service, { user: '面板用户' })
 
-  return { host, space, stores, requirementId: requirement.id, service, ownership, runs, approvals }
+  return { host, space, stores, requirementId: requirement.id, service, ownership, runs, approvals, readTraces }
 }
 
 function route(host: FakeHostContext, path: string) {
@@ -197,6 +201,24 @@ async function createRun(stores: ProjectStores, requirementId: string): Promise<
   return runId
 }
 
+function sampleTrace(runId: string): AgentTrace {
+  return {
+    runId,
+    nodeId: 'design',
+    attempt: 1,
+    label: 'REQ-1/design#1',
+    role: 'architect',
+    sessionId: 'child-1',
+    status: 'running',
+    startedAt: '2026-01-01T00:00:00.000Z',
+    preset: { id: 'takt-preset', cfgHash: 'abc12345', plugins: ['persona', 'tool-fs'] },
+    profile: { title: '架构师', description: '负责设计', skills: ['design'], writeScope: ['design/**'], readOnly: false, source: 'space' },
+    prompt: '输出设计',
+    tools: [{ name: 'read', summary: 'docs/requirement.md', ok: true, at: '2026-01-01T00:00:01.000Z', durationMs: 2 }],
+    denials: [{ tool: 'write', path: 'other/outside.txt', reason: '不在写入范围内', at: '2026-01-01T00:00:02.000Z' }],
+  }
+}
+
 /**
  * 用真实 EventStore 的 subscribe 包装一层 spy：返回的 unsubscribe 也是 spy。
  *
@@ -250,6 +272,7 @@ describe('registerRoutes：路由与读操作', () => {
       '/api/taktflow',
       '/api/taktflow.op',
       '/api/taktflow.stream',
+      '/api/taktflow.agents',
     ]))
 
     const response = await route(host, '/api/taktflow.ping').fetch(new Request('http://localhost/api/taktflow.ping'))
@@ -312,6 +335,53 @@ describe('registerRoutes：路由与读操作', () => {
     const { status, body } = await getJson(host, '/api/taktflow', { space: space.root, p: 'not-a-read-op' })
     expect(status).toBe(400)
     expect(body.error.message).toContain('未知读操作')
+  })
+
+  it('追溯路由：返回指定运行/节点的记录，并原样带出最新状态', async () => {
+    const { host, space, stores, requirementId, readTraces } = await makeFixture()
+    const runId = await createRun(stores, requirementId)
+    const trace = sampleTrace(runId)
+    readTraces.mockResolvedValue([trace])
+
+    const all = await getJson(host, '/api/taktflow.agents', { space: space.root, run: runId })
+    expect(all).toEqual({ status: 200, body: { ok: true, data: [trace] } })
+    expect(readTraces).toHaveBeenCalledWith(space, runId, undefined)
+
+    const one = await getJson(host, '/api/taktflow.agents', { space: space.root, run: runId, node: 'design' })
+    expect(one).toEqual({ status: 200, body: { ok: true, data: [trace] } })
+    expect(readTraces).toHaveBeenLastCalledWith(space, runId, 'design')
+  })
+
+  it('追溯路由：未显式注入 traces 时按权限登记表取回 RunManager 的追溯中心', async () => {
+    const { host, space, stores, requirementId, service } = await makeFixture()
+    const runId = await createRun(stores, requirementId)
+    const traces = new AgentTraceHub({ throttleMs: 5_000, log: () => {} })
+    bindAgentTraceHub(service.permissions, traces)
+    delete (service as { traces?: AgentTraceReader }).traces
+    const handle = await traces.begin(space, {
+      runId, nodeId: 'design', attempt: 1, label: 'REQ/design#1', role: 'architect', sessionId: 'child-trace',
+      preset: { id: 'preset', cfgHash: 'hash', plugins: [] },
+      profile: { title: '架构师', description: '设计', skills: [], writeScope: ['design/**'], readOnly: false, source: 'space' },
+      prompt: '输出设计',
+    })
+    await handle.finish({ status: 'completed', stopReason: 'completed' })
+    const response = await getJson(host, '/api/taktflow.agents', { space: space.root, run: runId })
+    expect(response.status).toBe(200)
+    expect(response.body.data).toHaveLength(1)
+    expect(response.body.data[0]).toMatchObject({ runId, nodeId: 'design', status: 'completed' })
+    await handle.dispose()
+    await traces.disposeAll()
+  })
+
+  it('追溯路由：space/run/node 校验失败 400，运行不存在 404', async () => {
+    const { host, space, stores, requirementId } = await makeFixture()
+    const runId = await createRun(stores, requirementId)
+
+    expect((await getJson(host, '/api/taktflow.agents', { run: runId })).status).toBe(400)
+    expect((await getJson(host, '/api/taktflow.agents', { space: space.root })).status).toBe(400)
+    expect((await getJson(host, '/api/taktflow.agents', { space: space.root, run: '../run' })).status).toBe(400)
+    expect((await getJson(host, '/api/taktflow.agents', { space: space.root, run: runId, node: '..' })).status).toBe(400)
+    expect((await getJson(host, '/api/taktflow.agents', { space: space.root, run: 'run-missing' })).status).toBe(404)
   })
 })
 

@@ -3,6 +3,8 @@ import { userInfo } from 'node:os'
 import path from 'node:path'
 import {
   AttentionAlreadyAnsweredError,
+  assertNodeId,
+  assertRunId,
   createInsights,
   type Actor,
   type EventEnvelope,
@@ -17,9 +19,13 @@ import {
   type WriteLease,
 } from '@taktflow/server'
 import { VERSION } from '../version.js'
+import { agentTraceHubFor, type AgentTraceReader } from './agent-trace.js'
 import { ApprovalInputError } from './approvals.js'
 import type { HostContext } from './dsh-types.js'
-import { TaktToolError, type SpaceHandle, type SpaceRegistry, type TaktflowService } from './types.js'
+import { TaktToolError, type AgentTrace, type SpaceHandle, type SpaceRegistry, type TaktflowService } from './types.js'
+
+/** 路由可用的服务面；追溯是阶段 3 增量，旧测试替身可以不带。 */
+export type RoutesService = TaktflowService & { traces?: AgentTraceReader }
 
 /** ping 的响应体；S4 与客户端面板都用它确认宿主半已加载。 */
 export interface PingPayload {
@@ -153,6 +159,17 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
         fetch: (request) => handleStream(request, service, core, active, shutdown.signal),
       }),
     'taktflow stream route',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/taktflow.agents',
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: (request) => handleAgents(request, service),
+      }),
+    'taktflow agents route',
   )
 }
 
@@ -558,6 +575,38 @@ async function handleSession(request: Request, service: TaktflowService, ctx: Ho
     }
     const data: SessionInfo = candidates.length === 1 ? { space: candidates[0]!.root } : {}
     return json({ ok: true, data })
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
+
+/**
+ * `GET /api/taktflow.agents?space=&run=[&node=]`：一次运行（或单个节点）的子 Agent 追溯。
+ *
+ * 空间与现有读路由一致，只接受已注册的根；run/node 先做与写盘相同的路径校验，
+ * 非法值返回 400，运行不存在返回 404。运行中的记录由追溯中心合并最新内存状态。
+ */
+async function handleAgents(request: Request, service: RoutesService): Promise<Response> {
+  try {
+    const url = new URL(request.url)
+    const space = await resolveSpace(service, url.searchParams.get('space'))
+    const rawRun = url.searchParams.get('run')?.trim() ?? ''
+    if (rawRun === '') throw new ApiError(400, '缺少 run 参数')
+    try { assertRunId(rawRun) } catch { throw new ApiError(400, 'run 参数不合法') }
+    const rawNode = url.searchParams.get('node')
+    let nodeId: string | undefined
+    if (rawNode !== null) {
+      nodeId = rawNode.trim()
+      if (nodeId === '') throw new ApiError(400, 'node 参数不能为空')
+      try { assertNodeId(nodeId) } catch { throw new ApiError(400, 'node 参数不合法') }
+    }
+    const state = await space.stores.runs.get(rawRun)
+    if (state === undefined) throw new ApiError(404, '运行不存在')
+    // 显式注入优先（测试替身）；生产从同一权限登记表取 RunManager 自建的追溯中心。
+    const reader = service.traces ?? agentTraceHubFor(service.permissions)
+    if (reader === undefined) throw new ApiError(500, '追溯服务不可用')
+    const traces: AgentTrace[] = await reader.read(space, rawRun, nodeId)
+    return json({ ok: true, data: traces })
   } catch (error) {
     return errorResponse(error)
   }

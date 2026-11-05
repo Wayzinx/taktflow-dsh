@@ -17,13 +17,14 @@ describe('taktflow 宿主行', () => {
     const service = ctx.get<TaktflowService>('taktflow')!
     const cleanup = vi.spyOn(service.runs, 'disposeAll').mockImplementation(async () => {
       expect(ctx.get('taktflow')).toBe(service)
-      expect(ctx.routes).toHaveLength(5)
+      expect(ctx.routes).toHaveLength(6)
     })
 
     expect(ctx.get('taktflow')).toBeDefined()
     expect(ctx.provided.map((entry) => entry.name)).toContain('taktflow')
     expect(ctx.routes.map((route) => route.path).sort()).toEqual([
       '/api/taktflow',
+      '/api/taktflow.agents',
       '/api/taktflow.op',
       '/api/taktflow.ping',
       '/api/taktflow.session',

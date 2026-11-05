@@ -2,9 +2,10 @@ import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { AgentTraceHub, bindAgentTraceHub, type AgentTraceDenial } from './agent-trace.js'
 import type { Agent, ToolExecution } from './dsh-types.js'
 import { createWriteGuard, InMemoryPermissionRegistry } from './permissions.js'
-import type { PermissionScope } from './types.js'
+import type { PermissionScope, SpaceHandle } from './types.js'
 
 let root: string
 let outside: string
@@ -20,6 +21,22 @@ function setup(overrides: Partial<PermissionScope> = {}) {
   const registry = new InMemoryPermissionRegistry()
   const release = registry.register(scope(overrides))
   return { registry, release, guard: createWriteGuard(registry) }
+}
+
+function denialRecorder() {
+  const calls: Array<{
+    root: string
+    nodeRef: { runId: string; nodeId: string; attempt: number }
+    denial: AgentTraceDenial
+  }> = []
+  return {
+    calls,
+    recorder: {
+      recordDenial(root: string, nodeRef: { runId: string; nodeId: string; attempt: number }, denial: AgentTraceDenial) {
+        calls.push({ root, nodeRef: { ...nodeRef }, denial })
+      },
+    },
+  }
 }
 beforeEach(async () => {
   root = await realpath(await mkdtemp(path.join(tmpdir(), 'takt-permission-')))
@@ -136,5 +153,65 @@ describe('createWriteGuard', () => {
     registry.register(scope())
     registry.register(scope({ childId: 'other-child', cwd: outside, writeScope: ['**'] }))
     expect(createWriteGuard(registry)(exec('write', { file_path: 'file' }, { ...child, id: 'other-child' }))).toContain('不在空间根内')
+  })
+
+  it('拒绝时同步登记工具、目标路径和原因，同时保持原拒绝文案', () => {
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope())
+    const { calls, recorder } = denialRecorder()
+    const guard = createWriteGuard(registry, { denials: recorder })
+    const text = guard(exec('write', { file_path: 'other/file.ts' }))
+    expect(text).toContain('拒绝')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.root).toBe(root)
+    expect(calls[0]!.nodeRef).toEqual({ runId: 'run-test', nodeId: 'dev', attempt: 1 })
+    expect(calls[0]!.denial).toMatchObject({ tool: 'write', path: 'other/file.ts' })
+    expect(calls[0]!.denial.reason).toContain('不在写入范围内')
+  })
+
+  it('放行不登记；working_directory 和 shell 拒绝也登记', () => {
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope())
+    const { calls, recorder } = denialRecorder()
+    const guard = createWriteGuard(registry, { denials: recorder })
+    expect(guard(exec('write', { file_path: 'allowed/file.ts' }))).toBeUndefined()
+    expect(calls).toHaveLength(0)
+
+    expect(guard(exec('working_directory', { cd: outside }))).toContain('不能切换')
+    expect(calls[0]!.denial).toMatchObject({ tool: 'working_directory', path: outside })
+
+    expect(guard(exec('bash', { command: 'rm -rf' }))).toContain('shell')
+    expect(calls[1]!.denial).toMatchObject({ tool: 'bash' })
+    expect(calls[1]!.denial.path).toBeUndefined()
+  })
+
+  it('未显式注入 denials 时按权限登记表取回 RunManager 登记的追溯中心', async () => {
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope())
+    const traces = new AgentTraceHub({ throttleMs: 5_000, log: () => {} })
+    bindAgentTraceHub(registry, traces)
+    const space = { root, stores: { taktDir: path.join(root, '.takt') } } as unknown as SpaceHandle
+    const handle = await traces.begin(space, {
+      runId: 'run-test', nodeId: 'dev', attempt: 1, label: 'REQ/dev#1', role: 'dev', sessionId: 'child-trace',
+      preset: { id: 'preset', cfgHash: 'hash', plugins: [] },
+      profile: { title: '开发', description: '实现', skills: [], writeScope: ['allowed/**'], readOnly: false, source: 'space' },
+      prompt: '任务',
+    })
+    const guard = createWriteGuard(registry)
+    expect(guard(exec('write', { file_path: 'other/file.ts' }))).toContain('拒绝')
+    // 拒绝同步进入内存记录，不依赖异步写盘完成。
+    expect((await traces.read(space, 'run-test'))[0]!.denials[0]).toMatchObject({ tool: 'write', path: 'other/file.ts' })
+    await handle.finish({ status: 'completed', stopReason: 'completed' })
+    await handle.dispose()
+    await traces.disposeAll()
+  })
+
+  it('追溯登记失败不能把拒绝变成放行', () => {
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope())
+    const guard = createWriteGuard(registry, {
+      denials: { recordDenial() { throw new Error('追溯不可用') } },
+    })
+    expect(guard(exec('write', { file_path: 'other/file.ts' }))).toContain('拒绝')
   })
 })

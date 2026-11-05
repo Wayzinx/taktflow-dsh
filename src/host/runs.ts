@@ -1,5 +1,6 @@
 import { createEngine, type Actor, type AttentionItem, type Engine, type ProjectStores, type RunId, type RunState, updateRequirement } from '@taktflow/core'
 import { collectSecrets, createRedactor } from '@taktflow/harness'
+import { AgentTraceHub, bindAgentTraceHub } from './agent-trace.js'
 import type { HostContext } from './dsh-types.js'
 import { createDshHarness, type DshHarness } from './dsh-harness.js'
 import { assertRuntimeIdentity, loadRunRuntime, recordRuntimeIdentity, type RunRuntime } from './run-runtime.js'
@@ -15,6 +16,8 @@ export interface RunManagerDeps {
   workflows: WorkflowCatalog
   /** 测试仅替换传输，仍走真实 engine 和 stores。 */
   harnessFactory?: typeof createDshHarness
+  /** 子 Agent 追溯中心；缺失时保持原执行语义，不写追溯文件。 */
+  traces?: AgentTraceHub
   log?: (message: string) => void
 }
 
@@ -42,10 +45,17 @@ export class DshRunManager implements RunManager {
   private readonly locks = new Map<string, Promise<void>>()
   private readonly starting = new Set<Promise<unknown>>()
   private readonly spaces = new Map<string, SpaceHandle>()
+  private readonly traces: AgentTraceHub
+  private readonly ownsTraces: boolean
   private disposed = false
   private disposal?: Promise<void>
 
-  constructor(private readonly deps: RunManagerDeps) {}
+  constructor(private readonly deps: RunManagerDeps) {
+    // 未显式注入时自建追溯中心；守卫和路由通过权限登记表取回同一个实例。
+    this.traces = deps.traces ?? new AgentTraceHub({ ...(deps.log === undefined ? {} : { log: deps.log }) })
+    this.ownsTraces = deps.traces === undefined
+    bindAgentTraceHub(deps.permissions, this.traces)
+  }
 
   start(input: StartRunInput): Promise<{ runId: RunId; deduped: boolean }> {
     return this.track(this.startOnce(input))
@@ -176,6 +186,8 @@ export class DshRunManager implements RunManager {
       const released = await Promise.allSettled([...this.spaces.values()].map((space) => this.deps.ownership.release(space)))
       const releaseFailures = rejected(released)
       if (releaseFailures.length) throw new AggregateError(releaseFailures, '释放运行租约失败')
+      // 自建追溯中心随宿主一起冲刷；注入实例的生命周期由调用方管理。
+      if (this.ownsTraces) await this.traces.disposeAll()
     })()
     return this.disposal
   }
@@ -192,6 +204,7 @@ export class DshRunManager implements RunManager {
     const harness = (this.deps.harnessFactory ?? createDshHarness)({
       ctx, space: runtime.space, presets, permissions: this.deps.permissions,
       ownership: this.deps.ownership, ownerSessionId: meta.ownerSessionId, profiles: runtime.profiles,
+      profileSources: runtime.profileSources, traces: this.traces,
       onLeadOffline: async (nodeRef) => this.leadOffline(managed, nodeRef),
       onPreset: async (_role, preset, nodeRef) => {
         if (!managed.runId) throw new Error('运行归属尚未发布')

@@ -12,11 +12,22 @@ import {
 import { BUNDLED_ROLE_FILES } from '../roles/defaults.js'
 import { TaktToolError, type SpaceHandle } from './types.js'
 
+/** 角色档案来源；运行开始时冻结，结束再 stat 会因磁盘变化漂移。 */
+export type ProfileSource = 'space' | 'bundled'
+
+/** 一次角色读取的结果：档案本身与每个角色的来源。 */
+export interface LoadedProfiles {
+  profiles: Record<string, AgentProfile>
+  sources: Record<string, ProfileSource>
+}
+
 /** RunManager 在开始时固定的执行配置；等待审批期间仍复用这一份。 */
 export interface RunRuntime {
   space: SpaceHandle
   workflow: WorkflowDefinition
   profiles: Record<string, AgentProfile>
+  /** 每个角色在读取时的来源；追溯按它记录，不从角色名或结束状态猜测。 */
+  profileSources: Record<string, ProfileSource>
   knowledge: KnowledgeSource[]
 }
 
@@ -25,6 +36,8 @@ interface RuntimeIdentity {
   hasFunctions: boolean
   config: string
   profiles: string
+  /** 来源也参与身份：同名角色由 bundled 换成 space 时不能恢复旧运行。 */
+  profileSources: string
   workflow: string
 }
 
@@ -38,11 +51,18 @@ interface RuntimeIdentity {
  * 失败直接交给调用方，尤其不能把 allowBash:true 静默丢掉。
  */
 export async function loadRunProfiles(space: SpaceHandle): Promise<Record<string, AgentProfile>> {
+  return (await loadRunProfilesDetailed(space)).profiles
+}
+
+/** 与 loadRunProfiles 相同，同时返回每个角色读取时的来源（bundled/space）。 */
+export async function loadRunProfilesDetailed(space: SpaceHandle): Promise<LoadedProfiles> {
   const defaults = Object.create(null) as Record<string, AgentProfile>
+  const sources: Record<string, ProfileSource> = Object.create(null)
   for (const file of BUNDLED_ROLE_FILES) {
     const profile = parseProfile(file.fileName, file.content, space)
     if (Object.hasOwn(defaults, profile.role)) throw new Error(`随包角色名称重复：${profile.role}`)
     defaults[profile.role] = profile
+    sources[profile.role] = 'bundled'
   }
 
   const dir = join(space.stores.taktDir, 'agents')
@@ -73,8 +93,12 @@ export async function loadRunProfiles(space: SpaceHandle): Promise<Record<string
     }
     if (Object.hasOwn(overrides, profile.role)) throw new Error(`角色名称冲突：${profile.role}`)
     overrides[profile.role] = profile
+    sources[profile.role] = 'space'
   }
-  return Object.assign(Object.create(null) as Record<string, AgentProfile>, defaults, overrides)
+  return {
+    profiles: Object.assign(Object.create(null) as Record<string, AgentProfile>, defaults, overrides),
+    sources,
+  }
 }
 
 /** 解析单个角色文件；默认角色与空间角色共用，避免两套字段规则漂移。 */
@@ -103,8 +127,14 @@ function parseProfile(fileName: string, content: string, space: SpaceHandle): Ag
 export async function loadRunRuntime(space: SpaceHandle, workflow: WorkflowDefinition): Promise<RunRuntime> {
   const current = await openProject(space.root)
   const frozenSpace: SpaceHandle = { ...space, stores: { ...space.stores, config: structuredClone(current.config) } }
-  const profiles = await loadRunProfiles(frozenSpace)
-  return { space: frozenSpace, workflow: cloneDefinition(workflow), profiles, knowledge: knowledgeForRun(frozenSpace) }
+  const loaded = await loadRunProfilesDetailed(frozenSpace)
+  return {
+    space: frozenSpace,
+    workflow: cloneDefinition(workflow),
+    profiles: loaded.profiles,
+    profileSources: loaded.sources,
+    knowledge: knowledgeForRun(frozenSpace),
+  }
 }
 
 /**
@@ -154,7 +184,14 @@ function cloneDefinition<T>(value: T): T {
 function identity(runtime: RunRuntime): RuntimeIdentity {
   // 只存摘要，不把模型连接的凭据复制进运行目录。函数字段也参与 workflow 身份。
   const workflow = JSON.parse(JSON.stringify(runtime.workflow, (_key, value: unknown) => typeof value === 'function' ? { functionSource: value.toString() } : value)) as unknown
-  return { version: 1, hasFunctions: containsFunction(runtime.workflow), config: sha256(canonicalJson(runtime.space.stores.config)), profiles: sha256(canonicalJson(runtime.profiles)), workflow: sha256(canonicalJson(workflow)) }
+  return {
+    version: 1,
+    hasFunctions: containsFunction(runtime.workflow),
+    config: sha256(canonicalJson(runtime.space.stores.config)),
+    profiles: sha256(canonicalJson(runtime.profiles)),
+    profileSources: sha256(canonicalJson(runtime.profileSources)),
+    workflow: sha256(canonicalJson(workflow)),
+  }
 }
 
 function containsFunction(value: unknown): boolean {

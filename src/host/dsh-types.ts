@@ -95,8 +95,8 @@ export interface Agent {
   readonly id: string
   /** 来源：@deepseek-ai/dsh-agent@0.2.1-rc.3/lib/types/runtime-types.d.ts:139-145；官方为必填。 */
   readonly options: AgentOptions
-  /** 来源：同上 :141；官方为必填，这里只约束 header。 */
-  readonly session: { readonly header: SessionHeader }
+  /** 来源：同上 :141；官方为必填，这里只约束 id/header。 */
+  readonly session: Session
   /**
    * Agent 所在的 Cordis 上下文。来源：同上 :149；官方为必填，这里可选以兼容旧替身。
    * 用来查询当前挂载的 preset（agentPresets.composedPreset），见 lead/tools.ts。
@@ -123,6 +123,42 @@ export interface SessionHeader {
   readonly id: string
   readonly cwd?: string
   readonly agentPreset?: string
+}
+
+/**
+ * 会话事件流里的单条事件。
+ * 来源：@deepseek-ai/dsh-session@0.2.1-rc.3/lib/types/types.d.ts:256-405（SessionEvent）。
+ * data 的具体形状随 type 变化，消费方必须按事件类型自行收窄。
+ */
+export interface SessionEvent {
+  readonly type: string
+  readonly seq: number
+  /** Unix 毫秒。 */
+  readonly time: number
+  readonly data: unknown
+}
+
+/**
+ * 来源：@deepseek-ai/dsh-session@0.2.1-rc.3/lib/types/index.d.ts:295-312（requestHeader/requestContext）。
+ * 这里只约束 Agent.session 上实际读取的字段。
+ */
+export interface Session {
+  /** 官方 Session 实例 id；旧替身可能只填 header，因此调用方需兼容 header.id。 */
+  readonly id?: string
+  readonly header: SessionHeader
+}
+
+/**
+ * 来源：@deepseek-ai/dsh-llm@0.2.1-rc.3/lib/types/index.d.ts（TokenUsage）。
+ * assistant/message 事件里的用量；缺字段表示该次响应没有报告。
+ */
+export interface TokenUsage {
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly totalTokens?: number
+  readonly cacheReadTokens?: number
+  readonly cacheWriteTokens?: number
+  readonly reasoningTokens?: number
 }
 
 /** 来源：@deepseek-ai/dsh-subagent@0.2.1-rc.3/lib/types/types.d.ts:127-144。 */

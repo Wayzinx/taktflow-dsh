@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { agent, human, initProject, readLease, type AgentProfile, type NodeDef, type WorkflowDefinition } from '@taktflow/core'
+import { AgentTraceHub, agentTraceHubFor } from './agent-trace.js'
 import type { Agent, SubagentActivationSpec, SubagentResult } from './dsh-types.js'
 import { DshRunManager } from './runs.js'
 import { FsOwnership } from './ownership.js'
@@ -27,7 +28,7 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-async function fixture(nodes: NodeDef[] = simple()) {
+async function fixture(nodes: NodeDef[] = simple(), options: { traces?: AgentTraceHub } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'takt-runs-'))
   roots.push(root)
   const stores = await initProject(root)
@@ -49,7 +50,10 @@ async function fixture(nodes: NodeDef[] = simple()) {
   }
   let workflow = definition(nodes)
   const workflows = { ids: () => ['test'], load: vi.fn(async () => workflow) }
-  const manager = new DshRunManager({ ctx, spaces, ownership, presets, permissions, workflows, log() {} })
+  const manager = new DshRunManager({
+    ctx, spaces, ownership, presets, permissions, workflows, log() {},
+    ...(options.traces === undefined ? {} : { traces: options.traces }),
+  })
   cleanups.push(async () => { await manager.disposeAll(); await ownership.releaseAll(); await ctx.dispose() })
   const input = { space, requirementId, workflowId: 'test', ownerSessionId: 'lead', requestKey: 'start-1' }
   const setWorkflow = (next: WorkflowDefinition) => { workflow = next }
@@ -379,5 +383,31 @@ describe('RunManager 真实 core 生命周期', () => {
     expect(executed).toEqual([])
     expect(f.ctx.activations).toHaveLength(0)
     expect((await f.manager.get(f.space, runId))?.status).toBe('waiting_human')
+  })
+
+  it('提供追溯中心时，真实节点运行落盘 starting→completed，并冻结角色来源', async () => {
+    const traces = new AgentTraceHub({ throttleMs: 10, log: () => {} })
+    const f = await fixture(simple(), { traces })
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'succeeded')
+    const records = await traces.read(f.space, runId)
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({
+      runId, nodeId: 'work', attempt: 1, role: 'dev', status: 'completed', stopReason: 'completed',
+    })
+    // 空间里的 dev.md 覆盖了随包角色，来源必须在开始时就冻结为 space。
+    expect(records[0]!.profile).toMatchObject({ source: 'space', writeScope: [] })
+    expect(records[0]!.preset).toEqual({ id: 'test-preset', cfgHash: 'test-hash', plugins: [] })
+    expect(records[0]!.endedAt).toBeTypeOf('string')
+    await traces.disposeAll()
+  })
+
+  it('未注入追溯中心时自建并登记到权限表，守卫和路由可共享同一实例', async () => {
+    const f = await fixture()
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'succeeded')
+    const shared = agentTraceHubFor(f.permissions)
+    expect(shared).toBeInstanceOf(AgentTraceHub)
+    expect(await shared!.read(f.space, runId)).toMatchObject([{ runId, nodeId: 'work', status: 'completed' }])
   })
 })

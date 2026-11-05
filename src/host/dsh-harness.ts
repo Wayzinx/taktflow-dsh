@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import { extractJsonBlock, type AgentProfile, type HarnessAdapter, type HarnessEvent, type HarnessRequest, type HarnessResult } from '@taktflow/core'
-import type { HostContext, SubagentActivation } from './dsh-types.js'
+import { collectSecrets } from '@taktflow/harness'
+import type { AgentTraceHandle, AgentTraceHub, AgentTraceOutcome } from './agent-trace.js'
+import type { HostContext, SessionEvent, SubagentActivation } from './dsh-types.js'
 import { supportsDshOutputSchema } from './dsh-schema.js'
 import { TaktToolError, type Ownership, type PermissionRegistry, type RolePresetHandle, type RolePresets, type SpaceHandle } from './types.js'
 
@@ -13,6 +15,10 @@ export interface DshHarnessDeps {
   permissions: PermissionRegistry
   ownerSessionId: string
   profiles?: Record<string, AgentProfile>
+  /** 运行开始时冻结的角色来源；有 traces 时必填，禁止从角色名猜测。 */
+  profileSources?: Record<string, 'space' | 'bundled'>
+  /** 追溯中心；缺失时保持原执行语义，不写追溯文件。 */
+  traces?: AgentTraceHub
   /** RunManager 取消整条运行；回调不可等待当前 harness 所属任务。 */
   onLeadOffline(nodeRef: { runId: string; nodeId: string; attempt: number }): Promise<void>
   /** 启动子 Agent 前把选用的 preset 写进 owner 审计。 */
@@ -36,6 +42,17 @@ function waitForCapacity(signal: AbortSignal, milliseconds: number): Promise<voi
     signal.addEventListener('abort', abort, { once: true })
     if (signal.aborted) abort()
   })
+}
+
+/** preset 组合里的插件包名；旧替身没有扩展字段时留空，不编造。 */
+function presetPlugins(handle: RolePresetHandle): string[] {
+  const value = (handle as RolePresetHandle & { plugins?: unknown }).plugins
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message !== '') return error.message
+  return String(error)
 }
 
 /**
@@ -96,6 +113,10 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       let preset: RolePresetHandle | undefined
       let activation: SubagentActivation | undefined
       let disposal: Promise<void> | undefined
+      let trace: AgentTraceHandle | undefined
+      let unsubscribeSession: (() => void | Promise<void>) | undefined
+      let outcome: AgentTraceOutcome | undefined
+      let runError: unknown
       const dispose = (): Promise<void> => disposal ??= Promise.resolve().then(() => activation?.dispose())
       const abort = () => { void dispose().catch(() => {}) }
       try {
@@ -107,13 +128,38 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
           req.resultSchema !== undefined && outputSchema === undefined
             ? '最后输出一个 JSON 代码块，并遵守任务中声明的结果结构。' : '',
         ].filter(Boolean).join('\n\n')
+        const label = `${req.env?.TAKT_REQ ?? run?.requirementId ?? runId}/${nodeId}#${nodeRef.attempt}`
+        if (deps.traces !== undefined) {
+          // 来源在 loadRunProfiles 时冻结；缺失时明确失败，不能按角色名猜 bundled/space。
+          if (profile === undefined) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `追溯缺少角色档案：${role}`)
+          const source = deps.profileSources?.[role]
+          if (source === undefined) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `追溯缺少冻结的角色来源：${role}`)
+          trace = await deps.traces.begin(space, {
+            runId, nodeId, attempt: nodeRef.attempt, label, role, sessionId: childId,
+            preset: { id: preset.id, cfgHash: preset.cfgHash, plugins: presetPlugins(preset) },
+            profile: {
+              title: profile.title, description: profile.description, skills: [...profile.skills],
+              writeScope: [...profile.writeScope], readOnly, source,
+            },
+            prompt,
+            ...(req.systemAppend === undefined ? {} : { systemAppend: req.systemAppend }),
+            ...(outputSchema === undefined ? {} : { outputSchema }),
+            // 本次请求的密钥集合（含 req.env 与冻结 providers）只用于内存脱敏。
+            secrets: collectSecrets(req, space.stores.config?.providers ?? {}),
+          })
+          // 官方 dsh-subagent 在 result resolve 前就 dispose 子 Agent，必须在启动前订阅。
+          const listener = ((session: { id?: string; header?: { id?: string } }, event: SessionEvent) => {
+            const id = session.id ?? session.header?.id
+            if (id === childId) trace?.sessionEvent(event)
+          }) as (...args: never[]) => void
+          unsubscribeSession = ctx.on('session/event', listener)
+        }
         while (activation === undefined) {
           signal.throwIfAborted()
           const parent = await requireParent()
           try {
             activation = await ctx.subagents.startActivation({
-              provider: 'spawn', label: `${req.env?.TAKT_REQ ?? run?.requirementId ?? runId}/${nodeId}#${nodeRef.attempt}`,
-              childId, signal, delivery: 'caller',
+              provider: 'spawn', label, childId, signal, delivery: 'caller',
               request: {
                 prompt: [{ type: 'text', text: prompt }], agentPreset: preset.id,
                 ...(outputSchema === undefined ? {} : { outputSchema }), parent, cwd: space.root,
@@ -131,28 +177,101 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         signal.addEventListener('abort', abort, { once: true })
         if (signal.aborted) abort()
         if (activation.childId !== childId) throw new Error('dsh 返回的子 Agent 身份与预留 childId 不一致')
+        // child 在 result 前就可能被销毁；这里只取发布瞬间的真实 options。
+        const child = ctx.agents.get(childId)
+        trace?.running(child?.options.model, child?.options.reasoningEffort)
         onEvent({ type: 'started', sessionId: childId, ...(req.model === undefined ? {} : { model: req.model }) })
         const result = await activation.result
-        signal.throwIfAborted()
         const finalText = result.output.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
         if (finalText !== '') onEvent({ type: 'message', role: 'assistant', text: finalText })
         const structured = outputSchema === undefined ? req.resultSchema === undefined ? undefined : extractJsonBlock(finalText) : result.structured
+        const status = result.stopReason === 'completed' ? 'completed'
+          : result.stopReason === 'aborted' || result.stopReason === 'cancelled' ? 'cancelled' : 'failed'
+        outcome = {
+          status,
+          stopReason: result.stopReason,
+          ...(finalText === '' ? {} : { finalText }),
+          ...(status === 'completed' ? {} : { error: result.diagnostic ?? `子 Agent 停止：${result.stopReason}` }),
+        }
+        // 结果已经返回时仍要保留 stopReason/finalText；取消只覆盖状态，不丢已有信息。
+        if (signal.aborted) {
+          outcome = {
+            status: 'cancelled',
+            ...(outcome.stopReason === undefined ? {} : { stopReason: outcome.stopReason }),
+            ...(outcome.finalText === undefined ? {} : { finalText: outcome.finalText }),
+            error: errorMessage(signal.reason ?? '运行已取消'),
+          }
+          signal.throwIfAborted()
+        }
         return {
           ok: result.stopReason === 'completed', finalText, sessionId: childId,
           ...(structured === undefined ? {} : { structured }),
           ...(result.stopReason === 'completed' ? {} : { error: result.diagnostic ?? `子 Agent 停止：${result.stopReason}` }),
         }
+      } catch (error) {
+        runError = error
+        throw error
       } finally {
         signal.removeEventListener('abort', abort)
         // 无法确认子 Agent 已停止时保留守卫和 preset，避免清理失败后无权限保护。
+        let cleanupError: unknown
         try {
           if (activation !== undefined) await dispose()
           releasePermission()
           if (preset !== undefined) await Promise.resolve(preset.release())
         } catch (error) {
           cleanupFailures.push(error)
-          throw error
+          cleanupError = error
         }
+        if (trace !== undefined) {
+          let finalOutcome: AgentTraceOutcome
+          if (outcome !== undefined) finalOutcome = outcome
+          else if (signal.aborted) {
+            finalOutcome = { status: 'cancelled', ...(runError === undefined ? {} : { error: errorMessage(signal.reason ?? runError) }) }
+          } else {
+            finalOutcome = { status: 'failed', error: errorMessage(runError ?? '节点未产生结果') }
+          }
+          if (cleanupError !== undefined) {
+            const cleanupText = errorMessage(cleanupError)
+            const merged = finalOutcome.error === undefined ? `清理失败：${cleanupText}` : `${finalOutcome.error}；清理失败：${cleanupText}`
+            finalOutcome = finalOutcome.status === 'cancelled'
+              ? { ...finalOutcome, error: merged }
+              : {
+                  status: 'failed',
+                  ...(finalOutcome.stopReason === undefined ? {} : { stopReason: finalOutcome.stopReason }),
+                  ...(finalOutcome.finalText === undefined ? {} : { finalText: finalOutcome.finalText }),
+                  error: merged,
+                }
+          }
+          // 最终刷新必须先于 trace.dispose；失败作为清理错误传播，不能假成功。
+          try { await trace.finish(finalOutcome) } catch (error) {
+            cleanupFailures.push(error)
+            cleanupError ??= error
+            // 写盘失败后用 failed 终态重试一次：磁盘恢复时也不能留下 completed 假成功。
+            try {
+              await trace.finish({
+                status: 'failed',
+                ...(finalOutcome.stopReason === undefined ? {} : { stopReason: finalOutcome.stopReason }),
+                ...(finalOutcome.finalText === undefined ? {} : { finalText: finalOutcome.finalText }),
+                error: `追溯记录写入失败：${errorMessage(error)}`,
+              })
+            } catch (retryError) {
+              cleanupFailures.push(retryError)
+            }
+          }
+          try { await trace.dispose() } catch (error) {
+            cleanupFailures.push(error)
+            cleanupError ??= error
+          }
+        }
+        // 会话事件订阅保留到最终刷新和 dispose 完成，避免漏掉最后一条 usage/tool 结果。
+        if (unsubscribeSession !== undefined) {
+          try { await unsubscribeSession() } catch (error) {
+            cleanupFailures.push(error)
+            cleanupError ??= error
+          }
+        }
+        if (cleanupError !== undefined) throw cleanupError
       }
     },
   }

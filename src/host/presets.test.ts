@@ -52,6 +52,8 @@ describe('动态角色 preset', () => {
     expect(rows.find((row) => row.id === 'agent-instructions')!.config).toEqual({ maxBytes: 65536 })
     expect(rows.find((row) => row.id === 'tool-fs-search')!.config).toEqual({ sampleOverCapGlobResults: false })
     expect(rows.at(-1)!.config).toMatchObject({ role: 'dev', spaceRoot: space.root, instructions: profile.instructions, skills: ['coding'] })
+    // 追溯读取的是组合里的真实插件包名，不能靠角色名或最终磁盘状态反推。
+    expect(handle.plugins).toEqual(rows.map((row) => row.name))
     await handle.release()
   })
 
