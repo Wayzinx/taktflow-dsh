@@ -478,19 +478,25 @@ async function listFiles(root, suffix) {
   return files
 }
 
+/** 去掉可选的 `{type:'event', event}` 包装，返回真正的会话事件。 */
+export function eventOf(record) {
+  return record?.type === 'event' && record.event !== undefined ? record.event : record
+}
+
 /**
- * 从会话日志里找 assistant 文本。
+ * 从会话日志里读全部事件。
  *
  * 隔离 profile 把 session-persistence-jsonl 的 compression 设为 none，日志是
  * 可直接读的 JSONL；同时兼容 Node 自带 zstd 的 .jsonl.zstd（Node ≥ 22.15）。
+ * 返回顺序与文件内追加顺序一致；找不到会话时返回空数组。
  */
-export async function readAssistantTexts(home, sessionId) {
+export async function readSessionRecords(home, sessionId) {
   const sessionsRoot = path.join(home, 'sessions')
   const files = [
     ...(await listFiles(sessionsRoot, '.jsonl')),
     ...(await listFiles(sessionsRoot, '.jsonl.zstd')),
   ]
-  const texts = []
+  const records = []
   for (const file of files) {
     let text
     try {
@@ -516,15 +522,22 @@ export async function readAssistantTexts(home, sessionId) {
     }
     if (header?.type !== 'session' || header?.id !== sessionId) continue
     for (const line of lines.slice(1)) {
-      let record
       try {
-        record = JSON.parse(line)
+        records.push(JSON.parse(line))
       } catch {
-        continue
+        // 半行/损坏行跳过；会话日志可能正在追加。
       }
-      const assistant = assistantTextFromEvent(record)
-      if (assistant !== undefined) texts.push(assistant)
     }
+  }
+  return records
+}
+
+/** 从会话日志里找 assistant 文本。 */
+export async function readAssistantTexts(home, sessionId) {
+  const texts = []
+  for (const record of await readSessionRecords(home, sessionId)) {
+    const assistant = assistantTextFromEvent(record)
+    if (assistant !== undefined) texts.push(assistant)
   }
   return texts
 }

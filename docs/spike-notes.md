@@ -2,7 +2,7 @@
 
 ## S4：隔离 profile 启动与 Host RPC
 
-状态：**骨架阶段的 S4 自动 E2E 与独立浏览器 UI 验收通过**。2026-11-05 使用 dsh `0.2.1-rc.3` 和当前工作区打出的 `taktflow@0.0.0` 完成真实安装：profile **6/6**、boot **13/13**、浏览器自动化 UI **8/8**。这是最小 ping 面板的验收，完整 P0 工作流与业务面板仍未实现。
+状态：**骨架阶段的 S4 自动 E2E 与独立浏览器 UI 验收通过**。2026-11-05 使用 dsh `0.2.1-rc.3` 和当前工作区打出的 `taktflow@0.0.0` 完成真实安装：profile **6/6**、boot **13/13**、浏览器自动化 UI **8/8**。这是当时最小 ping 面板的验收；完整 P0 工作流与业务面板后来已端到端通过，见文末 P0 小节。
 
 ### 环境与证据
 
@@ -80,7 +80,7 @@ UI 清理已完成：浏览器自动化会话已关闭；宿主已收到 SIGTERM
 
 ### 交付边界
 
-自动验证证明安装、宿主加载、客户端资源发现、preset 解析与真实模型路由可用；独立浏览器 验证证明最小面板能渲染、遵守主题和路径边界、展示 API 错误并恢复、卸载样式并在 reload 后继续工作。骨架阶段未实现 RunManager 业务、所有权/权限/审批/通知业务、Lead 工具和完整随包流程；`loadP0DeliveryWorkflow()` 当前直接抛 `not implemented`。这些由 M-C / M-D / M-F 后续接线，S1 / S2 / S3 和完整 P0 业务验收不在本次结果中。
+自动验证证明安装、宿主加载、客户端资源发现、preset 解析与真实模型路由可用；独立浏览器 验证证明最小面板能渲染、遵守主题和路径边界、展示 API 错误并恢复、卸载样式并在 reload 后继续工作。骨架阶段未实现 RunManager 业务、所有权/权限/审批/通知业务、Lead 工具和完整随包流程；`loadP0DeliveryWorkflow()` 当前直接抛 `not implemented`。这些由 M-C / M-D / M-F 后续接线，S1 / S2 / S3 和完整 P0 业务验收不在本次结果中。（历史记录：后续 P0 端到端已覆盖完整主路径，见文末 P0 小节。）
 
 ### 补充（2026-11-05，独立仓库复跑）
 
@@ -178,3 +178,44 @@ dsh 的顶层 `ctx.effect` 在卸载时并行清理；宿主接线把注册放�
 写角色实测工具为 `edit/glob/grep/read/read_image/skill/working_directory/write`；只读 Lead 为 `ask_user_question/glob/grep/read/read_image/skill/working_directory`。角色组合没有加载 shell 或派发包，但全局继承的工具仍需真实清单核查，不能仅凭 preset 配置推断。
 
 本次证明最小执行链、权限守卫、取消与清理成立；没有运行完整 `p0-delivery` 流程，没有将审批卡片、客户端完整业务面板或强杀后的自动恢复纳入这组通过数。强杀后的失效租约仍需人工确认接管。
+
+## P0 端到端：真实 dsh + 真实模型
+
+状态：**通过 25/25**。2026-11-05 23:09–23:16（北京时间），使用 dsh `0.2.1-rc.3`、当前源码构建并安装到隔离 web profile，模型由 `TAKT_E2E_*` 环境变量提供。执行脚本 `node e2e/p0.mjs`，完整脱敏结果在 `e2e/out/p0-result.json`，最终批次另存为 `e2e/out/p0-result-20261105-150916-final.json`（本地证据，不进包）。
+
+### 步骤
+
+1. `e2e/profile.mjs` 在带所有权标记的隔离 `DSH_HOME` 里构建、打包并安装插件，写入模型 provider；不使用用户自己的 `~/.dsh`。
+2. 在隔离 home 下创建最小 Node 演示项目：`package.json` 的 `test` 为 `node --test`，含 `src/add.js` 与 `src/add.test.js`。
+3. `startHost` 启动真实 dsh web，完成启动 token → 页面 cookie 交换；`/connect?interactions=answer` 单独签发审批卡片用的 API cookie。
+4. 通过 Host RPC `session/create` 创建 `taktflow` preset 会话，cwd 为演示项目根；用一条中文自然语言消息要求初始化空间、创建需求并启动 P0 交付流程，且设计后必须让人审批。
+5. 等运行进入 `waiting_human`；通过 dsh remote-events WebSocket 找到 Lead 的问题卡片，用“批准”回答。卡片不可用时才回退到面板 `attention.answer`，并在结果里记录原因。
+6. 等运行结束，逐项断言运行状态、节点、产物版本、真实文件改动、测试、事件链、面板读取、会话通知和 Lead 工具指标；最后停止进程并清理隔离目录。
+
+### 结果
+
+| 断言 | 真实读回 |
+| --- | --- |
+| 运行 | `succeeded`；clarify、design、approve-design、implement、test、report 六个节点均 succeeded、attempt 1 |
+| 人工审批 | 真实问题卡片：标题 `taktflow 审批`，选项 `批准/打回`，冻结 `design/design.md` v1；回答落账 `decision=approve`、actor `human`、`via=dsh:user-questions`，回读校验 requestId/run/需求/attempt 一致 |
+| 产物 | `design/design.md`、`reports/test.md`、`reports/summary.md` 均为 v1；测试报告记录退出码 0 |
+| 代码改动 | implement 节点 `harness.started` 的 child session `53edf862...` 内有指向 `src/add.js` 与 `src/add.test.js` 的成功 `edit` 工具调用；`sub(5, 3) === 2` |
+| 测试 | `test` 节点 succeeded；在演示项目执行 `npm test` 退出 0，`pass=2`、`fail=0`，测试报告记录退出码 0 |
+| 事件链 | 面板 `p=audit`（core `events.verify`）返回 ok，无断点；该批次 Lead 的 8 次工具调用里没有 `takt_trace` |
+| 面板 | `project`、`requirements`、`runs`、`run`、`attention` 全部 `{ ok: true }`；`client.js` 可取到 |
+| 通知 | Lead 会话有 6 条 `agent/inbox/spliced` 插入，且 6 条都与 `user/message.id` 配对（admitted），target 含 `next-step` / `next-turn`；观察到终态 `运行结束：succeeded` |
+| Lead 工具 | 8 次调用：7 次业务成功 + 1 次预期 `TAKT_NO_SPACE`；按全部调用为分母的成功率 87.5%；首次调用用对按 action 5/5、按工具 4/4；严格业务首次成功按 action 4/5、按工具 3/4；pending 0 |
+
+本轮 `start-followup.nudged=true`：模型在 create 后结束了回合，e2e 按真实用户方式发送“需求已经建好了，请继续启动 P0 交付流程”后成功启动。Lead prompt/skill 仍要求“用户已要求启动时 create 后同回合 start”，follow-up 只是模型未遵守时的兜底。
+
+### 踩坑
+
+- **审批卡片 cookie 不能复用面板 cookie。** `/connect?interactions=answer` 签发的是单 socket API 操作员 cookie；WebSocket 断开时该 peer 会被回收，之后再用同一 cookie 访问 `/api` 会 401。e2e 因此维护两个 cookie jar：页面 `/` 的浏览器 cookie 只给面板请求，answer cookie 只给 WS。真实浏览器面板本来就用页面 cookie，不受影响。
+- **阻塞式问题卡片不是 `userQuestions/answer`。** 本插件的 `takt_ask_human` 走 blocking waterfall，卡片通过 remote-events WS 的 `$events` / `$events/result` 回答；面板 `attention.answer` 是明确的 fallback，必须在结果里记录来源。
+- **`tool/result.isError=false` 不代表业务成功。** dsh 只反映工具执行是否抛错；业务结果要解析 render 的第二个 text block JSON 里的 `ok`。验收脚本和指标都按这个口径统计。
+- **最终结论必须 fail-closed。** 聚合只看 `result.ok`：任何 check `fail` / `not-run` 或显式异常都非零退出；即使 setup 阶段失败也要写出本次脱敏 JSON，不能保留上一次通过结果或打印伪绿。`check()` 捕获的业务失败会同时进入 failures 和 check 状态。
+- **通知只认真实会话证据。** `agent/inbox/spliced` 的 inserted message 只算 queued；必须与 `user/message.id` 配对才标 admitted。`.takt/status` 快照只作诊断，不能兜底 PASS。
+- **指标分母不能排除 pending。** 主成功率用全部 `takt_*` 调用作分母，pending/unknown 单列；首次调用取原始第一次，不能用后续成功覆盖；`TAKT_NO_SPACE` 只在 init 成功前算“用对”，严格业务成功率另行统计。
+- **dev 改动需要归因链。** 文件内容变化不能证明是 dev 改的；要读 implement 的 `harness.started` child sessionId，再核对该 child 的 `write`/`edit` 成功结果指向演示项目文件。
+- **模型可能在建完需求后结束回合。** 已在 Lead prompt / skill 明确“用户要求启动时，create 成功后同一回合继续 start”，e2e 仍保留一条自然语言 follow-up 作为真实用户兜底；最终批次实际使用了 follow-up。
+- **Node `--test` 的输出格式因版本而异。** 本机输出 `ℹ pass N` 而不是 `# pass N`；脚本同时识别 `# pass` / `ℹ pass`，识别不到时显式加 `--test-reporter=tap` 再读，不伪填数值。最终批次 `passCount=2`。

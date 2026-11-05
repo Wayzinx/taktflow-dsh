@@ -1,4 +1,5 @@
 import { isUtf8 } from 'node:buffer'
+import { access, lstat, mkdir, realpath, writeFile } from 'node:fs/promises'
 import { userInfo } from 'node:os'
 import path from 'node:path'
 import {
@@ -6,6 +7,8 @@ import {
   assertRequirementId,
   assertRunId,
   canonicalJson,
+  createInsights,
+  initProject,
   readLease,
   type Actor,
   type ArtifactRecord,
@@ -14,8 +17,10 @@ import {
   type ExternalLink,
   type Requirement,
   type RunState,
+  assertNoSymlinks, withFileLock,
 } from '@taktflow/core'
-import { withFileLock } from '../../../vendor/taktflow/packages/core/src/store/file-lock.js'
+import { BUNDLED_ROLE_FILES } from '../../roles/defaults.js'
+import { withSpaceMutationLock } from '../space-lock.js'
 import type {
   Agent,
   ContentBlock,
@@ -344,7 +349,17 @@ function taktStatusTool(deps: ToolDeps): DefineToolOptions {
           nextActions,
         )
       } catch (error) {
-        return toFailure(error)
+        const result = toFailure(error)
+        if (result.error?.code === 'TAKT_NO_SPACE') {
+          // 新目录是正常入口，不是失败终点：把 init 放在最前面，避免模型先让用户切目录。
+          return {
+            ...result,
+            space: null,
+            error: { ...result.error, hint: defaultHint('TAKT_NO_SPACE') },
+            next_actions: ['takt_requirement action="init"', 'takt_status'],
+          }
+        }
+        return result
       }
     },
   }
@@ -356,18 +371,20 @@ function taktRequirementTool(deps: ToolDeps): DefineToolOptions {
   return {
     name: 'takt_requirement',
     description: [
-      '创建或绑定一个需求。create 成功后会自动把当前会话绑定到该需求。',
-      '何时用：takt_status 显示尚未绑定需求时；create 必须带稳定的 requestKey，重试时保持不变。',
+      '初始化空间，或创建/绑定一个需求。create 成功后会自动把当前会话绑定到该需求。',
+      '何时用：takt_status 返回 TAKT_NO_SPACE 时先 init（在当前会话 cwd 初始化，已存在则幂等）；',
+      '已有空间但未绑定需求时用 create（必须带稳定 requestKey，重试时保持不变）或 bind。',
       '何时不用：已经绑定需求后不要再次 create/bind；update、import_link 是 P1。',
+      '示例：{"action":"init"}',
       '示例：{"action":"create","title":"支付回调重试","requestKey":"req-20261105-01"}',
       '示例：{"action":"bind","requirementId":"REQ-001"}',
     ].join('\n'),
     parameters: {
       action: {
         type: 'string',
-        enum: ['create', 'bind', 'update', 'import_link'],
+        enum: ['init', 'create', 'bind', 'update', 'import_link'],
         required: true,
-        description: 'P0 支持 create / bind；update、import_link 返回 P1 提示。',
+        description: 'P0 支持 init / create / bind；update、import_link 返回 P1 提示。',
       },
       title: { type: 'string', description: 'create 必填：需求标题。' },
       requestKey: {
@@ -388,15 +405,261 @@ function taktRequirementTool(deps: ToolDeps): DefineToolOptions {
         const args = asRecord(raw)
         const action = requiredString(args, 'action')
         const agent = requireRootAgent(exec, deps)
+        // init 必须能在“还没有空间”时工作，所以先于 resolveSpace。
+        if (action === 'init') return await initSpace(deps, agent)
         const space = await resolveSpace(deps, agent)
         if (action === 'update' || action === 'import_link') return p1('takt_requirement', action)
         if (action === 'create') return await createRequirement(deps, agent, space, args)
         if (action === 'bind') return await bindRequirement(deps, agent, space, args)
-        throw invalidAction('takt_requirement', action, ['create', 'bind'])
+        throw invalidAction('takt_requirement', action, ['init', 'create', 'bind'])
       } catch (error) {
         return toFailure(error)
       }
     },
+  }
+}
+
+// ------------------------------------------------------------ takt_requirement init
+
+/** core initProject 会创建的 `.takt` 子目录；vendor 未导出，这里按同一顺序核对。 */
+const INIT_SUBDIRS = ['agents', 'workflows', 'workspaces', 'objects', 'runs'] as const
+
+/**
+ * 在当前会话 cwd 初始化空间。
+ *
+ * 授权：调用方已经过 requireRootAgent（存活的 taktflow preset 根 Agent），cwd
+ * 只从可信的 session header 读取，模型参数无法指定目录。
+ *
+ * 幂等与冲突（全部在任何磁盘写入之前判断）：
+ * - cwd 本身已有 takt.config.json：打开并补齐缺失角色，返回 alreadyInitialized；
+ * - cwd 在已配置/已打开的空间根里面：TAKT_SPACE_ROOT_MISMATCH；
+ * - 已有空间根在 cwd 里面（会产生嵌套空间）：TAKT_SPACE_ROOT_MISMATCH；
+ * - 向上找到未注册的 takt.config.json：说明 cwd 是既有空间的子目录，拒绝。
+ *
+ * 成功后通过 SpaceRegistry.open 绑定根，后续 takt_status / 面板都能看到。
+ */
+async function initSpace(deps: ToolDeps, agent: Agent): Promise<LeadToolResult> {
+  const cwd = agent.session.header.cwd
+  if (typeof cwd !== 'string' || cwd.trim() === '') {
+    throw new TaktToolError(
+      'TAKT_NO_SPACE',
+      '当前会话没有工作目录，无法初始化空间',
+      '请从要初始化的项目目录打开 taktflow 会话。',
+    )
+  }
+  let resolved: string
+  try {
+    resolved = await realpath(path.resolve(cwd))
+  } catch {
+    throw new TaktToolError(
+      'TAKT_NO_SPACE',
+      '会话工作目录不存在或不可访问',
+      '确认目录存在后重新打开会话；init 不会创建会话目录。',
+    )
+  }
+
+  return await withSpaceMutationLock(async () => {
+    // 与 open 共用锁；写盘前先拒绝符号链接/同名特殊文件，避免写到空间根之外。
+    await assertInitPathsSafe(resolved)
+
+    // 已经是空间：幂等打开；仍补齐缺失的默认角色，但绝不覆盖用户档案。
+    if (await exists(path.join(resolved, 'takt.config.json'))) {
+      const space = await deps.service.spaces.open(resolved)
+      const roles = await copyBundledRoles(space)
+      return initSuccess(space, roles, true)
+    }
+
+    // 与宿主配置/已绑定的单根冲突：必须在 initProject 写盘前拒绝。
+    const roots = await deps.service.spaces.roots()
+    if (roots.length > 0 && !roots.includes(resolved)) {
+      throw spaceConflict(
+        `P0 只支持一个空间根，宿主已配置/已绑定 ${roots[0]}，不能初始化 ${resolved}`,
+        `把会话工作目录切到 ${roots[0]}，或换一个使用独立宿主进程的项目。`,
+      )
+    }
+    for (const root of roots) {
+      if (root === resolved) continue
+      if (isInside(resolved, root)) {
+        throw spaceConflict(
+          `会话目录在已有空间根 ${root} 里面，不能初始化嵌套空间：${resolved}`,
+          `把会话工作目录切到 ${root}，或换一个不在任何空间内的空目录。`,
+        )
+      }
+      if (isInside(root, resolved)) {
+        throw spaceConflict(
+          `已有空间根 ${root} 在会话目录里面，P0 只支持一个空间根：${resolved}`,
+          '换一个与已有空间无包含关系的目录，或继续使用已有空间。',
+        )
+      }
+    }
+
+    // 向上查找未注册的空间：cwd 是既有空间的子目录时，同样不能在这里新建。
+    const ancestor = await findAncestorSpace(resolved)
+    if (ancestor !== undefined) {
+      throw spaceConflict(
+        `会话目录在已有空间根 ${ancestor} 里面，不能初始化嵌套空间：${resolved}`,
+        `把会话工作目录切到 ${ancestor}，或换一个不在任何空间内的空目录。`,
+      )
+    }
+
+    // core initProject 只写 takt.config.json 和 .takt 子目录，不生成角色档案。
+    const stores = await initProject(resolved)
+    const space: SpaceHandle = { root: resolved, stores, insights: createInsights(stores) }
+    const roles = await copyBundledRoles(space)
+    // 绑定根由注册表统一做单根校验；前面的检查已经保证这里不会因冲突失败。
+    const opened = await deps.service.spaces.open(resolved)
+    return initSuccess(opened, roles, false)
+  })
+}
+
+interface RoleCopyResult {
+  /** 本次实际写入的默认角色。 */
+  copied: string[]
+  /** 已存在、保留用户档案的角色。 */
+  kept: string[]
+}
+
+/**
+ * 只补缺：已存在的 `.takt/agents/<role>.md` 一律保留，不覆盖用户修改。
+ *
+ * 目录或符号链接不能被当成“已存在角色”静默保留：符号链接可能指向空间外，
+ * 目录会让运行期读取角色时悄悄回退到默认档案。两种情况都明确失败。
+ */
+async function copyBundledRoles(space: SpaceHandle): Promise<RoleCopyResult> {
+  const dir = path.join(space.stores.taktDir, 'agents')
+  await mkdir(dir, { recursive: true })
+  const copied: string[] = []
+  const kept: string[] = []
+  for (const file of BUNDLED_ROLE_FILES) {
+    const target = path.join(dir, file.fileName)
+    const info = await assertNoSymlinkPath(space.stores.taktDir, target, `角色文件 ${file.fileName}`)
+    if (info !== undefined && !info.isFile()) {
+      throw spaceConflict(
+        `角色文件不是普通文件：${target}`,
+        '删除同名目录或特殊文件后重试；不会用默认角色覆盖它。',
+      )
+    }
+    try {
+      await writeFile(target, `${file.content}\n`, { encoding: 'utf8', flag: 'wx' })
+      copied.push(file.role)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        kept.push(file.role)
+        continue
+      }
+      throw error
+    }
+  }
+  return { copied, kept }
+}
+
+function initSuccess(space: SpaceHandle, roles: RoleCopyResult, alreadyInitialized: boolean): LeadToolResult {
+  const summary = alreadyInitialized
+    ? `空间 ${space.root} 已初始化；补齐默认角色 ${roles.copied.length} 个`
+    : `已初始化空间 ${space.root}；复制默认角色 ${roles.copied.length} 个`
+  return success(
+    summary,
+    {
+      initialized: true,
+      alreadyInitialized,
+      space: { root: space.root },
+      roles,
+    },
+    [
+      'takt_status',
+      'takt_requirement create title="需求标题" requestKey="<稳定唯一键>"',
+    ],
+  )
+}
+
+function spaceConflict(message: string, hint: string): TaktToolError {
+  return new TaktToolError('TAKT_SPACE_ROOT_MISMATCH', message, hint)
+}
+
+/** child 是否在 parent 内部（不包含相等）；与 SpaceRegistry 的判定保持一致。 */
+function isInside(child: string, parent: string): boolean {
+  const relative = path.relative(parent, child)
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+}
+
+/** 从 start 的父目录向上找 takt.config.json；start 本身已确认不是空间。 */
+async function findAncestorSpace(start: string): Promise<string | undefined> {
+  let current = path.dirname(start)
+  for (;;) {
+    if (await exists(path.join(current, 'takt.config.json'))) return current
+    const parent = path.dirname(current)
+    if (parent === current) return undefined
+    current = parent
+  }
+}
+
+async function exists(target: string): Promise<boolean> {
+  try {
+    await access(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * init 写盘前的路径安全检查。
+ *
+ * core initProject 会写 `takt.config.json` 和 `.takt/{agents,workflows,workspaces,
+ * objects,runs}`；任一组件是符号链接都会把写入导向空间根之外，必须在任何写入
+ * （包括幂等补齐角色）之前拒绝。不存在的路径视为安全。
+ */
+async function assertInitPathsSafe(root: string): Promise<void> {
+  const config = await assertNoSymlinkPath(root, path.join(root, 'takt.config.json'), '配置文件')
+  if (config !== undefined && !config.isFile()) {
+    throw spaceConflict(
+      `配置文件不是普通文件：${path.join(root, 'takt.config.json')}`,
+      '移走同名目录或特殊文件后重试。',
+    )
+  }
+  const taktDir = path.join(root, '.takt')
+  const takt = await assertNoSymlinkPath(root, taktDir, '.takt 目录')
+  if (takt !== undefined && !takt.isDirectory()) {
+    throw spaceConflict(`.takt 不是普通目录：${taktDir}`, '移走同名文件后重试。')
+  }
+  for (const sub of INIT_SUBDIRS) {
+    const target = path.join(taktDir, sub)
+    const info = await assertNoSymlinkPath(root, target, `.takt/${sub} 目录`)
+    if (info !== undefined && !info.isDirectory()) {
+      throw spaceConflict(`.takt/${sub} 不是普通目录：${target}`, '移走同名文件后重试。')
+    }
+  }
+  for (const file of BUNDLED_ROLE_FILES) {
+    const target = path.join(taktDir, 'agents', file.fileName)
+    const info = await assertNoSymlinkPath(root, target, `角色文件 ${file.fileName}`)
+    if (info !== undefined && !info.isFile()) {
+      throw spaceConflict(
+        `角色文件不是普通文件：${target}`,
+        '删除同名目录或特殊文件后重试；不会用默认角色覆盖它。',
+      )
+    }
+  }
+}
+
+/** 从 root 到 target 的每个已存在组件都不能是符号链接；返回 target 的 lstat。 */
+async function assertNoSymlinkPath(
+  root: string,
+  target: string,
+  label: string,
+): Promise<Awaited<ReturnType<typeof lstat>> | undefined> {
+  try {
+    await assertNoSymlinks(root, target)
+  } catch {
+    throw spaceConflict(
+      `${label}不能包含符号链接：${target}`,
+      '移走符号链接后重试；init 不会把文件写到空间根之外。',
+    )
+  }
+  try {
+    return await lstat(target)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
   }
 }
 
@@ -518,14 +781,15 @@ async function createRequirement(
 
   const { requirement, deduped, record } = outcome
   return success(
-    `${deduped ? '复用' : '已创建'}需求 ${requirement.id} 并绑定到当前会话`,
+    `${deduped ? '复用' : '已创建'}需求 ${requirement.id} 并绑定到当前会话；用户要求启动时，下一步直接 takt_run start`,
     {
       bound: true,
       requirement: requirementSummary(requirement),
       deduped,
       audit: { by: human, at: record.createdAt },
     },
-    ['takt_status', 'takt_run start requestKey="<稳定唯一键>" workflow="p0-delivery"'],
+    // 模型常在 create 后停下等用户确认；第一条就给出可直接执行的 start。
+    [`takt_run action="start" workflow="p0-delivery" requestKey="start-${requirement.id}"`, 'takt_status'],
   )
 }
 
@@ -605,7 +869,8 @@ async function bindRequirement(
       requirement: requirementSummary(requirement),
       audit: { by: deps.human, at: new Date().toISOString() },
     },
-    ['takt_status', 'takt_run start requestKey="<稳定唯一键>" workflow="p0-delivery"'],
+    // 模型常在 create 后停下等用户确认；第一条就给出可直接执行的 start。
+    [`takt_run action="start" workflow="p0-delivery" requestKey="start-${requirement.id}"`, 'takt_status'],
   )
 }
 
@@ -1219,8 +1484,9 @@ function toFailure(error: unknown): LeadToolResult {
 function defaultHint(code: LeadErrorCode): string {
   switch (code) {
     case 'TAKT_NO_SPACE':
+      return '当前目录还不是空间：用 takt_requirement action="init" 在当前会话目录初始化。'
     case 'TAKT_SPACE_ROOT_MISMATCH':
-      return '会话工作目录必须是包含 takt.config.json 的空间根。'
+      return '会话工作目录必须是空间根；子目录或其它根请切回正确目录。'
     case 'TAKT_NOT_BOUND':
       return '先用 takt_status 确认空间与绑定，再执行 create/bind。'
     case 'TAKT_LEASE_HELD':
@@ -1245,6 +1511,7 @@ function defaultHint(code: LeadErrorCode): string {
 function defaultNextAction(code: LeadErrorCode): string {
   switch (code) {
     case 'TAKT_NO_SPACE':
+      return 'takt_requirement action="init"（在当前会话目录初始化空间）'
     case 'TAKT_SPACE_ROOT_MISMATCH':
       return '把会话工作目录切到包含 takt.config.json 的空间根，再调用 takt_status'
     case 'TAKT_NOT_BOUND':
@@ -1307,11 +1574,24 @@ function invalidAction(tool: string, action: string, supported: readonly string[
   )
 }
 
+/**
+ * 工具渲染：一行摘要 + 完整结构化 JSON。
+ *
+ * dsh ToolRuntime 保存并送模型的是 render 的 content，而不是 execute 的 canonical
+ * value；只给摘要会让模型拿不到 requestId / next_actions / error.hint。JSON 放在
+ * 独立的 text block，模型与验收脚本都能直接解析。
+ */
 function renderResult(_args: unknown, value: JsonValue): ContentBlock[] {
   const summary = isRecord(value) && typeof value.summary === 'string'
     ? value.summary
     : 'taktflow 工具已完成'
-  return [{ type: 'text', text: oneLine(summary) || 'taktflow 工具已完成' }]
+  const blocks: ContentBlock[] = [{ type: 'text', text: oneLine(summary) || 'taktflow 工具已完成' }]
+  try {
+    blocks.push({ type: 'text', text: JSON.stringify(value, null, 2) })
+  } catch {
+    // execute 的返回值本应始终可 JSON 序列化；极端情况下保留摘要，不让渲染失败。
+  }
+  return blocks
 }
 
 // ---------------------------------------------------------------- 参数与数据

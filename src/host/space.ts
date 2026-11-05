@@ -1,6 +1,7 @@
 import { access, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { createInsights, openProject } from '@taktflow/core'
+import { withSpaceMutationLock } from './space-lock.js'
 import { TaktToolError, type SpaceHandle, type SpaceRegistry } from './types.js'
 
 const CONFIG_FILE = 'takt.config.json'
@@ -13,14 +14,14 @@ const CONFIG_FILE = 'takt.config.json'
  * 所以这里先确认“配置就在给定目录里”，再打开并核对 projectDir。
  *
  * open 串行化：并发打开同一个根返回同一个 handle；并发打开不同根只有一个成功。
- * 只有成功打开后才绑定根，失败不会占住空间，可以重试。
+ * 锁与 `takt_requirement init` 共用（space-lock），保证 init 的写盘与 open 的
+ * 单根检查不会交错。只有成功打开后才绑定根，失败不会占住空间，可以重试。
  */
 export class FsSpaceRegistry implements SpaceRegistry {
   private readonly configured: string[]
   private readonly cache = new Map<string, SpaceHandle>()
   private root: string | undefined
   private configuredResolved: Promise<string[]> | undefined
-  private rootLock: Promise<void> = Promise.resolve()
 
   constructor(config: { spaces?: string[] } = {}) {
     this.configured = (config.spaces ?? []).map((space) => path.resolve(space))
@@ -34,8 +35,8 @@ export class FsSpaceRegistry implements SpaceRegistry {
 
   async open(root: string): Promise<SpaceHandle> {
     const resolved = await this.realpath(root, '空间根不存在或不可访问')
-    await this.assertConfiguredRoot(resolved)
-    return this.exclusive(async () => {
+    return withSpaceMutationLock(async () => {
+      await this.assertConfiguredRoot(resolved)
       const cached = this.cache.get(resolved)
       if (cached !== undefined) return cached
       this.assertSingleRoot(resolved)
@@ -111,21 +112,6 @@ export class FsSpaceRegistry implements SpaceRegistry {
       `当前目录不是 Taktflow 空间根：${resolved}`,
       '在空间根初始化项目，或在宿主配置里设置 spaces。',
     )
-  }
-
-  /** 串行化 open，保证“检查根 → 绑定根”之间没有竞态。 */
-  private async exclusive<T>(task: () => Promise<T>): Promise<T> {
-    const previous = this.rootLock
-    let release!: () => void
-    this.rootLock = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    await previous
-    try {
-      return await task()
-    } finally {
-      release()
-    }
   }
 
   /** 解析配置里的根并去重；多个不同 realpath 是配置错误。 */

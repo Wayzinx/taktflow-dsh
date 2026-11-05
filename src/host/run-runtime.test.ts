@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
@@ -24,6 +24,81 @@ it('角色解析保留allowBash与skills，错误的allowBash不能静默忽略'
   expect((await loadRunProfiles(space)).dev).toMatchObject({ allowBash: true, skills: ['review'], instructions: '角色说明' })
   await writeFile(file, markdown.replace('allowBash: true', 'allowBash: yes'))
   await expect(loadRunProfiles(space)).rejects.toThrow('allowBash 必须是 boolean')
+})
+
+it('随包默认角色覆盖 p0-delivery 的四个角色且都不允许 shell', async () => {
+  const { space } = await fixture()
+  const profiles = await loadRunProfiles(space)
+  expect(Object.keys(profiles).sort()).toEqual(['analyst', 'architect', 'dev', 'reporter'])
+  expect(profiles.analyst).toMatchObject({ harness: { harness: 'dsh-host' }, allowBash: false, writeScope: [] })
+  expect(profiles.architect).toMatchObject({ allowBash: false, writeScope: ['.takt/workspaces/*/design/**'] })
+  expect(profiles.dev).toMatchObject({ allowBash: false, writeScope: ['src/**'] })
+  expect(profiles.reporter).toMatchObject({ allowBash: false, writeScope: ['.takt/workspaces/*/reports/**'] })
+  for (const profile of Object.values(profiles)) expect(profile.instructions.length).toBeGreaterThan(0)
+})
+
+it('角色文件是目录或符号链接时拒绝，不静默回退默认角色', async () => {
+  const { root, space, stores } = await fixture()
+  const agents = join(stores.taktDir, 'agents')
+  const outside = join(root, 'outside')
+  await mkdir(outside)
+
+  await mkdir(join(agents, 'dev.md'))
+  await expect(loadRunProfiles(space)).rejects.toThrow('角色文件不是普通文件')
+  await rm(join(agents, 'dev.md'), { recursive: true, force: true })
+
+  const outsideFile = join(outside, 'dev.md')
+  await writeFile(outsideFile, '---\nrole: dev\nharness: dsh-host\n---\n空间外角色')
+  await symlink(outsideFile, join(agents, 'dev.md'))
+  await expect(loadRunProfiles(space)).rejects.toThrow('不能是符号链接')
+})
+
+it('角色目录是符号链接时拒绝', async () => {
+  const { root, space, stores } = await fixture()
+  const agents = join(stores.taktDir, 'agents')
+  const outside = join(root, 'outside-agents')
+  await mkdir(outside)
+  await rm(agents, { recursive: true, force: true })
+  await symlink(outside, agents)
+  await expect(loadRunProfiles(space)).rejects.toThrow('角色目录不是普通目录')
+})
+
+it('祖先 .takt 是符号链接时拒绝，不能读到空间外的角色', async () => {
+  const { root, space, stores } = await fixture()
+  const taktDir = stores.taktDir
+  const outside = join(root, 'outside-takt')
+  await rename(taktDir, outside)
+  await symlink(outside, taktDir)
+  await expect(loadRunProfiles(space)).rejects.toThrow('符号链接')
+})
+
+it('文件名与声明 role 不一致时拒绝，避免同时顶掉两个角色', async () => {
+  const { space, stores } = await fixture()
+  await writeFile(
+    join(stores.taktDir, 'agents/dev.md'),
+    '---\nrole: analyst\nharness: dsh-host\n---\n冒充分析师',
+  )
+  await expect(loadRunProfiles(space)).rejects.toThrow('角色名与文件名不一致')
+})
+
+it('空间同名角色覆盖默认档案，并进入运行冻结', async () => {
+  const { root, space, stores } = await fixture()
+  const workflow: WorkflowDefinition = { id: 'test', version: '1', title: '测试', stages: [], nodes: [] }
+  const before = await loadRunRuntime(space, workflow)
+  await writeFile(
+    join(stores.taktDir, 'agents/dev.md'),
+    '---\nrole: dev\nharness: dsh-host\nallowBash: false\nwriteScope: ["custom/**"]\n---\n空间自定义开发角色',
+  )
+  const after = await loadRunRuntime(space, workflow)
+  expect(before.profiles.dev?.instructions).not.toBe('空间自定义开发角色')
+  expect(after.profiles.dev).toMatchObject({
+    instructions: '空间自定义开发角色',
+    writeScope: ['custom/**'],
+    allowBash: false,
+  })
+  // 运行开始时冻结：之后改磁盘不影响已加载的 runtime。
+  await writeFile(join(root, 'takt.config.json'), JSON.stringify({ ...stores.config, contextBudgetTokens: 4321 }))
+  expect(after.space.stores.config.contextBudgetTokens).not.toBe(4321)
 })
 
 it('新运行读取最新配置并隔离其对象，workflow函数保留且容器不共享', async () => {

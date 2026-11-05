@@ -3,9 +3,8 @@ import path from 'node:path'
 import {
   acquireLease, assertRunId, createEngine, readLease, releaseLease, renewLease,
   type Actor, type Lease, type RunId,
+  withFileLock, assertNoSymlinks, readJsonFile, toJsonText, writeFileAtomic,
 } from '@taktflow/core'
-import { withFileLock } from '../../vendor/taktflow/packages/core/src/store/file-lock.js'
-import { assertNoSymlinks, readJsonFile, toJsonText, writeFileAtomic } from '../../vendor/taktflow/packages/core/src/store/fs-utils.js'
 import type { HostContext, Disposer } from './dsh-types.js'
 import { TaktToolError } from './types.js'
 import type { EndReason, Ownership, RunOwnerMeta, SpaceHandle } from './types.js'

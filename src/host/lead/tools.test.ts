@@ -1205,12 +1205,17 @@ describe('首次调用友好度', () => {
     }
   })
 
-  it('错误结果可以直接渲染成一行文本', async () => {
+  it('结果渲染成一行摘要和完整结构化 JSON', async () => {
     const h = await makeHarness()
     const tool = h.tools.get('takt_requirement')!
     const result = await tool.execute({ action: 'create' }, execFor(h.rootAgent)) as LeadToolResult
     const blocks = tool.output.render({}, result as unknown as never)
-    expect(blocks).toEqual([{ type: 'text', text: result.summary }])
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0]).toEqual({ type: 'text', text: result.summary })
+    // dsh 保存/送模型的是 content；结构化字段必须在 JSON block 里完整可见。
+    expect(JSON.parse((blocks[1] as { text: string }).text)).toEqual(result)
+    expect((blocks[1] as { text: string }).text).toContain('next_actions')
+    expect((blocks[1] as { text: string }).text).toContain('TAKT_INVALID_INPUT')
   })
 
   it('工具渲染与错误摘要都不透传换行', async () => {
@@ -1232,7 +1237,12 @@ describe('首次调用友好度', () => {
       summary: '第一行\n第二行',
       next_actions: [],
     } as unknown as never)
-    expect(rendered).toEqual([{ type: 'text', text: '第一行 第二行' }])
+    expect(rendered[0]).toEqual({ type: 'text', text: '第一行 第二行' })
+    expect(JSON.parse((rendered[1] as { text: string }).text)).toEqual({
+      ok: false,
+      summary: '第一行\n第二行',
+      next_actions: [],
+    })
   })
 })
 

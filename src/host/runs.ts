@@ -1,6 +1,5 @@
-import { createEngine, type Actor, type AttentionItem, type Engine, type ProjectStores, type RunId, type RunState } from '@taktflow/core'
+import { createEngine, type Actor, type AttentionItem, type Engine, type ProjectStores, type RunId, type RunState, updateRequirement } from '@taktflow/core'
 import { collectSecrets, createRedactor } from '@taktflow/harness'
-import { updateRequirement } from '../../vendor/taktflow/packages/core/src/engine/requirement.js'
 import type { HostContext } from './dsh-types.js'
 import { createDshHarness, type DshHarness } from './dsh-harness.js'
 import { assertRuntimeIdentity, loadRunRuntime, recordRuntimeIdentity, type RunRuntime } from './run-runtime.js'

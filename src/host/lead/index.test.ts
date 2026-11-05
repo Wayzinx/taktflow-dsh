@@ -10,6 +10,8 @@ import {
   type LeadContext,
 } from './index.js'
 import { LEAD_TOOL_NAMES } from './tools.js'
+import { LEAD_PROMPT_SECTION } from './prompt.js'
+import { LEAD_SKILL } from './skill.js'
 import { apply as applyRole, inject as roleInject, name as roleName, type RoleContext } from '../role/index.js'
 
 const { loadDefineToolMock } = vi.hoisted(() => ({ loadDefineToolMock: vi.fn() }))
@@ -33,6 +35,11 @@ describe('taktflow/lead 行', () => {
   it('inject 只包含宿主门面、工具、提示词、技能与 agents', () => {
     expect(leadName).toBe('taktflow/lead')
     expect(leadInject).toEqual(['taktflow', 'tools', 'systemPrompt', 'skills', 'agents'])
+  })
+
+  it('用户已要求启动时，提示词与 skill 要求 create 后同回合继续 start', () => {
+    expect(LEAD_PROMPT_SECTION.text).toContain('同一回合继续 start')
+    expect(LEAD_SKILL.content).toContain('同一回合继续 `takt_run start`')
   })
 
   it('apply 注册一段提示词、一个 skill 和六个工具，dispose 后移除', async () => {

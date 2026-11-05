@@ -1,16 +1,16 @@
 # 开发说明
 
-Taktflow 的 DeepSeek Harness 插件包。当前骨架提供**可加载的宿主骨架 + 冻结的内部接口 + S4 验证脚本**，不是可运行的 P0 流水线：空间注册表、插件注册与清理、ping 面板可用；运行/审批/通知等业务方法仍显式抛 `not implemented`。
+Taktflow 的 DeepSeek Harness 插件包。P0 已接通宿主、Lead 工具、随包角色、真实子 Agent、审批、通知、业务面板和随包 `p0-delivery` 流程；隔离 web profile 下的真实 dsh + 真实模型端到端已通过（见文末 P0 e2e）。P1（从节点重跑、产物回退、配方指纹、归因视图）仍未实现。
 
 ## 包入口
 
 | export | 文件 | 作用 |
 | --- | --- | --- |
 | `.` | `lib/host.js` | 宿主行：注册 `taktflow` 服务与 `GET /api/taktflow.ping` |
-| `./lead` | `lib/lead.js` | Lead 行：提示词段与 bundled skill；Lead 层（M-D）注册工具 |
+| `./lead` | `lib/lead.js` | Lead 行：提示词段、bundled skill 与 `takt_*` 工具 |
 | `./role` | `lib/role.js` | 角色行：节点 Agent 的提示词段与 bundled skill |
-| `./client` | `lib/client.js` | Web 客户端模块：侧边栏入口 + 主面板占位 |
-| `./workflows/*` | `lib/workflows/*.js` | 工作流入口占位；调用 `loadP0DeliveryWorkflow()` 即抛错 |
+| `./client` | `lib/client.js` | Web 客户端模块：侧边栏入口、需求/运行/审批面板 |
+| `./workflows/*` | `lib/workflows/*.js` | 随包流程：`p0-delivery` 澄清 → 系分 → 人工审批 → 实现 → 测试 → 报告 |
 | `./locale/*.json`、`./icon` | `locale/`、`icon.svg` | 文案与图标 |
 
 `package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，其中包含宿主行和 `taktflow` preset 行。安装方式：
@@ -29,22 +29,22 @@ dsh plugin --profile web add /absolute/path/to/taktflow-0.0.0.tgz
   - `roots()`：已解析的 realpath 根列表，P0 最多一个；未配置且尚未打开时为 `[]`。
 - **宿主行生命周期**：`apply` 通过 `ctx.effect` 注册 `taktflow` 服务、ping 路由和 `runs.disposeAll` 清理；重复 dispose 幂等。
 - **`taktflow.ping`**：`GET /api/taktflow.ping` 返回 `{ ok: true, version }`，只用于 S4 验证宿主是否加载。
-- **Lead / Role 行**：注册固定提示词段和 `source: 'bundled'` 的 skill。Lead 只声明 6 个工具名，**不注册**工具；`approval_answer` 是人的动作，绝不暴露给 Lead。
-- **客户端模块**：factory 返回 `{ inject: ['slots'], apply }`；面板样式在挂载时插入、卸载时移除，只使用宿主真实的 `--dsw-alias-*` token；ping 请求带 `AbortController`，卸载时取消。
+- **Lead / Role 行**：注册固定提示词段和 `source: 'bundled'` 的 skill；Lead 行同时注册 `takt_*` 工具。`approval_answer` 是人的动作，绝不暴露给 Lead。
+- **随包角色**：`src/roles/defaults.ts` 内嵌 analyst / architect / dev / reporter 的 frontmatter 文本，由 esbuild 打入 `lib/*.js` 构建产物（共享 chunk，不保证固定文件名）。四个角色都是 `harness: dsh-host`、`allowBash: false`；dev 的 writeScope 与 `p0-delivery` 的 `src/**` 一致。空间 `.takt/agents/<role>.md` 存在时覆盖随包默认；角色目录/文件 symlink、文件名与 role 不一致、重复角色都拒绝，不静默回退。
+- **`takt_requirement init`**：在可信会话 cwd 初始化空间，复制缺失的默认角色（不覆盖用户档案）；已有空间幂等，子目录、祖先空间、与已绑定根冲突、symlink/特殊路径都在写盘前拒绝。与 `SpaceRegistry.open` 共用可重入的写锁，避免 init→open 自死锁和并发初始化竞争。
+- **Lead 工具**：`takt_status`、`takt_requirement`（init/create/bind）、`takt_artifact`（list/read/log/write）、`takt_run`（start/cancel/get）、`takt_trace`（audit）、`takt_ask_human`。身份只取 dsh 可信上下文；结果统一 `{ ok, summary, next_actions, error? }`，render 同时给一行摘要和完整 JSON。
+- **执行层**：`DshRunManager` 固定开始时的工作流/角色/知识源，`requestKey` 去重；子 Agent 先登记权限再启动；取消、Lead 离线、宿主丢失、等待审批、恢复身份校验都有测试。`dsh-host` harness 使用真实 dsh 子会话。
+- **审批与通知**：`takt_ask_human` 用 blocking waterfall 呈现原生问题卡片；`Approvals.answer` 校验 attempt、节点状态、冻结产物版本，已回答幂等；`Notifier` 通过 `agent.followup` / `agent.inject` 推送 `[taktflow]` 消息和状态快照。
+- **客户端模块**：factory 返回 `{ inject: ['slots'], apply }`；面板样式在挂载时插入、卸载时移除，只使用宿主真实的 `--dsw-alias-*` token；请求带 `AbortController`，卸载时取消。
 - **构建**：`scripts/build.mjs` 产出 `lib/host.js`、`lib/lead.js`、`lib/role.js`、`lib/client.js`、`lib/workflows/*.js`，并做静态检查（宿主 bundle 不得裸导入 `@taktflow/*`、客户端只允许白名单外部依赖、CSS 前缀转换）。
 
-## 尚未实现的业务
+## 未覆盖 / P1
 
-以下列的是冻结契约的目标行为，当前业务方法均抛 `not implemented`，不能当作已交付能力。`Ownership.hostOwner` 和 `RunManager.disposeAll()` 是例外：前者可读取宿主标识，后者已实现幂等清理。
-
-- `Ownership`：租约、`hostOwner`（默认 `dsh:<hostId>`，与审计用户 `Config.user` 无关）、运行元数据、`endReason`。
-- `RunManager`：`start` / `cancel` / `resume` / `get` / `onAnswered`；`requestKey` 去重，终态不可再改。
-- `PermissionRegistry`：子 Agent 的 `writeScope` / `allowBash` / `readOnly`；未登记的 Agent 不受本插件守卫影响。
-- `RolePresets`：按角色与 variant 租用 preset；越权抛 `TAKT_FORBIDDEN_FOR_LEAD`。
-- `Bindings`：需求 ↔ 会话绑定，未绑定返回 `undefined`。
-- `Approvals`：`present` 用 `ToolExecutionContext.agent` + `signal` 调 `ctx.userQuestions.ask`；`answer` 对已回答请求**幂等返回已有结果**，不抛错。
-- `Notifier`：需求群聊/运行事件通知桥；`attach` / `detach` 幂等。
-- `dsh-host` harness：`id: 'dsh-host'`（`dsh` 已被 CLI 适配器占用），`available()` 返回不可用，`run()` 抛 `not implemented`。
+- `update` / `import_link`、`diff` / `revert` / `comment`、`rerun_from` / `dispatch` / `ask`、`coverage` / `why` / `compare` 等 action 返回明确的 P1 提示。
+- 多空间、跨需求批量操作不在 P0 范围；P0 只支持一个空间根和一个会话绑定一个需求。
+- P0 所有角色都没有 shell；测试由流程里的 `script` 节点执行。强杀后的失效租约仍需人工确认接管。
+- 流程没有 review 节点；`p0-delivery` 固定为澄清 → 系分 → 人工审批 → 实现 → 测试 → 报告。
+- 面板覆盖项目、需求、运行、待办和产物；P1 的归因/回退视图尚未实现。
 
 ## `endReason` 语义
 
@@ -74,15 +74,15 @@ dsh plugin --profile web add /absolute/path/to/taktflow-0.0.0.tgz
 | `TaktflowService` | `spaces`、`ownership`、`runs`、`permissions`、`presets`、`bindings`、`approvals`、`notifier`，分别使用上列接口 |
 | `TaktToolError` | `extends Error`；`code: TaktErrorCode`；`hint?: string`；构造参数 `(code, message, hint?)` |
 
-`TaktErrorCode` 为 `TAKT_NO_SPACE`、`TAKT_SPACE_ROOT_MISMATCH`、`TAKT_NOT_BOUND`、`TAKT_LEASE_HELD`、`TAKT_RUN_BUSY`、`TAKT_STALE_VERSION`、`TAKT_FORBIDDEN_FOR_LEAD`、`TAKT_UNSUPPORTED_NODE`。接口说明中的业务错误属于后续实现契约；当前占位统一报 `not implemented`。
+`TaktErrorCode` 为 `TAKT_NO_SPACE`、`TAKT_SPACE_ROOT_MISMATCH`、`TAKT_NOT_BOUND`、`TAKT_LEASE_HELD`、`TAKT_RUN_BUSY`、`TAKT_STALE_VERSION`、`TAKT_FORBIDDEN_FOR_LEAD`、`TAKT_UNSUPPORTED_NODE`。工具层在冻结码之外增加 `TAKT_INVALID_INPUT`、`TAKT_UNSUPPORTED_ACTION`、`TAKT_INTERNAL`，统一转成结构化错误返回给模型。
 
 与最早简报的命名差异：以 `EndReason` / `RunOwnerMeta.endReason` / `Ownership.setEndReason` 取代 `PauseInfo` / `pause` / `setPause`，因为 P0 离线和宿主丢失会终止运行，不能恢复；增加 `SpaceRegistry.roots()`、`StartRunInput` 和 `RolePresetHandle` 的显式类型。
 
-## 后续接线
+## 接线结果
 
-- **M-C**：实现 `dsh-host` harness、角色 preset 租用、权限守卫、所有权与运行生命周期；复用 core 租约，先登记 childId 权限再 `startActivation`，在全部终止路径释放资源。P0 不允许角色执行 shell。
-- **M-D**：实现 Lead 六个工具、Bindings、Approvals、Notifier、业务 HTTP 路由和完整随包流程。`loadP0DeliveryWorkflow()` 当前直接抛 `not implemented`；计划流程为澄清 → 系分 → 人工审批 → 实现 → 测试 → 报告，尚未实现，不包含 review 节点。审批已回答时幂等返回，过期 attempt/产物版本拒绝。
-- **M-F**：在当前 `sidebar.panellist` / `main` 槽位接入需求、运行与待办面板；使用内存路由和 `.takt-root` 作用域，不改宿主主题；API 失败显示错误，不回退 mock。样式、请求与槽位注册必须随卸载清理。
+- **M-C（执行层）**：`dsh-host` harness、角色 preset 租用、权限守卫、所有权与运行生命周期已接通；复用 core 租约，先登记 childId 权限再 `startActivation`，在全部终止路径释放资源。P0 不允许角色执行 shell。
+- **M-D（Lead 层）**：六个 `takt_*` 工具、Bindings、Approvals、Notifier、业务 HTTP 路由和随包 `p0-delivery` 流程已接通；流程为澄清 → 系分 → 人工审批 → 实现 → 测试 → 报告，不包含 review 节点。审批已回答时幂等返回，过期 attempt/产物版本拒绝。
+- **M-F（客户端）**：在 `sidebar.panellist` / `main` 槽位接入项目、需求、运行、待办与产物面板；使用内存路由和 `.takt-root` 作用域，不改宿主主题；API 失败显示错误，不回退 mock。样式、请求与槽位注册随卸载清理。
 
 ## 构建与单测
 
@@ -96,9 +96,9 @@ npm test
 npm run pack:takt
 ```
 
-## S4 隔离 profile e2e
+## 隔离 profile e2e
 
-脚本：`e2e/profile.mjs`、`e2e/boot.mjs`，共享工具在 `e2e/lib.mjs`。
+脚本：`e2e/profile.mjs`、`e2e/boot.mjs`、`e2e/p0.mjs`，审批卡片 helper 为 `e2e/answer-ws.mjs`，共享工具在 `e2e/lib.mjs`。
 
 ```bash
 export TAKT_E2E_BASE_URL=...   # 模型服务的 chat-completions base URL
@@ -106,12 +106,16 @@ export TAKT_E2E_MODEL=...      # 模型 id
 export TAKT_E2E_API_KEY=...    # 仅通过进程环境传入
 node e2e/profile.mjs
 node e2e/boot.mjs
+node e2e/p0.mjs                # 完整 P0：初始化 → 建需求 → 启动 → 审批 → 产物/测试/审计/面板/通知
 ```
 
 可选变量：
 
 - `DSH_BIN`：dsh 可执行文件路径；缺省使用本机安装路径，再退回 PATH 里的 `dsh`。
 - `TAKT_E2E_HOME`：隔离的 `DSH_HOME`；缺省为 `os.tmpdir()/taktflow-dsh-e2e`。
+- `TAKT_E2E_REUSE_PROFILE=1`：复用上次成功安装的隔离 profile；目录失效或所有权标记不匹配时自动重新安装。
+- `TAKT_E2E_P0_TIMEOUT_MS`：P0 e2e 总超时，默认 20 分钟。
+- `TAKT_E2E_WS_TIMEOUT_MS`：等待审批卡片的 WebSocket 超时，默认 120 秒。
 
 安全与清理约定：
 
@@ -126,17 +130,18 @@ node e2e/boot.mjs
 
 生成的 `e2e/out/profile-result.json`、`boot-result.json` 和脱敏配置是本地证据，不在 npm 包中。`boot.mjs` 另导出 `startHost({ home, dshBin, env })` 供独立 UI 检查使用，返回 `{ url, child, workspace, stop, unref }`；URL 只能在当前进程传给浏览器，调用方必须 finally `stop()` 和 `cleanupOwnedHome(home)`。自动 E2E 不证明浏览器面板渲染或主题隔离；这些需单独用浏览器检查。
 
-2026-11-05 的 骨架验收已完成：dsh `0.2.1-rc.3` 下 profile **6/6**、boot **13/13**，真实 assistant 最终回复为 `pong`；独立浏览器 UI **8/8**，覆盖面板真实 ping `0.0.0`、主题 token、路径与根主题不变、卸载 style 清理、错误展示、恢复与 reload。UI 的 HTTP 503 来自浏览器 fetch 桩，只验证负例展示与恢复，不是服务器故障或真实模型验证；交互观察窗口内 `error` / `unhandledrejection` 为 0。
+2026-11-05 的验收分三层统计：骨架 profile **6/6**、boot **13/13**（真实 assistant 最终回复 `pong`）；独立浏览器 UI **8/8**（面板真实 ping、主题 token、路径边界、卸载清理、错误展示与恢复）；P0 业务端到端 **25/25**（最终批次 23:09–23:16 北京时间，真实 dsh + 真实模型，隔离 web profile）。P0 批次覆盖空间初始化、需求创建、运行启动、原生审批卡片、六个节点、产物版本、真实代码改动、`npm test`、事件链审计、面板读取、会话通知和 Lead 工具指标，详见 `docs/spike-notes.md` 的 P0 端到端小节。最终批次 8 次 Lead 工具调用中 7 次业务成功、1 次预期 `TAKT_NO_SPACE`；6 条通知均完成 `agent/inbox/spliced` 插入与 `user/message.id` 配对，并观察到 `运行结束：succeeded`。
 
-自动证据保留在 `e2e/out/api-run/`；UI 证据为 `e2e/out/ui-result.json` 和 `e2e/out/ui-panel.png`。两轮隔离目录已清理；UI 宿主无活动进程组成员，浏览器自动化会话已关闭。独立构建成功、类型检查无错误、8 个测试文件共 51 项测试通过，npm pack 清单检查通过。各层验证分别统计，不代表尚未实现的完整 P0 业务已通过。
+P0 判定是 fail-closed：任何 check `fail` / `not-run` 或显式异常都让进程非零退出；通知必须有真实会话投递证据，状态快照只作诊断；Lead 指标以全部 `takt_*` 调用为分母，pending/unknown 单列。P0 证据为 `e2e/out/p0-result.json`（最终批次另存 `e2e/out/p0-result-20261105-150916-final.json`）；自动安装证据保留在 `e2e/out/api-run/`，UI 证据为 `e2e/out/ui-result.json` 和 `e2e/out/ui-panel.png`。隔离目录在批次结束后清理；结果只保存脱敏摘要。各层验证分别统计；P0 e2e 通过代表主路径可用，不代表 P1 能力已实现。
 
-逐项断言与证据说明见 `docs/dsh-plugin/spike-notes.md` 的 S4 小节。
+逐项断言与证据说明见 `docs/spike-notes.md` 的 S1/S2 与 P0 端到端小节。
 
 - **代理**：dsh 用 Node `fetch` 统一走环境里的 HTTP(S) 代理，只有回环地址直连；`NO_PROXY` 里的网段写法（如 `10.0.0.0/8`）实测不生效。模型端点在代理之外时，要把**确切的主机名或 IP** 加进 `NO_PROXY`，否则请求会被送进代理、会话里一直没有 assistant 消息（2026-11-05 实测）。
 
 ## 已知限制
 
-- 除 `SpaceRegistry` 外的服务都是占位；工作流不可执行，Lead 工具未注册。
-- `dsh-host` harness 尚未实现，不能启动子 Agent。
-- 客户端只有侧边栏入口和 ping 状态面板；需求群聊、运行详情、审批交互属于客户端（M-F）。
-- 真实 e2e 需要可用的 chat-completions 端点和模型；缺少环境变量时脚本会直接报错，不会跳过。
+- P0 只支持一个空间根和一个会话绑定一个需求；多空间、跨需求批量操作属于 P1。
+- P0 所有角色都没有 shell；代码改动由 `dsh-host` 子 Agent 完成，测试由流程的 `script` 节点执行。
+- `update` / `import_link` / `diff` / `revert` / `comment` / `rerun_from` / `dispatch` / `ask` / `coverage` / `why` / `compare` 等 action 尚未实现，会返回 P1 提示。
+- 流程没有 review 节点；强杀后的失效租约仍需人工确认接管。
+- 真实 e2e 需要可用的 chat-completions 端点和模型；缺少环境变量时脚本会直接报错，不会跳过。模型偶尔会在 create 后结束回合，Lead prompt 已要求同一回合继续 start，e2e 另保留自然语言 follow-up 兜底。

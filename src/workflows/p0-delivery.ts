@@ -9,10 +9,9 @@ import {
   type NodeDef,
   type NodeResult,
   type WorkflowDefinition,
+  runShellCommand,
 } from '@taktflow/core'
 import { collectSecrets, createRedactor } from '@taktflow/harness'
-// core 公开入口没有导出进程组取消工具；这里只读复用其内部实现，不改 vendor。
-import { command } from '../../vendor/taktflow/packages/core/src/engine/process.js'
 import { TaktToolError } from '../host/types.js'
 
 /** 随包流程的稳定 id；RunManager、工具与客户端都按这个 id 加载。 */
@@ -85,7 +84,7 @@ async function runTests(ctx: NodeContext): Promise<NodeResult | void> {
   let exitCode = 0
   let output = ''
   try {
-    const result = await command(commandText, ctx.projectDir, {
+    const result = await runShellCommand(commandText, ctx.projectDir, {
       TAKT_REQ: ctx.requirementId,
       TAKT_RUN_ID: ctx.runId,
       TAKT_NODE: ctx.nodeId,
@@ -219,7 +218,8 @@ export function loadP0DeliveryWorkflow(): WorkflowDefinition {
         writeScope: ['src/**'],
         prompt: [
           '按 design/design.md 在 src/ 下实现已批准方案。',
-          '保持改动最小，复用存量能力；不要修改设计文档、测试与流程文件。',
+          '保持改动最小，复用存量能力；可以在 src/ 内新增或调整测试，但不要修改设计文档、配置与流程文件。',
+          '不要运行命令；测试由流程的 script 节点统一执行。',
           '完成后用一段话说明改了什么、还有哪些风险。',
         ].join('\n'),
       }),

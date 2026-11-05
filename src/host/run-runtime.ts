@@ -1,14 +1,15 @@
-import { readdir, readFile } from 'node:fs/promises'
+import { lstat, readdir, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import {
   assertRunId, canonicalJson, openProject, parseFrontmatter, sha256,
   type AgentProfile, type HarnessSelector, type KnowledgeSource, type WorkflowDefinition,
+  assertNoSymlinks, readJsonFile, writeFileAtomic,
 } from '@taktflow/core'
 import {
   createApiRegistrySource, createCodeGraphSource, createDatabaseSource, createDefaultSources,
   createGitHistorySource, createGrepSource, createWikiSource, createWorkspaceSource,
 } from '@taktflow/knowledge'
-import { assertNoSymlinks, readJsonFile, writeFileAtomic } from '../../vendor/taktflow/packages/core/src/store/fs-utils.js'
+import { BUNDLED_ROLE_FILES } from '../roles/defaults.js'
 import { TaktToolError, type SpaceHandle } from './types.js'
 
 /** RunManager 在开始时固定的执行配置；等待审批期间仍复用这一份。 */
@@ -29,38 +30,73 @@ interface RuntimeIdentity {
 
 /**
  * preset 和 RunManager 共用的角色读取器；按 CLI runtime-profiles 的格式读取。
+ *
+ * 合并顺序：随包默认角色（analyst/architect/dev/reporter）→ 空间
+ * `.takt/agents/*.md`。同名空间文件覆盖默认，用户可以直接改；空间内部出现
+ * 同名角色仍然报错。合并结果参与 RunRuntime 的身份摘要和运行冻结。
+ *
  * 失败直接交给调用方，尤其不能把 allowBash:true 静默丢掉。
  */
 export async function loadRunProfiles(space: SpaceHandle): Promise<Record<string, AgentProfile>> {
+  const defaults = Object.create(null) as Record<string, AgentProfile>
+  for (const file of BUNDLED_ROLE_FILES) {
+    const profile = parseProfile(file.fileName, file.content, space)
+    if (Object.hasOwn(defaults, profile.role)) throw new Error(`随包角色名称重复：${profile.role}`)
+    defaults[profile.role] = profile
+  }
+
   const dir = join(space.stores.taktDir, 'agents')
+  // 角色目录本身是符号链接时，readdir 会把空间外的文件当成本空间角色；直接拒绝。
+  const dirInfo = await lstat(dir).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (dirInfo !== undefined && !dirInfo.isDirectory()) {
+    throw new Error(`角色目录不是普通目录：${dir}`)
+  }
+  // lstat 只保护最后一段；`.takt` 本身是符号链接时仍会读到空间外，必须逐段核对。
+  await assertNoSymlinks(space.root, dir)
   const entries = await readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return []
     throw error
   })
-  const result: Record<string, AgentProfile> = Object.create(null)
+  const overrides: Record<string, AgentProfile> = Object.create(null)
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!entry.isFile() || !entry.name.endsWith('.md')) continue
-    const { data, body } = parseFrontmatter(await readFile(join(dir, entry.name), 'utf8'))
-    const text = (key: string, fallback: string): string => typeof data[key] === 'string' && data[key] !== '' ? data[key] : fallback
-    const list = (key: string): string[] => {
-      const value = data[key]
-      if (value === undefined) return []
-      if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) throw new Error(`角色 ${entry.name} 的 ${key} 必须是字符串数组`)
-      return [...value] as string[]
+    if (!entry.name.endsWith('.md')) continue
+    // 目录/符号链接同名角色文件不能静默跳过，否则会悄悄回退到随包默认角色。
+    if (entry.isSymbolicLink()) throw new Error(`角色文件不能是符号链接：${entry.name}`)
+    if (!entry.isFile()) throw new Error(`角色文件不是普通文件：${entry.name}`)
+    const profile = parseProfile(entry.name, await readFile(join(dir, entry.name), 'utf8'), space)
+    // 文件名即角色名：dev.md 声明 role: analyst 会同时顶掉 analyst 并让 dev 回退默认。
+    if (profile.role !== entry.name.slice(0, -3)) {
+      throw new Error(`角色名与文件名不一致：${entry.name} 声明 role=${profile.role}`)
     }
-    const role = text('role', entry.name.slice(0, -3))
-    const harness = typeof data.harness === 'string' ? { harness: data.harness } : data.harness ?? space.stores.config.roles?.[role]
-    if (!harness || typeof harness !== 'object' || typeof (harness as HarnessSelector).harness !== 'string') throw new Error(`角色 ${role} 缺少 harness`)
-    if (data.allowBash !== undefined && typeof data.allowBash !== 'boolean') throw new Error(`角色 ${role} 的 allowBash 必须是 boolean`)
-    if (Object.hasOwn(result, role)) throw new Error(`角色名称冲突：${role}`)
-    result[role] = {
-      role, title: text('title', role), description: text('description', ''),
-      instructions: body.trim(), harness: structuredClone(harness as HarnessSelector),
-      skills: list('skills'), writeScope: list('writeScope'), allowBash: data.allowBash === true,
-      ...(data.readScope === undefined ? {} : { readScope: list('readScope') }),
-    }
+    if (Object.hasOwn(overrides, profile.role)) throw new Error(`角色名称冲突：${profile.role}`)
+    overrides[profile.role] = profile
   }
-  return result
+  return Object.assign(Object.create(null) as Record<string, AgentProfile>, defaults, overrides)
+}
+
+/** 解析单个角色文件；默认角色与空间角色共用，避免两套字段规则漂移。 */
+function parseProfile(fileName: string, content: string, space: SpaceHandle): AgentProfile {
+  const { data, body } = parseFrontmatter(content)
+  const text = (key: string, fallback: string): string => typeof data[key] === 'string' && data[key] !== '' ? data[key] : fallback
+  const list = (key: string): string[] => {
+    const value = data[key]
+    if (value === undefined) return []
+    if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) throw new Error(`角色 ${fileName} 的 ${key} 必须是字符串数组`)
+    return [...value] as string[]
+  }
+  const role = text('role', fileName.slice(0, -3))
+  const harness = typeof data.harness === 'string' ? { harness: data.harness } : data.harness ?? space.stores.config.roles?.[role]
+  if (!harness || typeof harness !== 'object' || typeof (harness as HarnessSelector).harness !== 'string') throw new Error(`角色 ${role} 缺少 harness`)
+  if (data.allowBash !== undefined && typeof data.allowBash !== 'boolean') throw new Error(`角色 ${role} 的 allowBash 必须是 boolean`)
+  return {
+    role, title: text('title', role), description: text('description', ''),
+    instructions: body.trim(), harness: structuredClone(harness as HarnessSelector),
+    skills: list('skills'), writeScope: list('writeScope'), allowBash: data.allowBash === true,
+    ...(data.readScope === undefined ? {} : { readScope: list('readScope') }),
+  }
 }
 
 /** RunManager 开始时调用；配置来自本次磁盘读取，既有运行不受后续修改影响。 */

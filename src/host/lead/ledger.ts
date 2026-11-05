@@ -1,8 +1,6 @@
 import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
-import { assertRequirementId, canonicalJson, sha256, type Actor } from '@taktflow/core'
-import { withFileLock } from '../../../vendor/taktflow/packages/core/src/store/file-lock.js'
-import { readJsonFile, toJsonText, writeFileAtomic } from '../../../vendor/taktflow/packages/core/src/store/fs-utils.js'
+import { assertRequirementId, canonicalJson, sha256, type Actor, withFileLock, readJsonFile, toJsonText, writeFileAtomic } from '@taktflow/core'
 import type { SpaceHandle } from '../types.js'
 
 /**

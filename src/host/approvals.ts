@@ -9,8 +9,8 @@ import {
   type AttentionItem,
   type NodeState,
   type WorkflowSnapshot,
+  withFileLock,
 } from '@taktflow/core'
-import { withFileLock } from '../../vendor/taktflow/packages/core/src/store/file-lock.js'
 import type { Agent, HostContext, ToolExecutionContext, UserAnswer, UserQuestion } from './dsh-types.js'
 import { notImplemented } from './errors.js'
 import { TaktToolError, type AnswerInput, type Approvals, type Ownership, type RunManager, type SpaceHandle } from './types.js'

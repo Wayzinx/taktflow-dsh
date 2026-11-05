@@ -91,10 +91,11 @@ describe('RunManager 真实 core 生命周期', () => {
 
   it('缺角色在发布前拒绝；owner写失败在发布后把已创建状态收敛failed', async () => {
     const f = await fixture()
-    await rm(f.roleFile)
+    // 随包默认角色始终存在，只有既非随包也未落盘的角色才算缺失。
+    f.setWorkflow(definition([agent({ id: 'work', title: '执行', role: 'ghost', harness: { harness: 'dsh-host' }, prompt: '完成任务', writeScope: [] })]))
     await expect(f.manager.start(f.input)).rejects.toThrow('角色不存在')
     expect(await f.space.stores.runs.list()).toHaveLength(0)
-    await writeFile(f.roleFile, f.roleText())
+    await writeFile(join(f.stores.taktDir, 'agents', 'ghost.md'), '---\nrole: ghost\nharness: dsh-host\nwriteScope: []\nskills: []\n---\n幽灵角色\n')
     vi.spyOn(f.ownership, 'recordRun').mockRejectedValueOnce(new Error('owner写入失败'))
     await expect(f.manager.start(f.input)).rejects.toThrow('owner写入失败')
     await vi.waitFor(async () => expect((await f.space.stores.runs.list())[0]?.status).toBe('failed'))
@@ -144,7 +145,7 @@ describe('RunManager 真实 core 生命周期', () => {
     await f.manager.onAnswered(f.space, answered)
     await status(f.space, runId, 'succeeded')
     expect(f.workflows.load).toHaveBeenCalledTimes(1)
-    expect(f.acquired[0]?.[0]?.instructions).toBe('原始角色')
+    expect(f.acquired[0]?.find((profile) => profile.role === 'dev')?.instructions).toBe('原始角色')
     expect(f.ctx.activations[0]?.label).toContain('/work#1')
     expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ presets: { 'work#1': { id: 'test-preset' } } })
   })
