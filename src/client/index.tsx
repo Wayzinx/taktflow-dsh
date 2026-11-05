@@ -24,6 +24,8 @@ interface SlotRegistration {
 }
 
 interface ClientContext {
+  /** Cordis 的可选服务读取；uiWorkspace 用于打开子 Agent 会话。 */
+  get?(name: string): unknown
   slots: {
     inject(name: string, body: () => Generator<unknown, void, unknown>): unknown
     register(options: SlotRegistration, component: (props: never) => ReactElement): unknown
@@ -61,6 +63,16 @@ const dshTheme: ThemeHost = {
     observer.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
     return () => observer.disconnect()
   },
+}
+
+/** apply 时记下的客户端上下文；只用来按需读取宿主的 uiWorkspace。 */
+let clientCtx: ClientContext | undefined
+
+/** 在 dsh 里打开某个会话；宿主没有 uiWorkspace 时返回 undefined（面板不显示“打开会话”）。 */
+function hostOpenSession(): ((sessionId: string) => void) | undefined {
+  const workspace = clientCtx?.get?.('uiWorkspace') as { openSession?(target: string): void } | undefined
+  if (typeof workspace?.openSession !== 'function') return undefined
+  return (sessionId) => workspace.openSession!(sessionId)
 }
 
 /** 把作用域化后的样式挂到 head，面板卸载时移除。 */
@@ -116,7 +128,7 @@ function TaktflowPanel(): ReactElement {
     }
   }, [])
 
-  const source = useMemo(() => (state.status === 'ready' && state.space ? createDshSource(state.space) : undefined), [state])
+  const source = useMemo(() => (state.status === 'ready' && state.space ? createDshSource(state.space, { openSession: hostOpenSession() }) : undefined), [state])
 
   if (state.status === 'ready' && source) {
     return <TaktflowEmbed source={source} theme={dshTheme} />
@@ -199,7 +211,7 @@ function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement
   }, [sessionId])
 
   const info = state.status === 'ready' ? state.info : undefined
-  const source = useMemo(() => (info?.space ? createDshSource(info.space) : undefined), [info?.space])
+  const source = useMemo(() => (info?.space ? createDshSource(info.space, { openSession: hostOpenSession() }) : undefined), [info?.space])
 
   if (info && source) {
     // key：需求变化（刚绑定）时重新挂载，让内存路由回到需求页。
@@ -246,6 +258,7 @@ function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement
 export const inject = ['slots']
 
 export function apply(ctx: ClientContext): void {
+  clientCtx = ctx
   ctx.slots.inject('sidebar.panellist', function* () {
     yield ctx.slots.register({ name: 'sidebar.panellist', id: 'taktflow', order: 30, label: 'Taktflow' }, TaktflowIcon)
   })
