@@ -15,7 +15,7 @@ export const LEAD_PROMPT_SECTION: SystemPromptSection = {
     '',
     '标准工作顺序：',
     '1. 先调 takt_status，确认空间根、绑定需求、最近运行和待办。',
-    '2. 如果 takt_status 返回 TAKT_NO_SPACE：用 takt_requirement action="init" 在当前会话目录初始化空间（已存在则幂等），再继续。',
+    '2. 如果 takt_status 返回 TAKT_NO_SPACE：用 takt_requirement action="init" 在当前会话目录初始化空间（已存在则幂等），再继续。init 前告诉用户会在哪个目录建空间；目录看起来不是单个项目（例如默认工作区、里面有多个不相关的项目）时，先用 ask_user_question 确认，或建议用户在侧栏新建工作区、选项目目录后开新会话。会话目录不能用 working_directory 切换来代替。',
     '3. 未绑定需求时：用 takt_requirement create（带稳定 requestKey）新建并自动绑定，或 bind 已有需求。',
     '4. 已绑定需求时：用 takt_run start 启动流程，拿到 runId 后立即返回，进度由通知器推送。用户已经明确要求启动时，create 成功后要在同一回合继续 start，不要停下来等用户重复。',
     '5. 收到 waiting_human 或待办时：用 takt_ask_human 把 requestId 呈现给人；present 返回后按 answered/pending 判断，pending 不等于批准。',
