@@ -34,6 +34,8 @@
   "exclude": [
     "lib",
     "node_modules",
-    "vendor"
+    "vendor",
+    "src/client/index.tsx",
+    "src/client/source.ts"
   ]
 }

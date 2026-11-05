@@ -11,8 +11,8 @@ import { access, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { build } from 'esbuild'
-import { transformCss } from './css.mjs'
-import { checkClientBundle, checkHostBundle, checkPackageManifest, wrapClientBundle, CLIENT_REQUIRE_ALLOWLIST } from './checks.mjs'
+import { buildClient } from './build-client.mjs'
+import { checkClientBundle, checkHostBundle, checkPackageManifest, CLIENT_REQUIRE_ALLOWLIST } from './checks.mjs'
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url))
 // taktflow 源码来自 git 子模块 vendor/taktflow；可用 TAKTFLOW_DIR 指向本地 checkout 联调。
@@ -93,35 +93,19 @@ async function main() {
   }
   if (hostProblems.length > 0) fail('宿主产物静态检查失败', hostProblems)
 
-  const client = await build({
-    entryPoints: [path.join(packageRoot, 'src/client/index.tsx')],
-    bundle: true,
-    write: false,
-    format: 'iife',
-    globalName: '__taktflowClient',
-    platform: 'browser',
-    target: 'es2022',
-    external: CLIENT_REQUIRE_ALLOWLIST,
-    jsx: 'automatic',
-    sourcemap: false,
-    legalComments: 'none',
-    logLevel: 'warning',
-    metafile: true,
-  })
-  const clientCode = client.outputFiles?.[0]?.text
-  if (clientCode === undefined) fail('客户端构建失败', ['esbuild 没有产出 outputFiles'])
-
-  const sourceCss = await readFile(path.join(packageRoot, 'src/client/styles.css'), 'utf8')
-  const scopedCss = transformCss(sourceCss)
-  const wrapped = wrapClientBundle(clientCode, scopedCss)
+  const { wrapped, css: scopedCss, metafile: clientMeta } = await buildClient({ taktflowRoot, alias })
 
   const clientProblems = checkClientBundle(wrapped)
-  for (const metadata of Object.values(client.metafile.outputs)) {
+  for (const metadata of Object.values(clientMeta.outputs)) {
     for (const item of metadata.imports) {
       if (item.external && !CLIENT_REQUIRE_ALLOWLIST.includes(item.path)) {
         clientProblems.push(`客户端 external 不在白名单：${item.path}`)
       }
     }
+  }
+  // 嵌入模式不允许回退演示数据：web 的 api/mock*、api/pick 不能进客户端产物。
+  for (const input of Object.keys(clientMeta.inputs)) {
+    if (/packages\/web\/src\/api\/(mock|pick)/.test(input)) clientProblems.push(`客户端产物含演示数据代码：${input}`)
   }
   if (clientProblems.length > 0) fail('客户端产物静态检查失败', clientProblems)
 

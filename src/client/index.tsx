@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
-import type { ReactElement } from 'react'
+import { useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
+import { TaktflowEmbed, type ThemeHost } from '@taktflow/web/embed'
+import { createDshSource } from './source.js'
 
 /**
  * 客户端模块。
@@ -38,52 +39,103 @@ function TaktflowIcon(): ReactElement {
   )
 }
 
-interface PingState {
-  status: 'checking' | 'ok' | 'failed'
+/** 宿主 ping：确认宿主半已加载，并拿到已打开的空间根（P0 最多一个）。 */
+interface PingPayload {
+  ok?: boolean
   version?: string
-  detail?: string
+  spaces?: string[]
 }
 
-function TaktflowPanel(): ReactElement {
-  const [ping, setPing] = useState<PingState>({ status: 'checking' })
+type PanelState =
+  | { status: 'checking' }
+  | { status: 'ready'; version?: string; space?: string }
+  | { status: 'failed'; detail: string }
 
+/** dsh 把深色主题投影为 body[data-ds-dark-theme]；只读，不写任何全局属性。 */
+const dshTheme: ThemeHost = {
+  isDark: () => document.body.hasAttribute('data-ds-dark-theme'),
+  subscribe(cb) {
+    const observer = new MutationObserver(cb)
+    observer.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
+    return () => observer.disconnect()
+  },
+}
+
+/** 把作用域化后的样式挂到 head，面板卸载时移除。 */
+function useScopedStyle(): void {
   useEffect(() => {
     const style = document.createElement('style')
     style.dataset.taktflow = 'true'
     style.textContent = __taktflowCss
     document.head.append(style)
+    return () => style.remove()
+  }, [])
+}
+
+function Notice({ title, children }: { title: string; children?: ReactNode }): ReactElement {
+  return (
+    <div className="takt-panel">
+      <header className="takt-header">
+        <TaktflowIcon />
+        <h2 className="takt-title">{title}</h2>
+      </header>
+      {children}
+    </div>
+  )
+}
+
+function TaktflowPanel(): ReactElement {
+  useScopedStyle()
+  const [state, setState] = useState<PanelState>({ status: 'checking' })
+
+  useEffect(() => {
     const controller = new AbortController()
     fetch('./api/taktflow.ping', { credentials: 'same-origin', signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        const body = (await response.json()) as { ok?: boolean; version?: string }
+        const body = (await response.json()) as PingPayload
         if (body.ok !== true) throw new Error('宿主返回 ok=false')
-        if (!controller.signal.aborted) setPing({ status: 'ok', version: body.version })
+        if (!controller.signal.aborted) setState({ status: 'ready', version: body.version, space: body.spaces?.[0] })
       })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) setPing({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
+        if (!controller.signal.aborted) setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
       })
-    return () => {
-      controller.abort()
-      style.remove()
-    }
+    return () => controller.abort()
   }, [])
 
+  const source = useMemo(() => (state.status === 'ready' && state.space ? createDshSource(state.space) : undefined), [state])
+
+  if (state.status === 'ready' && source) {
+    return <TaktflowEmbed source={source} theme={dshTheme} />
+  }
   return (
     <div className="takt-root">
-      <div className="takt-panel">
-        <header className="takt-header">
-          <TaktflowIcon />
-          <h2 className="takt-title">Taktflow</h2>
-        </header>
-        <p className="takt-hint">宿主状态</p>
-        <p className={`takt-status takt-status--${ping.status}`}>
-          <span className="takt-dot" aria-hidden="true" />
-          {ping.status === 'checking' ? '正在检查宿主…' : null}
-          {ping.status === 'ok' ? `宿主可用 · v${ping.version ?? '?'}` : null}
-          {ping.status === 'failed' ? `宿主不可用：${ping.detail ?? '未知错误'}` : null}
-        </p>
-      </div>
+      {state.status === 'checking' && (
+        <Notice title="Taktflow">
+          <p className="takt-status takt-status--checking">
+            <span className="takt-dot" aria-hidden="true" />
+            正在连接宿主…
+          </p>
+        </Notice>
+      )}
+      {state.status === 'failed' && (
+        <Notice title="Taktflow">
+          <p className="takt-status takt-status--failed">
+            <span className="takt-dot" aria-hidden="true" />
+            宿主不可用：{state.detail}
+          </p>
+          <p className="takt-hint">确认插件已安装并重启过 App。</p>
+        </Notice>
+      )}
+      {state.status === 'ready' && (
+        <Notice title="还没有打开的空间">
+          <p className="takt-hint">
+            新建一个会话，模式选 <b>taktflow</b>，工作目录选需求空间的根目录（含 <code>takt.config.json</code>），
+            然后让 Lead 创建或绑定需求。空间打开后，这里会显示总览、需求、运行和待办。
+          </p>
+          <p className="takt-hint">插件版本 v{state.version ?? '?'}</p>
+        </Notice>
+      )}
     </div>
   )
 }

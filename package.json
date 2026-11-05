@@ -43,7 +43,7 @@
   "dependencies": {},
   "scripts": {
     "build": "node scripts/build.mjs",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "test": "vitest run",
     "pack:takt": "node scripts/pack.mjs",
     "e2e": "node e2e/profile.mjs && node e2e/boot.mjs"

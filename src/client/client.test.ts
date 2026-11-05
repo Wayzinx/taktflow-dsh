@@ -1,10 +1,7 @@
-import { readFile } from 'node:fs/promises'
-import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
-import { build } from 'esbuild'
 import { beforeAll, describe, expect, it, vi } from 'vitest'
-import { checkClientBundle, extractRequires, wrapClientBundle, CLIENT_REQUIRE_ALLOWLIST } from '../../scripts/checks.mjs'
-import { transformCss } from '../../scripts/css.mjs'
+import { checkClientBundle, extractRequires, CLIENT_REQUIRE_ALLOWLIST } from '../../scripts/checks.mjs'
+import { buildClient } from '../../scripts/build-client.mjs'
 
 const VALID_WRAPPER = `window.__ModuleLoader__.load({
   id: 'taktflow',
@@ -56,21 +53,26 @@ type Element = { type: unknown; props: Record<string, unknown> }
 type Effect = () => void | (() => void)
 type SlotOptions = { name: string; id?: string; key?: string }
 
+// 测的是发布产物：和 build.mjs 用同一个打包函数（不压缩，便于定位）。
 let bundle: string
 beforeAll(async () => {
-  const built = await build({
-    entryPoints: [fileURLToPath(new URL('./index.tsx', import.meta.url))],
-    bundle: true,
-    write: false,
-    platform: 'browser',
-    format: 'iife',
-    globalName: '__taktflowClient',
-    jsx: 'automatic',
-    external: [...CLIENT_REQUIRE_ALLOWLIST],
+  bundle = (await buildClient({ minify: false })).wrapped
+}, 60_000)
+
+/**
+ * 假 React：面板用到的 hook 单独实现，其余（web 页面模块加载时调用的 createContext、
+ * forwardRef、memo 等）统一返回第一个参数，只要求加载阶段不抛错。
+ */
+function fakeReact(effects: Effect[], updateState: (value: unknown) => void): unknown {
+  const hooks: Record<string, unknown> = {
+    useEffect: (effect: Effect) => effects.push(effect),
+    useState: (initial: unknown) => [initial, updateState],
+    useMemo: (factory: () => unknown) => factory(),
+  }
+  return new Proxy(hooks, {
+    get: (target, prop) => (typeof prop === 'string' && prop in target ? target[prop] : (value?: unknown) => value ?? {}),
   })
-  const css = await readFile(new URL('./styles.css', import.meta.url), 'utf8')
-  bundle = wrapClientBundle(built.outputFiles[0]!.text, transformCss(css))
-})
+}
 
 function loadClient() {
   const effects: Effect[] = []
@@ -81,12 +83,13 @@ function loadClient() {
   let entry: { id: string; factory: (require: (specifier: string) => unknown) => { inject: string[]; apply(ctx: unknown): void } } | undefined
   runInNewContext(bundle, {
     window: { __ModuleLoader__: { load(value: typeof entry) { entry = value } } },
-    document, fetch, AbortController,
+    document, fetch, AbortController, URLSearchParams,
   })
   const jsx = (type: unknown, props: Record<string, unknown>): Element => ({ type, props })
   const require = vi.fn((specifier: string): unknown => {
-    if (specifier === 'react') return { useEffect: (effect: Effect) => effects.push(effect), useState: (initial: unknown) => [initial, updateState] }
-    if (specifier === 'react/jsx-runtime') return { jsx, jsxs: jsx }
+    if (specifier === 'react') return fakeReact(effects, updateState)
+    if (specifier === 'react/jsx-runtime') return { jsx, jsxs: jsx, Fragment: 'Fragment' }
+    if (specifier === 'react-dom') return { createPortal: (node: unknown) => node }
     throw new Error(`unexpected require: ${specifier}`)
   })
   const plugin = entry!.factory(require)
@@ -103,13 +106,21 @@ function loadClient() {
   return { entry, plugin, require, registrations, disposers, slots, effects, document, style, fetch, updateState }
 }
 
+/** 渲染主面板一次，返回 [样式 effect, ping effect]。 */
+function mountPanel(client: ReturnType<typeof loadClient>): [Effect, Effect] {
+  client.plugin.apply({ slots: client.slots })
+  client.registrations.find(({ options }) => options.name === 'main')!.component()
+  expect(client.effects).toHaveLength(2)
+  return [client.effects[0]!, client.effects[1]!]
+}
+
 describe('真实客户端构建产物', () => {
   it('执行 ModuleLoader factory，外部模块从传入 require 解析，apply 注册正确插槽', () => {
     const client = loadClient()
     expect(checkClientBundle(bundle)).toEqual([])
     expect(client.entry?.id).toBe('taktflow')
     expect(client.plugin.inject).toEqual(['slots'])
-    expect(client.require.mock.calls.map(([name]) => name).sort()).toEqual(['react', 'react/jsx-runtime'])
+    for (const [name] of client.require.mock.calls) expect(CLIENT_REQUIRE_ALLOWLIST).toContain(name)
     expect(client.document.createElement).not.toHaveBeenCalled()
     client.plugin.apply({ slots: client.slots })
     expect(client.registrations.map(({ options }) => options)).toEqual([
@@ -121,31 +132,45 @@ describe('真实客户端构建产物', () => {
     expect(client.registrations).toHaveLength(0)
   })
 
-  it('面板挂载后查询ping；卸载会移除CSS并中止尚未完成的请求', async () => {
+  it('面板挂载时注入作用域样式，卸载时移除', () => {
     const client = loadClient()
-    client.plugin.apply({ slots: client.slots })
-    client.registrations.find(({ options }) => options.name === 'main')!.component()
-    const dispose = client.effects[0]!()
+    const [styleEffect] = mountPanel(client)
+    const dispose = styleEffect()
     expect(client.document.head.append).toHaveBeenCalledWith(client.style)
     expect(client.style.textContent).toContain('.takt-root')
+    expect(client.style.textContent.replace(/\/\*[\s\S]*?\*\//g, '')).not.toMatch(/(^|[\s,}]):root\b/)
+    if (typeof dispose === 'function') dispose()
+    expect(client.style.remove).toHaveBeenCalledTimes(1)
+  })
+
+  it('面板查询 ping；卸载会中止尚未完成的请求', async () => {
+    const client = loadClient()
+    const [, pingEffect] = mountPanel(client)
+    const dispose = pingEffect()
     const [url, options] = client.fetch.mock.calls[0]!
     expect(url).toBe('./api/taktflow.ping')
     expect(options.credentials).toBe('same-origin')
     expect(options.signal?.aborted).toBe(false)
-    expect(typeof dispose).toBe('function')
     if (typeof dispose === 'function') dispose()
     expect(options.signal?.aborted).toBe(true)
-    expect(client.style.remove).toHaveBeenCalledTimes(1)
     await new Promise<void>((resolve) => setImmediate(resolve))
     expect(client.updateState).not.toHaveBeenCalled()
+  })
+
+  it('ping 返回空间根时进入就绪状态，带上第一个空间', async () => {
+    const client = loadClient()
+    client.fetch.mockResolvedValueOnce(Response.json({ ok: true, version: '0.0.0', spaces: ['/w/space'] }))
+    const [, pingEffect] = mountPanel(client)
+    const dispose = pingEffect()
+    await vi.waitFor(() => expect(client.updateState).toHaveBeenCalledWith({ status: 'ready', version: '0.0.0', space: '/w/space' }))
+    if (typeof dispose === 'function') dispose()
   })
 
   it('ping真实响应内容决定状态，HTTP成功但ok=false也显示失败', async () => {
     const client = loadClient()
     client.fetch.mockResolvedValueOnce(Response.json({ ok: false }))
-    client.plugin.apply({ slots: client.slots })
-    client.registrations.find(({ options }) => options.name === 'main')!.component()
-    const dispose = client.effects[0]!()
+    const [, pingEffect] = mountPanel(client)
+    const dispose = pingEffect()
     await vi.waitFor(() => expect(client.updateState).toHaveBeenCalledWith({ status: 'failed', detail: '宿主返回 ok=false' }))
     if (typeof dispose === 'function') dispose()
   })

@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@taktflow/web/embed": ["./vendor/taktflow/packages/web/src/embed.tsx"],
+      "@taktflow/*": ["./vendor/taktflow/packages/*/src/index.ts"]
+    }
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx"],
+  "exclude": ["src/client/**/*.test.ts", "lib", "node_modules"]
+}
