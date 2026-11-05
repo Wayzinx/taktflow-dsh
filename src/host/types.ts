@@ -251,3 +251,44 @@ export interface TaktflowService {
   notifier: Notifier
   workflows: WorkflowCatalog
 }
+
+/**
+ * 一次职责 Agent 执行（节点的一次尝试）的追溯记录（阶段 3 增量）。
+ *
+ * dsh-host 适配器在启动时写入、结束时补全，存放在 `.takt/runs/<runId>/agents/<nodeId>#<attempt>.json`；
+ * 运行中的记录由路由合并活动状态返回。面板的节点抽屉和“子 Agent”页按它渲染。
+ * 文本字段都已脱敏并截断，不含密钥。
+ */
+export interface AgentTrace {
+  runId: string
+  nodeId: string
+  attempt: number
+  /** startActivation 的 label，例如 `REQ-1/design#1`。 */
+  label: string
+  role: string
+  /** dsh 子会话 id（= 预留的 childId），可在 dsh 的“编队”和会话列表里打开。 */
+  sessionId: string
+  status: 'starting' | 'running' | 'completed' | 'failed' | 'cancelled'
+  startedAt: string
+  endedAt?: string
+  durationMs?: number
+  /** 动态注册的角色 preset：id、配置哈希、组合里的插件包名。 */
+  preset: { id: string; cfgHash: string; plugins: string[] }
+  /** 角色档案摘要（来源：空间 .takt/agents 或随包默认）。 */
+  profile: { title: string; description: string; skills: string[]; writeScope: string[]; readOnly: boolean; source: 'space' | 'bundled' }
+  /** 发给子 Agent 的完整 prompt（脱敏）。 */
+  prompt: string
+  systemAppend?: string
+  outputSchema?: Record<string, unknown>
+  model?: string
+  effort?: string
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number }
+  /** 子会话里的工具调用（按时间顺序，最多保留最近 200 条）。 */
+  tools: Array<{ name: string; summary: string; ok?: boolean; at: string; durationMs?: number }>
+  /** 被写权限守卫拒绝的操作。 */
+  denials: Array<{ tool: string; path?: string; reason: string; at: string }>
+  stopReason?: string
+  /** 最终回复（截断）。 */
+  finalText?: string
+  error?: string
+}
