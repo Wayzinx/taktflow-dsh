@@ -8,7 +8,16 @@
  * - 涉及空间的方法都收 SpaceHandle，调用方先用 SpaceRegistry 解析。
  * - 失败统一抛 TaktToolError：code 稳定，message 给人看，hint 给下一步建议。
  */
-import type { Actor, AttentionItem, Insights, ProjectStores, RequirementId, RunId, RunState } from '@taktflow/core'
+import type {
+  Actor,
+  AttentionItem,
+  Insights,
+  ProjectStores,
+  RequirementId,
+  RunId,
+  RunState,
+  WorkflowDefinition,
+} from '@taktflow/core'
 import type { ToolExecutionContext } from './dsh-types.js'
 
 /** 技术方案 5.8 的稳定错误码；新增码要同步工具文档和客户端文案。 */
@@ -217,6 +226,19 @@ export interface Notifier {
   detach(space: SpaceHandle): Promise<void>
 }
 
+/**
+ * 随包流程目录（阶段 2 增量）。
+ *
+ * Lead 层（src/workflows）实现，执行层的 RunManager 在 start/resume 时按 id 加载。
+ * P0 只有随包流程，不加载用户的 .workflow.ts。未知 id 抛 TAKT_UNSUPPORTED_NODE；
+ * 流程里出现 P0 不支持的节点（review、声明 allowBash 的 dsh-host 节点等）同样
+ * 抛 TAKT_UNSUPPORTED_NODE，由 load 负责校验。
+ */
+export interface WorkflowCatalog {
+  ids(): string[]
+  load(workflowId: string): Promise<WorkflowDefinition>
+}
+
 /** 宿主行提供给所有 dsh 行/工具的服务门面。 */
 export interface TaktflowService {
   spaces: SpaceRegistry
@@ -227,4 +249,5 @@ export interface TaktflowService {
   bindings: Bindings
   approvals: Approvals
   notifier: Notifier
+  workflows: WorkflowCatalog
 }

@@ -7,6 +7,7 @@ import { PlaceholderRolePresets } from './presets.js'
 import { PlaceholderRunManager } from './runs.js'
 import { registerPingRoute } from './routes.js'
 import { FsSpaceRegistry } from './space.js'
+import { createWorkflowCatalog } from '../workflows/index.js'
 import type { TaktflowService } from './types.js'
 
 /** 宿主行的包名/行名；cordis.patch.yml 必须用这个精确包名。 */
@@ -37,6 +38,7 @@ export function createService(config: Config = {}): TaktflowService {
     bindings: new PlaceholderBindings(),
     approvals: new PlaceholderApprovals(),
     notifier: new PlaceholderNotifier(),
+    workflows: createWorkflowCatalog(),
   }
 }
 
