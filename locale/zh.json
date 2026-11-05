@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "title": "Taktflow",
+    "description": "Taktflow 交付流水线：工作流、公共存放区、审批与审计。"
+  },
+  "panel": {
+    "title": "Taktflow",
+    "ping": "宿主状态",
+    "checking": "正在检查宿主…",
+    "ok": "宿主可用",
+    "failed": "宿主不可用"
+  }
+}

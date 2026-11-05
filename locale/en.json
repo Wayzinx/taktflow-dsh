@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "title": "Taktflow",
+    "description": "Taktflow delivery pipeline: workflows, shared workspace, approvals and audit trail."
+  },
+  "panel": {
+    "title": "Taktflow",
+    "ping": "Host status",
+    "checking": "Checking host…",
+    "ok": "Host reachable",
+    "failed": "Host unreachable"
+  }
+}

@@ -1,0 +1,80 @@
+/* 只用 dsh 主题 token；构建脚本会把 :root/选择器/keyframes 统一加前缀。 */
+:root {
+  --takt-radius: 10px;
+}
+
+.takt-panel,
+.takt-header {
+  box-sizing: border-box;
+}
+
+.takt-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--takt-radius);
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+}
+
+.takt-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.takt-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.takt-hint {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.takt-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.takt-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-secondary);
+}
+
+.takt-status--ok .takt-dot {
+  background: var(--dsw-alias-state-success-primary);
+}
+
+.takt-status--failed .takt-dot {
+  background: var(--dsw-alias-state-error-primary);
+}
+
+.takt-status--checking .takt-dot {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@media (max-width: 640px) {
+  .takt-panel {
+    padding: 12px;
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "name": "taktflow",
+  "version": "0.0.0",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "description": "taktflow for DeepSeek Harness：需求交付线插件。Lead Agent 带职责 Agent 从设计推进到交付，全程可追溯、可审计",
+  "exports": {
+    ".": "./lib/host.js",
+    "./lead": "./lib/lead.js",
+    "./role": "./lib/role.js",
+    "./client": "./lib/client.js",
+    "./workflows/*": "./lib/workflows/*.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "icon": "./icon.svg",
+  "files": [
+    "lib/**/*.js",
+    "!lib/**/*.test.js",
+    "cordis.patch.yml",
+    "locale/**/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.3 <0.3.0",
+    "node": ">=20.12"
+  },
+  "dependencies": {},
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "pack:takt": "node scripts/pack.mjs",
+    "e2e": "node e2e/profile.mjs && node e2e/boot.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-tools": "~0.2.1-rc.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wayzinx/taktflow-dsh.git"
+  },
+  "homepage": "https://github.com/Wayzinx/taktflow-dsh#readme",
+  "bugs": {
+    "url": "https://github.com/Wayzinx/taktflow-dsh/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "taktflow",
+    "agent",
+    "sdlc",
+    "workflow"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@xyflow/react": "^12.12.1",
+    "esbuild": "^0.28.2",
+    "lucide-react": "^0.460.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7",
+    "yaml": "^2.9.1"
+  }
+}

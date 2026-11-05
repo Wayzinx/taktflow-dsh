@@ -1,0 +1,56 @@
+# Taktflow bundle 的静态组合。
+#
+# 1) 宿主行必须写**精确包名** `taktflow`：@deepseek-ai/dsh-client-modules 只扫描
+#    宿主 Loader 里精确包名的行来发现 `dsh.client`；写子路径会让浏览器半静默消失
+#    （参考 ref-sdlc/docs/dsh-pitfalls.md §13“合并后新坑”）。
+# 2) Lead preset 用白名单组合，不复制整个 standard preset：写权限关闭、不挂 bash，
+#    Lead 只做编排与评审（docs/dsh-plugin/02-技术方案.md 5.7）。
+#    每个包名与 config 键均在已安装的 @deepseek-ai/* README 中核对：
+#    - dsh-persona: prefix（README “Configuration” 表）
+#    - dsh-agent-instructions: maxBytes（README “Configuration”）
+#    - dsh-tool-fs: write / edit（README “Configuration” 表）
+#    - dsh-tool-fs-search: sampleOverCapGlobResults 必填（README “Configuration”）
+#    - dsh-skill-filesystem / dsh-tool-skill / dsh-tool-ask-user / dsh-time-context 无必填配置
+- insert:
+    # 宿主半 + 浏览器半的发现前提；只注册 ping 路由与 service。
+    - id: taktflow
+      name: 'taktflow'
+
+    # 选择 “taktflow” preset 的会话才挂载 Lead 行；标准会话不受影响。
+    - id: preset-taktflow
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: taktflow
+        name: taktflow
+        description: Taktflow 交付流水线 Lead：负责需求拆解、派发与评审，不直接改代码。
+        order: 30
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are the Taktflow Lead, a delivery orchestrator. You plan, delegate and review; you never edit product code yourself.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          # Lead 只读：关闭 write/edit，也不挂 bash（技术方案 5.7 白名单）。
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          # Lead 行：注册固定提示词段与 bundled skill；工具由 M-D 追加。
+          - id: taktflow-lead
+            name: 'taktflow/lead'

@@ -1,0 +1,8 @@
+node_modules/
+lib/
+tgz/
+*.tgz
+e2e/out/
+.dev/
+.taktdev/
+.DS_Store
