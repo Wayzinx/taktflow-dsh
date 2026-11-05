@@ -87,7 +87,14 @@ export class FakeHostContext implements HostContext {
       roots: (): Agent[] => [],
     }
     this.agentPresets = {
+      list: async () => this.presets.map(({ id, name, description, order }) => ({ id, name, description, order })),
+      resolve: async (id) => {
+        const definition = this.presets.find((preset) => preset.id === id)
+        if (definition === undefined) throw new Error(`Unknown agent preset: ${id}`)
+        return { id: definition.id }
+      },
       register: async (definition) => {
+        if (this.presets.some((preset) => preset.id === definition.id)) throw new Error(`Duplicate agent preset: ${definition.id}`)
         const dispose = this.register(this.presets, definition, 'agentPresets.register')
         return async () => { await dispose() }
       },

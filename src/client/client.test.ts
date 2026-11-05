@@ -83,7 +83,7 @@ function loadClient() {
   let entry: { id: string; factory: (require: (specifier: string) => unknown) => { inject: string[]; apply(ctx: unknown): void } } | undefined
   runInNewContext(bundle, {
     window: { __ModuleLoader__: { load(value: typeof entry) { entry = value } } },
-    document, fetch, AbortController, URLSearchParams,
+    document, fetch, AbortController, URLSearchParams, setTimeout, clearTimeout,
   })
   const jsx = (type: unknown, props: Record<string, unknown>): Element => ({ type, props })
   const require = vi.fn((specifier: string): unknown => {

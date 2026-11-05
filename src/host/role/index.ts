@@ -11,6 +11,17 @@ export interface RoleContext extends HostContext {
   taktflow: TaktflowService
 }
 
+/** 执行器通过 preset 行传入冻结角色信息；运行中不重新读空间档案。 */
+export interface RoleConfig {
+  role?: string
+  spaceRoot?: string
+  title?: string
+  description?: string
+  instructions?: string
+  skills?: string[]
+  readOnly?: boolean
+}
+
 /**
  * 角色行的固定提示词段。
  *
@@ -59,7 +70,18 @@ export const ROLE_SKILL: SkillRegistration = {
  * 调用方：dsh preset 加载器（执行层动态注册的角色 preset）。
  * 失败语义：重复注册同名段/技能会抛错，由 preset 注册失败暴露。
  */
-export function apply(ctx: RoleContext): void {
-  ctx.effect(() => ctx.systemPrompt.section(ROLE_PROMPT_SECTION), 'taktflow role prompt')
+export function apply(ctx: RoleContext, config: RoleConfig = {}): void {
+  const detail = [
+    config.role === undefined ? '' : `当前角色：${config.title ?? config.role}（${config.role}）`,
+    config.spaceRoot === undefined ? '' : `空间根：${config.spaceRoot}`,
+    config.readOnly === undefined ? '' : `本次权限：${config.readOnly ? '只读' : '仅可写宿主登记的范围'}`,
+    config.description ?? '', config.instructions ?? '',
+    config.skills?.length ? `此角色需要的技能：${config.skills.join('、')}。按需用 skill 工具读取。` : '',
+  ].filter(Boolean).join('\n\n')
+  ctx.effect(() => ctx.systemPrompt.section({
+    ...ROLE_PROMPT_SECTION,
+    text: [ROLE_PROMPT_SECTION.text, detail].filter(Boolean).join('\n\n'),
+    interpolate: false,
+  }), 'taktflow role prompt')
   ctx.effect(() => ctx.skills.register(ROLE_SKILL), 'taktflow role skill')
 }

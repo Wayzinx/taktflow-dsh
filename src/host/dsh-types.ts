@@ -309,6 +309,15 @@ export interface AgentPresetDefinition {
   readonly plugins: readonly unknown[]
 }
 
+/** 来源：@deepseek-ai/dsh-agent-preset-registry/lib/index.js:570-610，声明及挂载诊断。 */
+export interface AgentPresetSummary {
+  readonly id: string
+  readonly name?: string
+  readonly description?: string
+  readonly order?: number
+  readonly broken?: string
+}
+
 /** 来源：@deepseek-ai/dsh-system-prompt@0.2.1-rc.3/lib/types/index.d.ts:47-67。 */
 export interface SystemPromptSection {
   readonly name: string
@@ -402,6 +411,8 @@ export type AgentPresetDisposer = () => Promise<void>
 
 /** 本包用到的 cordis/dsh 服务面；来源见各字段注释。 */
 export interface HostContext {
+  /** 来源：@deepseek-ai/cordis 的 Context 内置 logger；不是 inject 服务。 */
+  readonly logger?: { warn(message: string): void }
   /** 来源：@deepseek-ai/cordis（桌面版随附）/src/registry.ts:164-176。 */
   inject(deps: string[], callback: InjectCallback): Fiber & PromiseLike<Fiber>
   /** 来源：@deepseek-ai/cordis（桌面版随附）/src/fiber.ts:405-418。 */
@@ -430,6 +441,10 @@ export interface HostContext {
   }
   agentPresets: {
     register(definition: AgentPresetDefinition): Promise<AgentPresetDisposer>
+    /** 来源：@deepseek-ai/dsh-agent-preset-registry/lib/index.js:570；旧测试替身可省略。 */
+    list?(): Promise<AgentPresetSummary[]>
+    /** 来源：同上 :596；不存在时拒绝，挂载失败则返回 broken。 */
+    resolve?(id: string): Promise<AgentPresetSummary>
   }
   userQuestions: {
     ask(request: UserQuestionsRequest): Promise<UserQuestionsResult>

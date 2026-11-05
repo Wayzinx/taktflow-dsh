@@ -88,19 +88,30 @@ function TaktflowPanel(): ReactElement {
   useScopedStyle()
   const [state, setState] = useState<PanelState>({ status: 'checking' })
 
+  // 还没有空间时每 5 秒再探测一次：Lead 在需求群里打开空间后，面板自动切到总览。
   useEffect(() => {
     const controller = new AbortController()
-    fetch('./api/taktflow.ping', { credentials: 'same-origin', signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        const body = (await response.json()) as PingPayload
-        if (body.ok !== true) throw new Error('宿主返回 ok=false')
-        if (!controller.signal.aborted) setState({ status: 'ready', version: body.version, space: body.spaces?.[0] })
-      })
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
-      })
-    return () => controller.abort()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const probe = (): void => {
+      fetch('./api/taktflow.ping', { credentials: 'same-origin', signal: controller.signal })
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          const body = (await response.json()) as PingPayload
+          if (body.ok !== true) throw new Error('宿主返回 ok=false')
+          if (controller.signal.aborted) return
+          const space = body.spaces?.[0]
+          setState({ status: 'ready', version: body.version, space })
+          if (space === undefined) timer = setTimeout(probe, 5000)
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
+        })
+    }
+    probe()
+    return () => {
+      controller.abort()
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }, [])
 
   const source = useMemo(() => (state.status === 'ready' && state.space ? createDshSource(state.space) : undefined), [state])
