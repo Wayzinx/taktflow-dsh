@@ -18,13 +18,15 @@ interface SlotRegistration {
   id?: string
   key?: string
   order?: number
-  label?: string
+  label?: string | (() => string)
+  /** 会话级 slot：按 sessionId 生成组件 props。 */
+  inject?: (sessionId: string) => Record<string, unknown>
 }
 
 interface ClientContext {
   slots: {
     inject(name: string, body: () => Generator<unknown, void, unknown>): unknown
-    register(options: SlotRegistration, component: () => ReactElement): unknown
+    register(options: SlotRegistration, component: (props: never) => ReactElement): unknown
   }
 }
 
@@ -151,6 +153,89 @@ function TaktflowPanel(): ReactElement {
   )
 }
 
+/** `GET ./api/taktflow.session` 的结果：会话属于哪个空间、绑定了哪个需求。 */
+interface SessionInfo {
+  space?: string
+  requirementId?: string
+}
+
+type SessionViewState =
+  | { status: 'loading' }
+  | { status: 'ready'; info: SessionInfo }
+  | { status: 'failed'; detail: string }
+
+/**
+ * 会话 Tab（conversation.view）：需求群里直接看这个需求的产物、运行和待办。
+ *
+ * 绑定了需求就打开需求页；会话目录是空间但还没绑定就打开总览；都不是就给出引导。
+ * 还没有空间时每 5 秒重查一次，Lead 初始化或绑定后自动切过去。
+ */
+function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement {
+  useScopedStyle()
+  const [state, setState] = useState<SessionViewState>({ status: 'loading' })
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const probe = (): void => {
+      fetch(`./api/taktflow.session?${new URLSearchParams({ sessionId })}`, { credentials: 'same-origin', signal: controller.signal })
+        .then(async (response) => {
+          const body = (await response.json()) as { ok?: boolean; data?: SessionInfo; error?: { message?: string } }
+          if (!response.ok || body.ok !== true) throw new Error(body.error?.message ?? `HTTP ${response.status}`)
+          if (controller.signal.aborted) return
+          const info = body.data ?? {}
+          setState({ status: 'ready', info })
+          if (info.requirementId === undefined) timer = setTimeout(probe, 5000)
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
+        })
+    }
+    probe()
+    return () => {
+      controller.abort()
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [sessionId])
+
+  const info = state.status === 'ready' ? state.info : undefined
+  const source = useMemo(() => (info?.space ? createDshSource(info.space) : undefined), [info?.space])
+
+  if (info && source) {
+    // key：需求变化（刚绑定）时重新挂载，让内存路由回到需求页。
+    const path = info.requirementId ? `/req/${encodeURIComponent(info.requirementId)}` : '/'
+    return <TaktflowEmbed key={path} source={source} theme={dshTheme} initialPath={path} />
+  }
+  return (
+    <div className="takt-root">
+      {state.status === 'loading' && (
+        <Notice title="Taktflow">
+          <p className="takt-status takt-status--checking">
+            <span className="takt-dot" aria-hidden="true" />
+            正在读取会话…
+          </p>
+        </Notice>
+      )}
+      {state.status === 'failed' && (
+        <Notice title="Taktflow">
+          <p className="takt-status takt-status--failed">
+            <span className="takt-dot" aria-hidden="true" />
+            读取失败：{state.detail}
+          </p>
+        </Notice>
+      )}
+      {state.status === 'ready' && (
+        <Notice title="这个会话还不是需求群">
+          <p className="takt-hint">
+            需求群是 <b>taktflow</b> 模式的会话，工作目录就是需求空间的根目录。新建会话时选 taktflow 模式和项目目录，
+            然后对 Lead 说要做什么；它会初始化空间、创建需求，这里随后显示需求的产物、运行和待办。
+          </p>
+        </Notice>
+      )}
+    </div>
+  )
+}
+
 /**
  * 客户端 apply。
  *
@@ -166,5 +251,12 @@ export function apply(ctx: ClientContext): void {
   })
   ctx.slots.inject('main', function* () {
     yield ctx.slots.register({ name: 'main', key: 'taktflow' }, TaktflowPanel)
+  })
+  // 会话 View Tab（和“对话 / 轨迹 / 上下文”同一排）。
+  ctx.slots.inject('conversation.view', function* () {
+    yield ctx.slots.register(
+      { name: 'conversation.view', id: 'taktflow', order: 40, label: () => 'Taktflow', inject: (sessionId) => ({ sessionId }) },
+      TaktflowSessionView,
+    )
   })
 }

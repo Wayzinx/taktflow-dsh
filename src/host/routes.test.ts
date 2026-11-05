@@ -242,10 +242,11 @@ async function drain(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<v
 }
 
 describe('registerRoutes：路由与读操作', () => {
-  it('同时注册 ping、读、写、SSE 四条路由', async () => {
+  it('同时注册 ping、会话、读、写、SSE 路由', async () => {
     const { host } = await makeFixture()
     expect(host.routes.map((entry) => entry.path)).toEqual(expect.arrayContaining([
       '/api/taktflow.ping',
+      '/api/taktflow.session',
       '/api/taktflow',
       '/api/taktflow.op',
       '/api/taktflow.stream',
@@ -254,6 +255,22 @@ describe('registerRoutes：路由与读操作', () => {
     const response = await route(host, '/api/taktflow.ping').fetch(new Request('http://localhost/api/taktflow.ping'))
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ ok: true, version: expect.any(String) })
+  })
+
+  it('会话路由：绑定了需求返回空间和需求；未绑定只返回空间；缺参数 400', async () => {
+    const { host, space, service } = await makeFixture()
+    vi.mocked(service.bindings.bySession).mockImplementation(async (_space, sessionId) =>
+      sessionId === 'session-1' ? 'req-1' : undefined)
+
+    const bound = await getJson(host, '/api/taktflow.session', { sessionId: 'session-1' })
+    expect(bound).toEqual({ status: 200, body: { ok: true, data: { space: space.root, requirementId: 'req-1' } } })
+
+    const unbound = await getJson(host, '/api/taktflow.session', { sessionId: 'session-2' })
+    expect(unbound).toEqual({ status: 200, body: { ok: true, data: { space: space.root } } })
+
+    const missing = await getJson(host, '/api/taktflow.session')
+    expect(missing.status).toBe(400)
+    expect(missing.body.ok).toBe(false)
   })
 
   it('GET 读操作委托 api-core，只返回已注册空间的数据', async () => {

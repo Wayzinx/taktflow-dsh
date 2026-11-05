@@ -114,6 +114,17 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
   ctx.effect(
     () =>
       ctx.connection.fetch.register({
+        path: '/api/taktflow.session',
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: (request) => handleSession(request, service, ctx),
+      }),
+    'taktflow session route',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
         path: '/api/taktflow',
         methods: ['GET'],
         requestBody: 'buffered',
@@ -517,6 +528,41 @@ function parseCursor(after: string | null, lastEventId: string | null): number {
  * 先 realpath 再比较，symlink 不能绕过；未注册的路径不调用 open，避免通过 HTTP
  * 顺手把一个任意目录绑成空间。roots() 为空（宿主还没打开/配置空间）时一律拒绝。
  */
+/** 会话视图用：这个会话属于哪个空间、绑定了哪个需求。 */
+export interface SessionInfo {
+  space?: string
+  requirementId?: string
+}
+
+/**
+ * `GET /api/taktflow.session?sessionId=`：会话 Tab 用来定位空间和需求。
+ *
+ * 会话 Agent 在线时按它的 cwd 打开空间（cwd 必须正好是空间根，否则视为不属于任何空间）；
+ * 不在线时只在已打开的空间里查绑定。查不到返回空对象，不报错：普通会话也会显示这个 Tab。
+ */
+async function handleSession(request: Request, service: TaktflowService, ctx: HostContext): Promise<Response> {
+  try {
+    const sessionId = new URL(request.url).searchParams.get('sessionId')?.trim() ?? ''
+    if (sessionId === '') throw new ApiError(400, '缺少 sessionId 参数')
+    const candidates: SpaceHandle[] = []
+    const cwd = ctx.agents.get(sessionId)?.session.header.cwd
+    if (typeof cwd === 'string' && cwd !== '') {
+      const space = await service.spaces.forSession(cwd).catch(() => undefined)
+      if (space !== undefined) candidates.push(space)
+    } else {
+      for (const root of await service.spaces.roots()) candidates.push(await service.spaces.open(root))
+    }
+    for (const space of candidates) {
+      const requirementId = await service.bindings.bySession(space, sessionId)
+      if (requirementId !== undefined) return json({ ok: true, data: { space: space.root, requirementId } satisfies SessionInfo })
+    }
+    const data: SessionInfo = candidates.length === 1 ? { space: candidates[0]!.root } : {}
+    return json({ ok: true, data })
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
+
 async function resolveSpace(service: TaktflowService, requested: string | null | undefined): Promise<SpaceHandle> {
   const raw = typeof requested === 'string' ? requested.trim() : ''
   if (raw === '') throw new ApiError(400, '缺少 space 参数')

@@ -365,6 +365,35 @@ describe('身份与初始化授权', () => {
     await expect(h.bindings.bySession(h.space, 'session-standard')).resolves.toBeUndefined()
   })
 
+  it('桌面版：会话按 standard 创建后切到 taktflow，以挂载的 preset 为准', async () => {
+    const h = await makeHarness()
+    const base = makeAgent('session-switched', h.root)
+    const presets = { composedPreset: (ctx: unknown) => (ctx === agentCtx ? 'taktflow' : undefined) }
+    const agentCtx = { get: (name: string) => (name === 'agentPresets' ? presets : undefined) }
+    const switched: Agent = {
+      ...base,
+      session: { header: { id: base.id, cwd: h.root, agentPreset: 'standard' } },
+      ctx: agentCtx,
+    }
+    h.agents.get = () => switched
+    h.agents.roots = () => [switched]
+    const status = await h.call('takt_status', {}, switched)
+    expect(status.error?.message ?? '').not.toContain('preset')
+  })
+
+  it('header 写着 taktflow 但当前挂载的是别的 preset 时拒绝', async () => {
+    const h = await makeHarness()
+    const base = makeAgent('session-left', h.root)
+    const agentCtx = { get: () => ({ composedPreset: () => 'standard' }) }
+    const left: Agent = { ...base, ctx: agentCtx }
+    h.agents.get = () => left
+    h.agents.roots = () => [left]
+    const status = await h.call('takt_status', {}, left)
+    expect(status.ok).toBe(false)
+    expect(status.error?.code).toBe('TAKT_NOT_BOUND')
+    expect(status.error?.message).toContain('preset')
+  })
+
   it('绑定表双向关系不一致时拒绝已绑定动作', async () => {
     const h = await makeHarness()
     await seedRequirement(h, 'REQ-001')

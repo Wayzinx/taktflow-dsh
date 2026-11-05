@@ -97,6 +97,11 @@ export interface Agent {
   readonly options: AgentOptions
   /** 来源：同上 :141；官方为必填，这里只约束 header。 */
   readonly session: { readonly header: SessionHeader }
+  /**
+   * Agent 所在的 Cordis 上下文。来源：同上 :149；官方为必填，这里可选以兼容旧替身。
+   * 用来查询当前挂载的 preset（agentPresets.composedPreset），见 lead/tools.ts。
+   */
+  readonly ctx?: { get(name: string): unknown }
   /** 来源：同上 :202-231；官方为必填。 */
   followup(message: UserMessage): void
   inject(message: UserMessage): void

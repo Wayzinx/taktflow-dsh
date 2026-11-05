@@ -126,7 +126,11 @@ describe('真实客户端构建产物', () => {
     expect(client.registrations.map(({ options }) => options)).toEqual([
       { name: 'sidebar.panellist', id: 'taktflow', order: 30, label: 'Taktflow' },
       { name: 'main', key: 'taktflow' },
+      expect.objectContaining({ name: 'conversation.view', id: 'taktflow', order: 40 }),
     ])
+    const view = client.registrations.find(({ options }) => options.name === 'conversation.view')!.options as SlotOptions & { label: () => string; inject: (id: string) => unknown }
+    expect(view.label()).toBe('Taktflow')
+    expect(view.inject('session-1')).toEqual({ sessionId: 'session-1' })
     expect(client.document.createElement).not.toHaveBeenCalled()
     for (const dispose of client.disposers.reverse()) dispose()
     expect(client.registrations).toHaveLength(0)

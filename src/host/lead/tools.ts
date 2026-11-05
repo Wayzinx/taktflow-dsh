@@ -196,7 +196,7 @@ function requireRootAgent(exec: ToolExecutionContext, deps: ToolDeps): Agent {
       '请回到 Lead 根会话执行。',
     )
   }
-  if (caller.session.header.agentPreset !== 'taktflow') {
+  if (currentPreset(caller) !== 'taktflow') {
     throw new TaktToolError(
       'TAKT_NOT_BOUND',
       '当前会话不是 taktflow preset，不能执行 Lead 操作',
@@ -204,6 +204,18 @@ function requireRootAgent(exec: ToolExecutionContext, deps: ToolDeps): Agent {
     )
   }
   return caller
+}
+
+/**
+ * Agent 当前挂载的 preset。
+ *
+ * 桌面版先建 standard 会话、再用 agent-preset/selected 切换，header.agentPreset 只记
+ * 创建时的值；以 preset 注册表的 composedPreset 为准（dsh-subagent 同样这样读）。
+ * 注册表不可用时退回 header。
+ */
+function currentPreset(agent: Agent): string | undefined {
+  const presets = agent.ctx?.get('agentPresets') as { composedPreset?(ctx: unknown): string | undefined } | undefined
+  return presets?.composedPreset?.(agent.ctx) ?? agent.session.header.agentPreset
 }
 
 async function resolveSpace(deps: ToolDeps, agent: Agent): Promise<SpaceHandle> {
