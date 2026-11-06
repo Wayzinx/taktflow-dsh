@@ -181,10 +181,10 @@ export function loadP0DeliveryWorkflow(): WorkflowDefinition {
           { path: 'clarifications/**', required: false },
         ],
         outputs: [{ path: 'design/design.md', kind: 'design' }],
-        // 引擎按项目根做写后 diff，而 agent 实际写的是 .takt/workspaces/<REQ>/design/**，
+        // 引擎按项目根做写后 diff，而 agent 实际写的是需求目录下的 design/**，
         // 所以这里写物理范围；逻辑产物路径仍是 design/**。单星只匹配一层需求目录。
-        // 若执行层能按 TAKT_REQ 收窄到当前需求，应优先使用更窄的范围。
-        writeScope: ['.takt/workspaces/*/design/**'],
+        // 新空间是 requirements/<REQ>，旧空间仍是 .takt/workspaces/<REQ>，两种布局都兼容。
+        writeScope: ['requirements/*/design/**', '.takt/workspaces/*/design/**'],
         prompt: (ctx) => {
           const clarified = ctx.resultOf('clarify')
           const summary = typeof clarified === 'string' ? clarified : JSON.stringify(clarified ?? '')
@@ -245,7 +245,7 @@ export function loadP0DeliveryWorkflow(): WorkflowDefinition {
         ],
         outputs: [{ path: 'reports/summary.md', kind: 'report' }],
         // 同 design：产物逻辑路径是 reports/**，物理写入在需求目录下。
-        writeScope: ['.takt/workspaces/*/reports/**'],
+        writeScope: ['requirements/*/reports/**', '.takt/workspaces/*/reports/**'],
         prompt: [
           '汇总本次交付：改动摘要、测试结果、遗留风险与后续建议。',
           '只依据 design/design.md 和 reports/test.md，不要编造未验证的结论。',

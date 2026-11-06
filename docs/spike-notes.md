@@ -219,3 +219,32 @@ dsh 的顶层 `ctx.effect` 在卸载时并行清理；宿主接线把注册放�
 - **dev 改动需要归因链。** 文件内容变化不能证明是 dev 改的；要读 implement 的 `harness.started` child sessionId，再核对该 child 的 `write`/`edit` 成功结果指向演示项目文件。
 - **模型可能在建完需求后结束回合。** 已在 Lead prompt / skill 明确“用户要求启动时，create 成功后同一回合继续 start”，e2e 仍保留一条自然语言 follow-up 作为真实用户兜底；最终批次实际使用了 follow-up。
 - **Node `--test` 的输出格式因版本而异。** 本机输出 `ℹ pass N` 而不是 `# pass N`；脚本同时识别 `# pass` / `ℹ pass`，识别不到时显式加 `--test-reporter=tap` 再读，不伪填数值。最终批次 `passCount=2`。
+
+---
+## M-J 增量：真实 Node 24 边界与标准流程验收
+
+状态：**构建、类型、单测与发布包探针通过；真实 dsh + 模型的新版 standard e2e 已执行 5 批，前 4 批未通过，第 5 批在研发测试 loop 后升级给人、整体 `ok=false`，标准全链成功尚未验证**。环境为 Node `v24.20.0`、dsh `0.2.2-rc.1`；第 5 批 App Node 为 `v24.21`。
+
+| 验证 | 结果 | 证据口径 |
+| --- | --- | --- |
+| 构建 | PASS | `node scripts/build.mjs` 产出 `lib/host.js`、`lib/lead.js`、`lib/role.js`、`lib/core.js`、`lib/sandbox.js`、`lib/templates/bundled.js`、3 个流程与客户端 bundle，静态检查通过 |
+| 类型 | PASS | `npx tsc -p tsconfig.json --noEmit` 退出 0 |
+| 单测 | PASS，35 文件 / 548 项 | `npx vitest run`；新增真实 symlink/core 单例 2 项、build literal 形状 2 项 |
+| 流程加载器真实 Node 24 | PASS，29/29 | 隔离进程覆盖 AST 静态扫描、冻结解析边、绝对路径与 `file:` URL、全局 hook 作用域、相对 `.js`→`.ts`、同包 core/sandbox 单例、内容哈希版本隔离 |
+| 发布包 workflow 读写 | PASS，5/5 | 临时目录只放 `lib/**`，无 `vendor`、无本地 `node_modules`、清 `NODE_PATH`；GET 快照、合法 `source.replace`、非法语法 400、同 baseRev 冲突 409、两种失败均不改已持久化源码 |
+| 发布包 `@taktflow/*` | PASS | `harness`/`knowledge`/`server`/`workflow-source` 等共享入口从随包 `lib` 解析，不依赖用户环境安装 |
+| 真实 standard e2e 第 1 批 | FAIL，未启动运行 | Lead 动态流程目录遗漏 `taktflow-standard`，`takt_run start` 返回 `TAKT_UNSUPPORTED_NODE`，未生成 runId；33 项账本 1 fail + 14 not-run；已修 |
+| 真实 standard e2e 第 2 批 | FAIL，run failed | run 已启动，`clarify` 前 `@taktflow/sandbox` 解析失败；33 项账本 12 fail；已修 |
+| 真实 standard e2e 第 3 批 | FAIL，run failed | 真实 dsh coreSingleton 全部 true，仍在 `clarify` 前 `@taktflow/sandbox` 解析失败；34 项账本 12 fail；已修 |
+| 真实 standard e2e 第 4 批 | FAIL，升级待办 | 34 项账本 8 fail；跑到研发测试 loop，5 轮评审、9 条生成用例 8 pass / 1 fail、独立 6 项产品断言 PASS；REG-001 缺 `TAKT_REGRESSION_BASELINE_REV` 被 judge 以 `env_issue` 0.99 升级（1 个 requestId）；未到准出；整体未通过 |
+| 真实 standard e2e 第 5 批 | FAIL，升级待办 | run `run-20261106-124857-4d67`、requirement `REQ-3AB8FDFD0134`；34 项账本 26 pass / 8 fail，整体 `ok=false`；12 条生成用例首轮 9 pass / 3 fail，独立 6 项产品 AC PASS；7 轮评审均通过；23 条职责 trace、1 个唯一升级 requestId；judge 停 `waiting_human`，未到质量报告/准出/知识回流 |
+
+第 4 批补充事实：18 条职责 trace 全有 usage（输入 295433 / 输出 34337），Lead 24955 / 356，合计 320388 / 34693；pipeline elapsed 863861ms（停在升级），整个 e2e 985673ms；host stop 与 home cleanup 均 PASS。第 2/3 批 sandbox 失败根因是真实 dsh resolver 在 profile 裸包查找失败时先把 parent 改为 `profiles/package.json` 再进 Node hook，`runtimeForParent` 不命中，不是 symlink 直接导致；`scripts/build.mjs` 用 onLoad 把 vendor `execution.ts` 的唯一 `import(name)` 转成字面量 `import('@taktflow/sandbox')`，esbuild 生成相对 chunk lazy import，vendor 未改。
+
+第 5 批补充事实：e2e 从 `2026-11-06T04:48:27.138Z` 到 `05:11:58.089Z`，总 1410951ms（23 分 30.951 秒）；流水线到升级 1284161ms（21 分 24.161 秒），这是升级前用时，不是运行成功耗时。`autonomy=full`，最终 judge 升级待办保持未回答；34 项验收失败项为 `run-finished`、`no-escalation`、`role-exact`（没有 `release-reviewer` trace）、`loop-ran`（judge `waiting_human`）、`evidence-summary`、`quality-report`、`auto-answers`（acceptance 没执行）、`audit-verify`（只有 1 条 `human.answered`，缺准出 AI 代答留痕）；34 项是验收项，不是 34 条业务用例。23 条职责 trace 全有 usage（输入 408668 / 输出 53348），Lead 17282 / 331，合计 425950 / 53679（含 Lead，按观测 usage 字段，不换算费用）。PRD 评审 2 轮、系分 1 轮、测分 1 轮、动态代码评审 1 轮、脚本评审 2 轮，共 7 轮且最后都通过；`run-cases` + `judge` 第 1 轮已执行，但 judge 停 `waiting_human`，不能称 loop 完整通过或收敛。
+
+第 5 批升级与基线：1 个唯一升级 requestId（ledger 两次观察不能计为 2 次）；`TC-DEL-001`、`TC-REG-001` 判 `env_issue`，缺 Agent 变更前完整文件清单及可信 SHA256（`TAKT_CHANGE_ORIGIN_MANIFEST` / `TAKT_CHANGE_ORIGIN_SHA256`）；`TC-REG-002` 判 `script_defect`，正则误把正常 TAP 汇总 `# todo 0` 识别成 TODO 指令，judge 给了 fix-script 路由，但与 `env_issue` 混合后需人工裁决，未继续修复。`TAKT_REGRESSION_BASELINE_REV` 实际已被消费：`git show` 真实初始 SHA `cad08a234ed7e93e56a2f4dc6a910e90667f8e2f` 成功、原测试与 `package.json` 逐字节匹配，第 4 批的基线缺失已解决。core 单例、init 模板、三类交叉评审、read denial、dev/reviewer 技能隔离、生成物、独立 product-acceptance、进程停止、home 清理均 PASS；完整 audit 验收失败，不能把缺准出回答等同链损坏，也不能反推链验收全过。证据归档在 `e2e/out/standard-history/`。
+
+五批 standard 的真实结果均为 `ok=false`：第 1 批 33 项 1 fail + 14 not-run；第 2 批 33 项 12 fail；第 3 批 34 项 12 fail；第 4 批 34 项 8 fail；第 5 批 34 项 8 fail。第 4 批未到质量报告/准出/知识回流，完整 audit 验收未通过（EventStore.verify 单项通过，但缺少准出 AI 代答留痕，需按 JSON 分开看）。第 5 批同样未到质量报告/准出/知识回流，完整 audit 验收失败；第 5 批是最终交付的真实升级记录，无第 6 批、无全链 PASS。这些是脱敏摘要，不含地址、凭据或绝对路径。
+
+本机探针不替代真实 dsh + 模型 e2e；上面的 548 项单测也不包含浏览器 UI、`profile` 外部 CLI 或真实审批卡片链路，`profile` CLI 与浏览器 UI 未做真实 e2e。

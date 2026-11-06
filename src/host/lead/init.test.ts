@@ -12,7 +12,10 @@ import type {
 } from '../dsh-types.js'
 import { loadRunProfiles } from '../run-runtime.js'
 import { FsSpaceRegistry } from '../space.js'
+import { BUNDLED_ROLE_FILES } from '../../roles/defaults.js'
 import type { TaktflowService } from '../types.js'
+
+const ROLE_NAMES = BUNDLED_ROLE_FILES.map((file) => file.fileName.replace(/\.md$/, ''))
 import { registerLeadTools, type LeadToolResult } from './tools.js'
 
 const roots: string[] = []
@@ -102,16 +105,17 @@ describe('takt_requirement init', () => {
     expect(result.ok).toBe(true)
     expect(result.alreadyInitialized).toBe(false)
     expect(result.roles).toEqual({
-      copied: ['analyst', 'architect', 'dev', 'reporter'],
+      copied: ROLE_NAMES,
       kept: [],
     })
     expect(await exists(path.join(project, 'takt.config.json'))).toBe(true)
-    for (const role of ['analyst', 'architect', 'dev', 'reporter']) {
-      expect(await exists(path.join(project, '.takt', 'agents', `${role}.md`))).toBe(true)
+    for (const role of ROLE_NAMES) {
+      expect(await exists(path.join(project, 'agents', `${role}.md`))).toBe(true)
     }
     const space = await h.registry.open(project)
     const profiles = await loadRunProfiles(space)
-    expect(profiles.dev).toMatchObject({ allowBash: false, writeScope: ['src/**'] })
+    expect(profiles.dev).toMatchObject({ allowBash: false })
+    expect(profiles.dev?.writeScope).toEqual(expect.arrayContaining(['src/**']))
     expect(result.next_actions.some((action) => action.includes('takt_requirement create'))).toBe(true)
   })
 
@@ -119,7 +123,7 @@ describe('takt_requirement init', () => {
     const project = await tempDir()
     const h = makeHarness({ cwd: project })
     await h.call('takt_requirement', { action: 'init' })
-    const analyst = path.join(project, '.takt', 'agents', 'analyst.md')
+    const analyst = path.join(project, 'agents', 'analyst.md')
     await writeFile(analyst, '用户自定义分析角色\n', 'utf8')
 
     const again = await h.call('takt_requirement', { action: 'init' })
@@ -127,7 +131,7 @@ describe('takt_requirement init', () => {
     expect(again.alreadyInitialized).toBe(true)
     expect(again.roles).toEqual({
       copied: [],
-      kept: ['analyst', 'architect', 'dev', 'reporter'],
+      kept: ROLE_NAMES,
     })
     expect(await readFile(analyst, 'utf8')).toBe('用户自定义分析角色\n')
   })
@@ -210,7 +214,7 @@ describe('takt_requirement init', () => {
 
   it('默认角色文件同名目录存在时在写盘前拒绝', async () => {
     const project = await tempDir()
-    await mkdir(path.join(project, '.takt', 'agents', 'dev.md'), { recursive: true })
+    await mkdir(path.join(project, 'agents', 'dev.md'), { recursive: true })
     const h = makeHarness({ cwd: project })
 
     const result = await h.call('takt_requirement', { action: 'init' })

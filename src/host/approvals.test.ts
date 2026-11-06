@@ -1,13 +1,16 @@
-import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  canonicalJson,
   createInsights,
   initProject,
+  sha256,
   snapshotWorkflow,
   type Actor,
   type ArtifactRef,
   type AttentionItem,
+  type Expansion,
   type NodeStatus,
   type ProjectStores,
   type RunState,
@@ -20,6 +23,7 @@ import {
   REJECT_LABEL,
   ApprovalInputError,
   PlaceholderApprovals,
+  autoAnswerPath,
   createApprovals,
 } from './approvals.js'
 import type {
@@ -31,6 +35,7 @@ import type {
 } from './dsh-types.js'
 import {
   TaktToolError,
+  type AgentDecisionInput,
   type AnswerInput,
   type Approvals,
   type Ownership,
@@ -64,6 +69,10 @@ interface PendingOptions {
   nodeStatus?: NodeStatus
   itemAttempt?: number
   nodeAttempts?: number
+  /** 动态节点：静态 workflow 快照里没有，只在运行状态 expansions 中出现。 */
+  nodeId?: string
+  expansions?: Expansion[]
+  workflow?: WorkflowDefinition
 }
 
 interface PendingFixture {
@@ -72,6 +81,7 @@ interface PendingFixture {
   requirementId: string
   runId: string
   requestId: string
+  nodeId: string
   refs: ArtifactRef[]
 }
 
@@ -95,32 +105,34 @@ async function makePending(options: PendingOptions = {}): Promise<PendingFixture
 
   const runId = 'run-approval-1'
   const nodeAttempts = options.nodeAttempts ?? 1
+  const nodeId = options.nodeId ?? 'approve'
+  const workflowDef = options.workflow ?? workflow
   const state: RunState = {
     runId,
-    workflowId: workflow.id,
-    workflowVersion: workflow.version,
+    workflowId: workflowDef.id,
+    workflowVersion: workflowDef.version,
     requirementId,
     status: options.runStatus ?? 'waiting_human',
     startedAt: new Date().toISOString(),
     args: {},
     nodes: {
-      approve: {
-        id: 'approve',
+      [nodeId]: {
+        id: nodeId,
         status: options.nodeStatus ?? 'waiting_human',
         attempts: nodeAttempts,
         outputs: [],
         inputs: refs.map((ref) => ({ ...ref })),
       },
     },
-    expansions: [],
+    expansions: options.expansions ?? [],
   }
-  await stores.runs.create(state, snapshotWorkflow(workflow))
+  await stores.runs.create(state, snapshotWorkflow(workflowDef))
 
-  const requestId = `${runId}:approve`
+  const requestId = `${runId}:${nodeId}`
   await stores.attention.create({
     requestId,
     runId,
-    nodeId: 'approve',
+    nodeId,
     requirementId,
     ask: '请审批规格',
     form: options.form ?? 'approve',
@@ -135,6 +147,7 @@ async function makePending(options: PendingOptions = {}): Promise<PendingFixture
     requirementId,
     runId,
     requestId,
+    nodeId,
     refs,
   }
 }
@@ -211,6 +224,26 @@ function answerInput(fixture: PendingFixture, patch: Partial<AnswerInput> = {}):
     by: { type: 'human', id: '审批人', via: 'dsh-web' },
     ...patch,
   }
+}
+
+function agentInput(fixture: PendingFixture, patch: Partial<AgentDecisionInput> = {}): AgentDecisionInput {
+  return {
+    requestId: fixture.requestId,
+    attempt: 1,
+    disposition: 'approve',
+    by: { type: 'agent', role: 'release-reviewer', harness: 'dsh-host', onBehalfOf: '审批人' },
+    confidence: 0.95,
+    evidence: fixture.refs.map((ref) => ({ ...ref })),
+    blockers: [],
+    unresolved: [],
+    rationale: '质量报告、影响面和评审记录齐全，可以准出。',
+    ...patch,
+  }
+}
+
+async function autoAnswerArtifacts(fixture: PendingFixture) {
+  return (await fixture.stores.workspaces.listArtifacts(fixture.requirementId))
+    .filter((record) => record.path.startsWith('decisions/auto-answers/'))
 }
 
 async function findItem(stores: ProjectStores, requestId: string): Promise<AttentionItem | undefined> {
@@ -513,6 +546,55 @@ describe('approvals.present：原生问题卡片', () => {
     })
   })
 
+  it('AI 升级后的人工卡片简短显示哪一步、为什么升级和未解决项', async () => {
+    const fixture = await makePending()
+    const decisionPath = autoAnswerPath(fixture.requestId)
+    await fixture.stores.workspaces.writeArtifact({
+      ref: { workspace: fixture.requirementId, path: decisionPath },
+      content: [
+        '# 自主审批记录',
+        '',
+        '- 处置：escalate',
+        '',
+        '## Blocker',
+        '',
+        '- 缺少质量报告正文',
+        '',
+        '## 未解决项',
+        '',
+        '- 回归范围未确认',
+        '',
+        '## 理由',
+        '',
+        '证据不足，需要人判断',
+        '',
+      ].join('\n'),
+      kind: 'decision',
+      author: { type: 'agent', role: 'release-reviewer', harness: 'dsh-host', onBehalfOf: '审批人' },
+      reason: '自主升级',
+      producedBy: { runId: fixture.runId, nodeId: fixture.nodeId },
+    })
+    const agent = rootAgent()
+    const asked: UserQuestionsRequest[] = []
+    const ctx = ctxFor(agent, async (request) => {
+      asked.push(request)
+      return { answers: [{ id: request.questions[0]!.id, selected: [APPROVE_LABEL] }] }
+    })
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx, ownership, runs, config: { user: '审批人' } })
+
+    await approvals.present(execFor(agent), fixture.space, fixture.requestId)
+
+    const detail = asked[0]!.questions[0]!.detail ?? ''
+    expect(detail).toContain(`节点：${fixture.nodeId}`)
+    expect(detail).toContain('AI 自主审批已升级：证据不足，需要人判断')
+    expect(detail).toContain('Blocker：缺少质量报告正文')
+    expect(detail).toContain('未解决项：回归范围未确认')
+    // 普通人工卡仍要说明真实批准/打回后果，不能把打回说成继续运行。
+    expect(detail).toContain('打回：该节点会被标记为失败')
+  })
+
   it('忽略与本卡片 id 不匹配的答案，不拿无关答案批准', async () => {
     const fixture = await makePending()
     const agent = rootAgent()
@@ -688,6 +770,241 @@ describe('approvals.present：原生问题卡片', () => {
     await approvals.present(execFor(agent), fixture.space, fixture.requestId)
 
     expect(ask).not.toHaveBeenCalled()
+  })
+})
+
+describe('approvals.answerAsAgent：自主落账、取消窗口与动态节点', () => {
+  it('批准写入 agent actor 与决策产物，但不调用 runs.onAnswered', async () => {
+    const fixture = await makePending()
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    const result = await approvals.answerAsAgent!(fixture.space, agentInput(fixture))
+
+    expect(result).toMatchObject({ disposition: 'approve', answered: true })
+    expect(result.artifact?.path).toMatch(/^decisions\/auto-answers\//)
+    const item = await findItem(fixture.stores, fixture.requestId)
+    expect(item).toMatchObject({
+      decision: 'approve',
+      answeredBy: { type: 'agent', role: 'release-reviewer', harness: 'dsh-host', onBehalfOf: '审批人' },
+    })
+    expect(onAnswered).not.toHaveBeenCalled()
+    const content = (await fixture.stores.workspaces.readArtifact({
+      workspace: fixture.requirementId,
+      path: result.artifact!.path,
+      version: result.artifact!.version,
+    }))?.toString('utf8') ?? ''
+    expect(content).toContain('处置：approve')
+    expect(content).toContain('置信度：0.95')
+    expect(content).toContain('spec/spec.md v1')
+    expect(content).toContain('代表：审批人（来源：config）')
+  })
+
+  it('最后一次 ensureLease 期间取消：产物可已写，但绝不落回答', async () => {
+    const fixture = await makePending()
+    const controller = new AbortController()
+    const { ownership, ensureLease } = ownershipStub()
+    const { runs } = runsStub()
+    let calls = 0
+    ensureLease.mockImplementation(async () => {
+      calls += 1
+      if (calls === 3) controller.abort()
+    })
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    const error = await expectTaktError(
+      approvals.answerAsAgent!(fixture.space, agentInput(fixture, { signal: controller.signal })),
+      'TAKT_RUN_BUSY',
+    )
+    expect(error.message).toContain('已取消')
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+    const events = await fixture.stores.events.read(fixture.runId, { types: ['human.answered'] })
+    expect(events).toHaveLength(0)
+    // 前一次 ensureLease 之后的产物写入是允许的；关键是回答没有落账。
+    expect(await autoAnswerArtifacts(fixture)).toHaveLength(1)
+  })
+
+  it('写产物前取消：不新增决策产物', async () => {
+    const fixture = await makePending()
+    const controller = new AbortController()
+    const { ownership, ensureLease } = ownershipStub()
+    const { runs } = runsStub()
+    let calls = 0
+    ensureLease.mockImplementation(async () => {
+      calls += 1
+      if (calls === 2) controller.abort()
+    })
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answerAsAgent!(fixture.space, agentInput(fixture, { signal: controller.signal })),
+      'TAKT_RUN_BUSY',
+    )
+    expect(await autoAnswerArtifacts(fixture)).toHaveLength(0)
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('planner 动态展开的 human 节点允许自主回答', async () => {
+    const empty: WorkflowDefinition = { id: 'dynamic-wf', version: '1', title: '动态', stages: [], nodes: [] }
+    const snapshot = snapshotWorkflow({
+      id: 'dynamic-wf', version: '1', title: '动态', stages: [],
+      nodes: [{ id: 'answer', kind: 'human', title: '动态审批', needs: [], ask: '动态问题', form: 'approve' }],
+    }).nodes[0]!
+    const expansions: Expansion[] = [{
+      plannerId: 'plan',
+      items: [],
+      nodeIds: ['plan/item/answer'],
+      nodes: [{ ...snapshot, id: 'plan/item/answer' }],
+      at: new Date().toISOString(),
+    }]
+    const fixture = await makePending({ nodeId: 'plan/item/answer', workflow: empty, expansions })
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    const result = await approvals.answerAsAgent!(fixture.space, agentInput(fixture))
+    expect(result.answered).toBe(true)
+    expect((await findItem(fixture.stores, fixture.requestId))?.decision).toBe('approve')
+  })
+
+  it('动态节点实际是 review 时拒绝 AI 代答', async () => {
+    const empty: WorkflowDefinition = { id: 'dynamic-wf', version: '1', title: '动态', stages: [], nodes: [] }
+    const expansions: Expansion[] = [{
+      plannerId: 'plan',
+      items: [],
+      nodeIds: ['plan/item/review'],
+      nodes: [{
+        id: 'plan/item/review', kind: 'review', title: '动态评审', needs: [], ask: '评审？', form: 'approve',
+      }],
+      at: new Date().toISOString(),
+    }]
+    const fixture = await makePending({ nodeId: 'plan/item/review', workflow: empty, expansions })
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answerAsAgent!(fixture.space, agentInput(fixture)),
+      'TAKT_FORBIDDEN_FOR_LEAD',
+    )
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('工作副本被直接修改或删除时拒绝按旧版本批准', async () => {
+    for (const mutation of ['modify', 'delete', 'untracked'] as const) {
+      const fixture = await makePending()
+      const dir = fixture.stores.workspaces.dir(fixture.requirementId)
+      if (mutation === 'modify') await writeFile(join(dir, 'spec/spec.md'), '人工直接修改，未登记版本')
+      if (mutation === 'delete') await rm(join(dir, 'spec/spec.md'))
+      if (mutation === 'untracked') await writeFile(join(dir, 'spec/extra.md'), '评审期间新增的 blocker')
+      const { ownership } = ownershipStub()
+      const { runs } = runsStub()
+      const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+      const error = await expectTaktError(
+        approvals.answerAsAgent!(fixture.space, agentInput(fixture)),
+        'TAKT_STALE_VERSION',
+      )
+      expect(error.message).toMatch(mutation === 'delete' ? /已删除/ : /未登记|直接修改/)
+      expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+    }
+  })
+
+  it('冻结依据集合新增产物后拒绝落账', async () => {
+    const fixture = await makePending()
+    const basis = fixture.refs.map((ref) => ({ ...ref }))
+    const basisDigest = sha256(canonicalJson(basis))
+    await fixture.stores.workspaces.writeArtifact({
+      ref: { workspace: fixture.requirementId, path: 'reports/quality.md' },
+      content: '# 质量报告',
+      kind: 'report',
+      author: { type: 'system', id: 'test' },
+    })
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    const error = await expectTaktError(
+      approvals.answerAsAgent!(fixture.space, agentInput(fixture, { basis, basisDigest })),
+      'TAKT_STALE_VERSION',
+    )
+    expect(error.message).toContain('产物集合或版本发生变化')
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('证据出现新版本时拒绝', async () => {
+    const fixture = await makePending()
+    await fixture.stores.workspaces.writeArtifact({
+      ref: { workspace: fixture.requirementId, path: 'spec/spec.md' },
+      content: 'spec v2',
+      kind: 'spec',
+      author: { type: 'human', id: '审批人' },
+      reason: '人工更新 spec',
+    })
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answerAsAgent!(fixture.space, agentInput(fixture)),
+      'TAKT_STALE_VERSION',
+    )
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('真人抢先回答后 AI 不写第二份决定', async () => {
+    const fixture = await makePending()
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+    await approvals.answer(fixture.space, answerInput(fixture))
+
+    const result = await approvals.answerAsAgent!(fixture.space, agentInput(fixture))
+
+    expect(result.answered).toBe(false)
+    expect(result.artifact).toBeUndefined()
+    expect(await autoAnswerArtifacts(fixture)).toHaveLength(0)
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredBy).toMatchObject({ type: 'human' })
+  })
+
+  it('升级只写决策产物，不落回答', async () => {
+    const fixture = await makePending()
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    const result = await approvals.answerAsAgent!(fixture.space, agentInput(fixture, {
+      disposition: 'escalate',
+      evidence: [],
+      confidence: 0,
+      rationale: '缺少质量报告正文',
+      blockers: ['缺少质量报告'],
+      unresolved: ['回归范围未确认'],
+    }))
+
+    expect(result).toMatchObject({ disposition: 'escalate', answered: false })
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+    const content = (await fixture.stores.workspaces.readArtifact({
+      workspace: fixture.requirementId,
+      path: result.artifact!.path,
+      version: result.artifact!.version,
+    }))?.toString('utf8') ?? ''
+    expect(content).toContain('处置：escalate')
+    expect(content).toContain('缺少质量报告')
+    expect(content).toContain('回归范围未确认')
+  })
+
+  it('直接调用时低置信度批准仍被拒绝', async () => {
+    const fixture = await makePending()
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expect(
+      approvals.answerAsAgent!(fixture.space, agentInput(fixture, { confidence: 0.5 })),
+    ).rejects.toBeInstanceOf(ApprovalInputError)
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
   })
 })
 

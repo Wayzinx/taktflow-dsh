@@ -13,6 +13,7 @@ import {
   type RunStatus,
   type WorkflowSnapshot,
 } from '@taktflow/core'
+import { beginAutonomyAnswer } from './autonomy-state.js'
 import type { Agent, UserMessage } from './dsh-types.js'
 import { createNotifier } from './notify.js'
 import type { Bindings, SpaceHandle } from './types.js'
@@ -611,6 +612,164 @@ describe('通知器', () => {
     const snapshot = await readFile(snapshotFile, 'utf8')
     expect(snapshot).not.toContain(secret)
     expect(snapshot).toContain('[REDACTED]')
+    await notifier.detach(space)
+  })
+
+  it('run.finished(waiting_human) 按当前待办判定：AI 处理中不唤醒，marker 释放后也不补旧卡', async () => {
+    const { root, stores, requirementId, runId, space } = await fixture({ status: 'waiting_human', pending: true })
+    const calls: Recorded[] = []
+    const release = beginAutonomyAnswer(root, `${runId}:node-1`)
+    const notifier = createNotifier({
+      ctx: { agents: { get: (id) => (id === 'session-1' ? fakeAgent(id, calls) : undefined), roots: () => [] } },
+      bindings: bindingsFor('session-1'),
+      pollIntervalMs: 10,
+      mergeWindowMs: 20,
+    })
+    await notifier.attach(space)
+    await appendEvent(stores, runId, {
+      type: 'run.finished',
+      actor: { type: 'system', id: 'test' },
+      data: { status: 'waiting_human' },
+    })
+    await sleep(120)
+    expect(calls.filter((call) => call.kind === 'followup')).toHaveLength(0)
+    // 释放 marker 后没有新事件，不能把历史 run.finished 再补发成人工唤醒。
+    release()
+    await sleep(80)
+    expect(calls.filter((call) => call.kind === 'followup')).toHaveLength(0)
+    expect(await readFile(join(root, '.takt/status', `${requirementId}.json`), 'utf8')).toContain(`${runId}:node-1`)
+    await notifier.detach(space)
+  })
+
+  it('run.finished(waiting_human) 在待办已回答时只记进度，不唤醒人', async () => {
+    const { stores, requirementId, runId, space } = await fixture({ status: 'waiting_human', pending: true })
+    const item = (await stores.attention.list({ requirementId, pending: true }))[0]!
+    await stores.attention.answer(item.requestId, { decision: 'approve', by: { type: 'human', id: '审批人' } })
+    const calls: Recorded[] = []
+    const notifier = createNotifier({
+      ctx: { agents: { get: (id) => (id === 'session-1' ? fakeAgent(id, calls) : undefined), roots: () => [] } },
+      bindings: bindingsFor('session-1'),
+      pollIntervalMs: 10,
+      mergeWindowMs: 20,
+    })
+    await notifier.attach(space)
+    await appendEvent(stores, runId, {
+      type: 'run.finished',
+      actor: { type: 'system', id: 'test' },
+      data: { status: 'waiting_human' },
+    })
+    await sleep(120)
+    expect(calls.every((call) => call.kind === 'inject')).toBe(true)
+    await notifier.detach(space)
+  })
+
+  it('历史 human.requested 在待办已回答后回放不再唤醒人', async () => {
+    const { stores, requirementId, runId, space } = await fixture()
+    const calls: Recorded[] = []
+    const notifier = createNotifier({
+      ctx: { agents: { get: (id) => (id === 'session-1' ? fakeAgent(id, calls) : undefined), roots: () => [] } },
+      bindings: bindingsFor('session-1'),
+      pollIntervalMs: 10,
+      mergeWindowMs: 20,
+    })
+    await notifier.attach(space)
+
+    // attach 之后新建运行，模拟历史事件在新一轮轮询里从头回放。
+    const secondRunId = 'run-notify-2'
+    await stores.runs.create(runState(requirementId, secondRunId, 'waiting_human'), emptySnapshot())
+    const requestId = `${secondRunId}:node-1`
+    await stores.attention.create({
+      requestId, runId: secondRunId, nodeId: 'node-1', requirementId, ask: '历史待办', form: 'approve', attempt: 1, subjects: [],
+    })
+    await stores.attention.answer(requestId, { decision: 'approve', by: { type: 'human', id: '审批人' } })
+    await appendEvent(stores, secondRunId, {
+      type: 'human.requested',
+      actor: { type: 'system', id: 'test' },
+      nodeId: 'node-1',
+      data: { requestId, ask: '历史待办', form: 'approve' },
+    })
+    await sleep(120)
+    expect(calls.filter((call) => call.kind === 'followup')).toHaveLength(0)
+    expect(calls.some((call) => call.text.includes(requestId))).toBe(false)
+    await notifier.detach(space)
+  })
+
+  it('投递前复核：合并窗口内待办已回答则撤掉人工唤醒', async () => {
+    const { stores, requirementId, runId, space } = await fixture()
+    const calls: Recorded[] = []
+    const notifier = createNotifier({
+      ctx: { agents: { get: (id) => (id === 'session-1' ? fakeAgent(id, calls) : undefined), roots: () => [] } },
+      bindings: bindingsFor('session-1'),
+      pollIntervalMs: 10,
+      mergeWindowMs: 80,
+    })
+    await notifier.attach(space)
+    const requestId = `${runId}:node-1`
+    await stores.attention.create({
+      requestId, runId, nodeId: 'node-1', requirementId, ask: '待审批', form: 'approve', attempt: 1, subjects: [],
+    })
+    await appendEvent(stores, runId, {
+      type: 'human.requested',
+      actor: { type: 'system', id: 'test' },
+      nodeId: 'node-1',
+      data: { requestId, ask: '待审批', form: 'approve' },
+    })
+    // 等事件被轮询读入并进入合并窗口，再在窗口内直接落账（不产生 human.answered 事件）。
+    await sleep(40)
+    await stores.attention.answer(requestId, { decision: 'approve', by: { type: 'human', id: '审批人' } })
+    await sleep(120)
+    expect(calls.filter((call) => call.kind === 'followup')).toHaveLength(0)
+    await notifier.detach(space)
+  })
+
+  it('待办所属运行记录不存在时不唤醒人，不把未知运行当成可回答', async () => {
+    const { stores, requirementId, runId, space } = await fixture()
+    const requestId = 'ghost-run:node-1'
+    await stores.attention.create({
+      requestId, runId: 'ghost-run', nodeId: 'node-1', requirementId,
+      ask: '孤儿待办', form: 'approve', attempt: 1, subjects: [],
+    })
+    const calls: Recorded[] = []
+    const notifier = createNotifier({
+      ctx: { agents: { get: (id) => (id === 'session-1' ? fakeAgent(id, calls) : undefined), roots: () => [] } },
+      bindings: bindingsFor('session-1'),
+      pollIntervalMs: 10,
+      mergeWindowMs: 20,
+    })
+    await notifier.attach(space)
+    await appendEvent(stores, runId, {
+      type: 'human.requested',
+      actor: { type: 'system', id: 'test' },
+      nodeId: 'node-1',
+      data: { requestId, ask: '孤儿待办', form: 'approve' },
+    })
+    await sleep(120)
+    expect(calls.filter((call) => call.kind === 'followup')).toHaveLength(0)
+    expect(calls.some((call) => call.text.includes(requestId))).toBe(false)
+    await notifier.detach(space)
+  })
+
+  it('同空间另一个人工 run 不被 AI 处理中的 run 误挡', async () => {
+    const { root, stores, requirementId, runId, space } = await fixture({ status: 'waiting_human', pending: true })
+    const secondRunId = 'run-notify-2'
+    await stores.runs.create(runState(requirementId, secondRunId, 'waiting_human'), emptySnapshot())
+    const secondRequest = `${secondRunId}:node-1`
+    await stores.attention.create({
+      requestId: secondRequest, runId: secondRunId, nodeId: 'node-1', requirementId, ask: '另一个待审批', form: 'approve', attempt: 1, subjects: [],
+    })
+    const release = beginAutonomyAnswer(root, `${runId}:node-1`)
+    const calls: Recorded[] = []
+    const notifier = createNotifier({
+      ctx: { agents: { get: (id) => (id === 'session-1' ? fakeAgent(id, calls) : undefined), roots: () => [] } },
+      bindings: bindingsFor('session-1'),
+      pollIntervalMs: 10,
+      mergeWindowMs: 30,
+    })
+    await notifier.attach(space)
+    await waitFor(() => calls.some((call) => call.kind === 'followup' && call.text.includes(secondRequest)))
+    const followups = calls.filter((call) => call.kind === 'followup')
+    expect(followups.some((call) => call.text.includes(`${runId}:node-1`))).toBe(false)
+    release()
     await notifier.detach(space)
   })
 })

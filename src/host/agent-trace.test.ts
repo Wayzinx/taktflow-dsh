@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInsights, initProject } from '@taktflow/core'
 import { afterEach, describe, expect, it } from 'vitest'
-import { AgentTraceHub, agentTraceFile, type AgentTraceStart } from './agent-trace.js'
+import { AgentTraceHub, agentTraceFile, agentTraceSessionFile, type AgentTraceStart } from './agent-trace.js'
 import type { AgentTrace, SpaceHandle } from './types.js'
 
 const dirs: string[] = []
@@ -74,6 +74,36 @@ describe('AgentTraceHub：生命周期', () => {
     expect(final.endedAt).toBeTypeOf('string')
     expect(final.durationMs).toBeGreaterThanOrEqual(0)
     expect(await traces.read(space, 'run-1')).toEqual([final])
+  })
+
+  it('实际注册技能与档案声明技能落盘并可读回', async () => {
+    const space = await makeSpace()
+    const traces = hub()
+    const handle = await traces.begin(space, start({
+      preset: { id: 'takt-preset', cfgHash: 'abc12345', plugins: ['persona'], skills: ['design', 'review'] },
+      profile: {
+        title: '架构师', description: '负责设计', skills: ['design', 'review'], declaredSkills: ['design', 'review', 'missing'],
+        writeScope: [], readOnly: false, source: 'space',
+      },
+    }))
+    await handle.dispose()
+    const record = await readRecord(space, 'run-1', 'design', 1)
+    expect(record.preset.skills).toEqual(['design', 'review'])
+    expect(record.profile.declaredSkills).toEqual(['design', 'review', 'missing'])
+    expect((await traces.read(space, 'run-1'))[0]).toMatchObject({
+      preset: { skills: ['design', 'review'] },
+      profile: { declaredSkills: ['design', 'review', 'missing'] },
+    })
+  })
+
+  it('legacy 文件记录同一 session 后拒绝重复 begin', async () => {
+    const space = await makeSpace()
+    const traces = hub()
+    const first = await traces.begin(space, start())
+    await first.dispose()
+    // 第一次写 legacy node#attempt.json；同 session 第二次 begin 不能因为
+    // session 文件尚不存在就绕过去重。
+    await expect(traces.begin(space, start())).rejects.toThrow('子会话已有追溯记录')
   })
 
   it('失败与取消不会写成成功，清理错误保留在 error 里', async () => {
@@ -459,5 +489,85 @@ describe('AgentTraceHub：读取与路径安全', () => {
     await handle.finish({ status: 'completed', stopReason: 'completed' })
     await handle.dispose()
     expect((await traces.read(space, 'run-1'))[0]!.tools).toHaveLength(1)
+  })
+})
+
+describe('AgentTraceHub：同一节点尝试的多次执行', () => {
+  it('review 节点顺序执行多个角色时保留每次记录，首条不被覆盖，usage/denials 不串', async () => {
+    const space = await makeSpace()
+    const traces = hub({ throttleMs: 5_000 })
+    const first = await traces.begin(space, start({ role: 'reviewer-a', sessionId: 'child-a', label: 'REQ-1/review#1' }))
+    first.denial({ tool: 'write', path: 'a.txt', reason: '评审只读' })
+    first.sessionEvent({
+      type: 'assistant/message', seq: 1, time: 1_000, data: { usage: { inputTokens: 10, outputTokens: 2 } },
+    })
+    await first.finish({ status: 'completed', stopReason: 'completed' })
+    await first.dispose()
+
+    const second = await traces.begin(space, start({ role: 'author', sessionId: 'child-b', label: 'REQ-1/review#1' }))
+    second.running('model-b')
+    second.denial({ tool: 'write', path: 'b.txt', reason: '只改产物' })
+    second.sessionEvent({
+      type: 'assistant/message', seq: 1, time: 1_000, data: { usage: { inputTokens: 20, outputTokens: 4 } },
+    })
+    // 运行中的第二次与磁盘上的第一次必须同时可见，不能被 byKey 合并成一条。
+    const during = await traces.read(space, 'run-1')
+    expect(during.map((trace) => trace.sessionId)).toEqual(['child-a', 'child-b'])
+    expect(during[0]).toMatchObject({ status: 'completed', role: 'reviewer-a' })
+    expect(during[1]).toMatchObject({ status: 'running', role: 'author', model: 'model-b' })
+
+    await second.finish({ status: 'completed', stopReason: 'completed' })
+    await second.dispose()
+
+    const all = await traces.read(space, 'run-1')
+    expect(all).toHaveLength(2)
+    expect(all.map((trace) => trace.sessionId)).toEqual(['child-a', 'child-b'])
+    expect(all[0]).toMatchObject({
+      role: 'reviewer-a',
+      usage: { inputTokens: 10, outputTokens: 2 },
+      denials: [expect.objectContaining({ path: 'a.txt' })],
+    })
+    expect(all[1]).toMatchObject({
+      role: 'author',
+      usage: { inputTokens: 20, outputTokens: 4 },
+      denials: [expect.objectContaining({ path: 'b.txt' })],
+    })
+    expect(all[0]!.denials).toHaveLength(1)
+    expect(all[1]!.denials).toHaveLength(1)
+
+    // 首次执行保留旧文件名；后续执行写独立 session 文件。
+    expect(await readRecord(space, 'run-1', 'design', 1)).toMatchObject({ sessionId: 'child-a' })
+    expect(JSON.parse(
+      await readFile(agentTraceSessionFile(space, 'run-1', 'design', 1, 'child-b'), 'utf8'),
+    )).toMatchObject({ sessionId: 'child-b', role: 'author' })
+
+    // 已落盘的同一 session 文件不能被下一次执行静默覆盖。
+    await expect(traces.begin(space, start({ role: 'author', sessionId: 'child-b', label: 'REQ-1/review#1' })))
+      .rejects.toThrow('该子会话已有追溯记录')
+  })
+
+  it('sessionId 安全编码进文件名，读取只接受与内容一致的旧格式或 session 文件名', async () => {
+    const space = await makeSpace()
+    const traces = hub({ throttleMs: 5_000 })
+    const handle = await traces.begin(space, start())
+    await handle.finish({ status: 'completed', stopReason: 'completed' })
+    await handle.dispose()
+
+    const agents = join(space.stores.taktDir, 'runs', 'run-1', 'agents')
+    const valid = JSON.parse(await readFile(agentTraceFile(space, 'run-1', 'design', 1), 'utf8')) as AgentTrace
+
+    const encoded = structuredClone(valid)
+    encoded.sessionId = 'child/with/slash'
+    const sessionFile = agentTraceSessionFile(space, 'run-1', 'design', 1, 'child/with/slash')
+    // `/` 必须编码成文件名片段，不能变成目录层级。
+    expect(sessionFile).not.toContain(join('agents', 'child'))
+    await writeFile(sessionFile, JSON.stringify(encoded), 'utf8')
+
+    const mismatch = structuredClone(valid)
+    mismatch.sessionId = 'child-ok'
+    await writeFile(join(agents, 'design#1~child-other.json'), JSON.stringify(mismatch), 'utf8')
+
+    expect(await traces.read(space, 'run-1')).toHaveLength(2)
+    expect((await traces.read(space, 'run-1')).map((trace) => trace.sessionId)).toEqual(['child-1', 'child/with/slash'])
   })
 })

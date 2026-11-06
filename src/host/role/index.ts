@@ -1,11 +1,11 @@
-import type { HostContext } from '../dsh-types.js'
-import type { SkillRegistration, SystemPromptSection } from '../dsh-types.js'
+import type { HostContext, SystemPromptSection } from '../dsh-types.js'
+import { createRoleSkillTool, roleSkillRegistration, type RoleSkillSnapshot } from '../role-skills.js'
 import type { TaktflowService } from '../types.js'
 
 export const name = 'taktflow/role'
 
-/** 角色行只依赖宿主门面、提示词与技能；具体角色由 执行层按节点配置挂载。 */
-export const inject = ['taktflow', 'systemPrompt', 'skills']
+/** 角色行只依赖宿主门面、提示词、技能与工具；具体角色由 执行层按节点配置挂载。 */
+export const inject = ['taktflow', 'systemPrompt', 'skills', 'tools']
 
 export interface RoleContext extends HostContext {
   taktflow: TaktflowService
@@ -18,7 +18,10 @@ export interface RoleConfig {
   title?: string
   description?: string
   instructions?: string
+  /** 档案声明的技能名；仅用于旧实现/提示词，不代表已经注册。 */
   skills?: string[]
+  /** 运行开始时冻结的角色技能；提供时按内容注册，并挂载角色局部 skill 工具。 */
+  skillSnapshot?: RoleSkillSnapshot[]
   readOnly?: boolean
 }
 
@@ -35,32 +38,14 @@ export const ROLE_PROMPT_SECTION: SystemPromptSection = {
     '你是 Taktflow 交付流水线中的角色 Agent。',
     '',
     '工作规则：',
-    '- 只在当前工作目录内工作；写入范围以宿主提供的 writeScope 为准，越界会被引擎判为违规。',
+    '- 只在当前工作目录内工作；代码写入范围以宿主提供的 writeScope 为准，越界会被引擎判为违规。',
+    '- 公共产物只能写到宿主登记的当前需求产物目录；不要创建其它需求目录或第二份产物。',
+    '- 不要修改 `.takt/runs/`、`.takt/attention.jsonl` 等宿主状态。',
     '- P0 所有角色都没有 shell；不要尝试执行命令，测试由流程里的 script 节点执行。',
     '- 只读模式（readOnly）下不要修改任何文件。',
-    '- 产物写入公共存放区约定的路径，并在结果里说明改了哪些文件、依据是什么。',
-    '- 无法完成时明确返回 blocked 和原因，不要伪造成功。',
-  ].join('\n'),
-}
-
-/**
- * 角色行的 bundled skill。
- *
- * 调用方：执行层挂载角色行时注册。
- * 时机：模型需要确认产物路径/写权限边界时读取。
- */
-export const ROLE_SKILL: SkillRegistration = {
-  name: 'taktflow',
-  description: 'Taktflow 角色 Agent 的产物路径与写权限边界',
-  whenToUse: '当需要写产物、确认写权限或返回结构化结果时',
-  source: 'bundled',
-  content: [
-    '# Taktflow 角色约定',
-    '',
-    '- 公共存放区在 `.takt/workspaces/<需求ID>/`；产物路径相对该目录。',
-    '- 不要修改 `.takt/runs/`、`.takt/attention.jsonl` 等宿主状态。',
     '- 写入范围是 glob 白名单；不在白名单内的文件即使存在也不要改。',
     '- 结果用结构化 JSON 时，字段名与节点 resultSchema 对齐；失败时给出可执行的下一步。',
+    '- 无法完成时明确返回 blocked 和原因，不要伪造成功。',
   ].join('\n'),
 }
 
@@ -71,17 +56,24 @@ export const ROLE_SKILL: SkillRegistration = {
  * 失败语义：重复注册同名段/技能会抛错，由 preset 注册失败暴露。
  */
 export function apply(ctx: RoleContext, config: RoleConfig = {}): void {
+  const snapshots = config.skillSnapshot ?? []
+  const skillNames = snapshots.length > 0 ? snapshots.map((skill) => skill.name) : config.skills ?? []
   const detail = [
     config.role === undefined ? '' : `当前角色：${config.title ?? config.role}（${config.role}）`,
     config.spaceRoot === undefined ? '' : `空间根：${config.spaceRoot}`,
     config.readOnly === undefined ? '' : `本次权限：${config.readOnly ? '只读' : '仅可写宿主登记的范围'}`,
     config.description ?? '', config.instructions ?? '',
-    config.skills?.length ? `此角色需要的技能：${config.skills.join('、')}。按需用 skill 工具读取。` : '',
+    skillNames.length ? `此角色声明的技能：${skillNames.join('、')}。只可使用 skill 工具实际返回的当前角色技能。` : '',
   ].filter(Boolean).join('\n\n')
   ctx.effect(() => ctx.systemPrompt.section({
     ...ROLE_PROMPT_SECTION,
     text: [ROLE_PROMPT_SECTION.text, detail].filter(Boolean).join('\n\n'),
     interpolate: false,
   }), 'taktflow role prompt')
-  ctx.effect(() => ctx.skills.register(ROLE_SKILL), 'taktflow role skill')
+  // 只注册角色声明并通过空间加载的技能；固定产物/权限说明已在上方 system prompt。
+  for (const snapshot of snapshots) {
+    ctx.effect(() => ctx.skills.register(roleSkillRegistration(snapshot)), `taktflow role skill ${snapshot.name}`)
+  }
+  // 无论快照是否为空都挂局部同名工具：空快照明确拒绝全部，不能继承全局 skill 工具/目录。
+  ctx.effect(() => ctx.tools.register(createRoleSkillTool(snapshots)), 'taktflow role skill tool')
 }

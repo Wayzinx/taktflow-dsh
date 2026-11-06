@@ -8,24 +8,44 @@ import {
   createInsights,
   type Actor,
   type EventEnvelope,
+  type HarnessInfo,
+  type ModelInfo,
   type ProjectStores,
+  type WorkflowChangedEvent,
 } from '@taktflow/core'
 import {
   ApiError,
   createApiCore,
   type ApiCore,
+  type ApiCoreOptions,
   type EventStream,
   type ReadOp,
   type WriteLease,
+  type WriteOp,
 } from '@taktflow/server'
 import { VERSION } from '../version.js'
 import { agentTraceHubFor, type AgentTraceReader } from './agent-trace.js'
 import { ApprovalInputError } from './approvals.js'
 import type { HostContext } from './dsh-types.js'
-import { TaktToolError, type AgentTrace, type SpaceHandle, type SpaceRegistry, type TaktflowService } from './types.js'
+import { TaktToolError, type AgentTrace, type SpaceHandle, type SpaceRegistry, type TaktflowService, type WorkflowCatalog } from './types.js'
+
+/**
+ * 面板 harnesses / models 读操作的运行时目录。
+ *
+ * 主实现（运行时组装）按空间配置提供；路由不自己编造空数组，缺省时读操作明确
+ * 返回 501。结构与 server 包的 CatalogCallbacks 同形（该类型未从包入口导出）。
+ */
+export interface RoutesCatalog {
+  /** 运行时组装已算好的静态目录；有函数回调时优先用函数。 */
+  harnesses?: HarnessInfo[]
+  models?: ModelInfo[]
+  getHarnesses?(stores: ProjectStores): Promise<HarnessInfo[]>
+  getModels?(stores: ProjectStores): Promise<ModelInfo[]>
+  getCatalog?(stores: ProjectStores): Promise<{ harnesses: HarnessInfo[]; models: ModelInfo[] }>
+}
 
 /** 路由可用的服务面；追溯是阶段 3 增量，旧测试替身可以不带。 */
-export type RoutesService = TaktflowService & { traces?: AgentTraceReader }
+export type RoutesService = TaktflowService & { traces?: AgentTraceReader; catalog?: RoutesCatalog }
 
 /** ping 的响应体；S4 与客户端面板都用它确认宿主半已加载。 */
 export interface PingPayload {
@@ -39,16 +59,47 @@ export interface PingPayload {
 export interface RoutesConfig {
   /** 默认 os.userInfo().username。 */
   user?: string
+  /**
+   * 仅供单测注入 api-core：用来观察 workflow-stream 的订阅与清理。
+   * 生产不传，默认 createApiCore；注入者仍会收到路由构造的租约包装器。
+   */
+  createCore?: (options: ApiCoreOptions) => ApiCore
 }
+
+/** 插件自己的写操作：字段平铺在 POST body 里。 */
+export const PLUGIN_WRITE_OPS = ['attention.answer', 'run.start', 'run.cancel', 'lease.release'] as const
+
+/**
+ * api-core 的写操作白名单：body 为 `{ space, p, params, body }`，全部走租约。
+ *
+ * 群聊写（room.members / chat.send）不开放：需求群就是 dsh 会话。
+ */
+export const CORE_WRITE_OPS = [
+  'artifact.edit',
+  'comment.add',
+  'space.members',
+  'space.repo.add',
+  'space.repo.sync',
+  'space.file.edit',
+  'workflow.edit',
+  'workflow.source.replace',
+  'workflow.layout',
+  'workflow.rollback',
+] as const
 
 /**
  * POST 白名单。只有这些操作会落到真实服务；GET 永远不执行它们。
  *
- * P1 再按需加入 artifact.edit / comment.add 等操作，不能直接把 core.write 的
- * 全部写操作暴露给浏览器。
+ * 不能直接把 core.write 的全部写操作暴露给浏览器：插件操作和 api-core 操作
+ * 的请求形状不同，且群聊写永远不开放。
  */
-export const WRITE_OPS = ['attention.answer', 'run.start', 'run.cancel', 'lease.release'] as const
+export const WRITE_OPS = [...PLUGIN_WRITE_OPS, ...CORE_WRITE_OPS] as const
 export type TaktWriteOp = (typeof WRITE_OPS)[number]
+export type TaktPluginWriteOp = (typeof PLUGIN_WRITE_OPS)[number]
+export type TaktCoreWriteOp = (typeof CORE_WRITE_OPS)[number]
+
+/** GET 明确不透出的 api-core 读操作；群聊只在 dsh 会话里发生。 */
+const BLOCKED_READ_OPS: ReadonlySet<string> = new Set(['room', 'chat'])
 
 const SSE_HEADERS = {
   'content-type': 'text/event-stream; charset=utf-8',
@@ -89,9 +140,10 @@ export function registerPingRoute(ctx: HostContext, spaces?: Pick<SpaceRegistry,
 /**
  * 注册面板使用的全部 HTTP 路由（含 ping）。
  *
- * - `GET  /api/taktflow?space=&p=`：只读操作，委托 server 的 api-core；
+ * - `GET  /api/taktflow?space=&p=`：只读操作，委托 server 的 api-core（群聊读除外）；
  * - `POST /api/taktflow.op`：写操作白名单，所有写先 ensureLease；
- * - `GET  /api/taktflow.stream?space=&run=`：SSE，支持 Last-Event-ID 重放；
+ * - `GET  /api/taktflow.stream?space=&run=`：运行 SSE，支持 Last-Event-ID 重放；
+ * - `GET  /api/taktflow.workflow-stream?space=&id=`：流程修订 SSE；
  * - `GET  /api/taktflow.ping`：最小存活探针。
  *
  * 空间只接受已经注册的根：请求路径先 realpath，再和 SpaceRegistry.roots()
@@ -101,7 +153,10 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
   const user = resolveUser(config)
   // api-core 与直接 dispatch 共用同一个租约包装器：所有写入口都必须先 ensureLease。
   const withWriteLease = makeWriteLease(service)
-  const core = createApiCore({ withWriteLease })
+  const core = (config.createCore ?? createApiCore)({
+    withWriteLease,
+    catalog: routesCatalog(service),
+  })
   const active = new Set<ActiveStream>()
   // 宿主卸载信号：让还在读取空间/运行的 SSE 请求也能立刻结束，而不是挂在磁盘 IO 上。
   const shutdown = new AbortController()
@@ -145,7 +200,7 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
         path: '/api/taktflow.op',
         methods: ['POST'],
         requestBody: 'buffered',
-        fetch: (request) => handleWrite(request, service, user, withWriteLease),
+        fetch: (request) => handleWrite(request, service, core, user, withWriteLease),
       }),
     'taktflow write route',
   )
@@ -159,6 +214,17 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
         fetch: (request) => handleStream(request, service, core, active, shutdown.signal),
       }),
     'taktflow stream route',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/taktflow.workflow-stream',
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: (request) => handleWorkflowStream(request, service, core, active, shutdown.signal),
+      }),
+    'taktflow workflow stream route',
   )
 
   ctx.effect(
@@ -179,6 +245,8 @@ async function handleRead(request: Request, service: TaktflowService, core: ApiC
     const op = url.searchParams.get('p') ?? undefined
     if (op === undefined || op === '') throw new ApiError(400, '缺少读操作参数 p')
     if (isWriteOp(op)) throw new ApiError(400, 'GET 只能执行读操作，写操作请用 POST /api/taktflow.op')
+    // 群聊读操作明确不透出：需求群就是 dsh 会话，面板不该再开一条消息通道。
+    if (BLOCKED_READ_OPS.has(op)) throw new ApiError(400, `群聊读操作 ${op} 不开放：需求群就是 dsh 会话`)
 
     const space = await resolveSpace(service, url.searchParams.get('space'))
     const params: Record<string, string | undefined> = {}
@@ -196,6 +264,7 @@ async function handleRead(request: Request, service: TaktflowService, core: ApiC
 async function handleWrite(
   request: Request,
   service: TaktflowService,
+  core: ApiCore,
   user: string,
   withWriteLease: WriteLease,
 ): Promise<Response> {
@@ -213,11 +282,84 @@ async function handleWrite(
 
     const requestedSpace = optionalText(body.space, 'space') ?? url.searchParams.get('space')
     const space = await resolveSpace(service, requestedSpace)
-    const data = await dispatchWrite(service, user, space, op, body, withWriteLease)
+    if (isPluginWriteOp(op)) {
+      const data = await dispatchPluginWrite(service, user, space, op, body, withWriteLease)
+      return json({ ok: true, data })
+    }
+    const data = await dispatchCoreWrite(core, space, op, body, user)
+    // workflow 写入可能返回冲突/校验失败对象；必须在 ok:true 包装前识别，
+    // 且只认 error 严格等于 'conflict' / 'validation' 的返回值，避免误判文档内容。
+    const failure = workflowFailureResponse(data)
+    if (failure !== undefined) return failure
     return json({ ok: true, data })
   } catch (error) {
     return errorResponse(error)
   }
+}
+
+/** api-core 写操作：params 只接受字符串值，body 原样交给 core，actor 由宿主决定。 */
+async function dispatchCoreWrite(
+  core: ApiCore,
+  space: SpaceHandle,
+  op: TaktCoreWriteOp,
+  envelope: Record<string, unknown>,
+  user: string,
+): Promise<unknown> {
+  const params = coreParams(envelope.params)
+  // 忽略客户端可能塞进 body 的 author/by：人的入口固定是 dsh-web。
+  const actor: Actor = { type: 'human', id: user, via: 'dsh-web' }
+  return core.write(space.stores, op as WriteOp, params, envelope.body, actor)
+}
+
+/** api-core 的 params 与查询串同形：键值都必须是字符串。 */
+function coreParams(value: unknown): Record<string, string> {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) throw new ApiError(400, 'params 必须是对象')
+  const params: Record<string, string> = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== 'string') throw new ApiError(400, `params.${key} 必须是字符串`)
+    params[key] = item
+  }
+  return params
+}
+
+/**
+ * 把 workflow 写操作的返回值转成 HTTP 响应。
+ *
+ * 返回 WorkflowConflict 时 409 并原样带出 conflict 对象；返回
+ * `{ error: 'validation', diagnostics }` 时 400 并原样带出 validation 对象。
+ * 其它对象（包括正常的 WorkflowDocument）都返回 undefined，继续按成功包装。
+ */
+function workflowFailureResponse(value: unknown): Response | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const kind = (value as { error?: unknown }).error
+  if (kind === 'conflict') {
+    return json({
+      ok: false,
+      error: { code: 'TAKT_WORKFLOW_CONFLICT', message: '工作流基线已变化，自动合并失败' },
+      conflict: value,
+    }, 409)
+  }
+  if (kind === 'validation') {
+    const diagnostics = (value as { diagnostics?: unknown }).diagnostics
+    const detail = Array.isArray(diagnostics)
+      ? diagnostics
+        .flatMap((item) => typeof item === 'object' && item !== null && typeof (item as { message?: unknown }).message === 'string'
+          ? [(item as { message: string }).message]
+          : [])
+        .slice(0, 3)
+        .join('；')
+      : ''
+    return json({
+      ok: false,
+      error: {
+        code: 'TAKT_WORKFLOW_VALIDATION',
+        message: detail === '' ? '工作流校验失败' : `工作流校验失败：${detail}`,
+      },
+      validation: value,
+    }, 400)
+  }
+  return undefined
 }
 
 /** 由 stores 反查已注册空间；直接 dispatch 与 api-core 写包装器共用。 */
@@ -230,19 +372,90 @@ async function spaceForStores(service: TaktflowService, stores: ProjectStores): 
   return { root: stores.projectDir, stores, insights: createInsights(stores) }
 }
 
+/**
+ * 租约冲突对外的稳定错误：api-core 的写包装器只认 `code === 'TAKT_LEASE_HELD'`，
+ * 会把它改写成普通 ApiError 并丢掉错误码；这里用 ApiError 子类保住 409 语义，
+ * 由 errorResponse 还原成 TAKT_LEASE_HELD。
+ */
+class LeaseHeldApiError extends ApiError {
+  constructor(message: string) {
+    super(409, message)
+    this.name = 'LeaseHeldApiError'
+  }
+}
+
 function makeWriteLease(service: TaktflowService): WriteLease {
   return async (stores, fn) => {
     const space = await spaceForStores(service, stores)
-    await service.ownership.ensureLease(space)
+    try {
+      await service.ownership.ensureLease(space)
+    } catch (error) {
+      if (error instanceof TaktToolError && error.code === 'TAKT_LEASE_HELD') throw new LeaseHeldApiError(error.message)
+      throw error
+    }
     return fn()
   }
 }
 
-async function dispatchWrite(
+/**
+ * 空间流程目录的向后兼容探测。
+ *
+ * 主实现会把 WorkflowCatalog 扩展为按空间列流程（list(space)）并让 load 接受
+ * 空间参数；本路由只依赖可选的 list/defaultId，不修改冻结的 types.ts。
+ * 没有空间流程或旧目录实现没有 list 时回退 P0 演示流程 p0-delivery。
+ */
+interface SpaceWorkflowCatalog {
+  /** 冻结后的真实签名允许字符串数组或 `{ id }` 数组；路由两种都兼容。 */
+  list?(space?: SpaceHandle): Promise<Array<string | { id: string }>>
+  defaultId?(space?: SpaceHandle): Promise<string>
+}
+
+async function defaultWorkflowId(service: TaktflowService, space: SpaceHandle): Promise<string> {
+  const catalog = service.workflows as SpaceWorkflowCatalog
+  // 生产目录必须给出空间默认流程；损坏/导入失败时让它上抛，不能静默换成演示流程。
+  if (typeof catalog.defaultId === 'function') {
+    const id = await catalog.defaultId(space)
+    if (typeof id === 'string' && id.trim() !== '') return id.trim()
+    throw new ApiError(500, '空间流程目录返回了空默认流程')
+  }
+  // 兼容没有 defaultId 的旧目录实现：只认 list 返回的第一个字符串 id。
+  if (typeof catalog.list === 'function') {
+    const entries = await catalog.list(space)
+    const first = entries[0]
+    if (typeof first === 'string' && first.trim() !== '') return first.trim()
+    if (first !== undefined && typeof first === 'object' && typeof first.id === 'string' && first.id.trim() !== '') return first.id.trim()
+  }
+  return 'p0-delivery'
+}
+
+/**
+ * 面板目录回调：每次请求都从 service.catalog 取最新实现，便于运行时组装完成后
+ * 再注入。没有目录时明确 501，不返回空数组冒充真实列表。
+ */
+function routesCatalog(service: RoutesService): RoutesCatalog {
+  return {
+    async getHarnesses(stores) {
+      const catalog = service.catalog
+      if (catalog?.getHarnesses !== undefined) return catalog.getHarnesses(stores)
+      if (catalog?.harnesses !== undefined) return catalog.harnesses
+      if (catalog?.getCatalog !== undefined) return (await catalog.getCatalog(stores)).harnesses
+      throw new ApiError(501, '未接入运行时 harnesses 目录')
+    },
+    async getModels(stores) {
+      const catalog = service.catalog
+      if (catalog?.getModels !== undefined) return catalog.getModels(stores)
+      if (catalog?.models !== undefined) return catalog.models
+      if (catalog?.getCatalog !== undefined) return (await catalog.getCatalog(stores)).models
+      throw new ApiError(501, '未接入运行时 models 目录')
+    },
+  }
+}
+
+async function dispatchPluginWrite(
   service: TaktflowService,
   user: string,
   space: SpaceHandle,
-  op: TaktWriteOp,
+  op: TaktPluginWriteOp,
   body: Record<string, unknown>,
   withWriteLease: WriteLease,
 ): Promise<unknown> {
@@ -270,7 +483,8 @@ async function dispatchWrite(
       }
       case 'run.start': {
         const requirementId = requiredText(body.requirementId, 'requirementId')
-        const workflowId = optionalText(body.workflowId, 'workflowId') ?? 'p0-delivery'
+        // 默认用空间配置里的第一个流程；没有空间流程（或旧目录实现）时回退演示流程。
+        const workflowId = optionalText(body.workflowId, 'workflowId') ?? await defaultWorkflowId(service, space)
         const requestKey = requiredText(body.requestKey, 'requestKey')
         const args = body.args === undefined ? undefined : requiredObject(body.args, 'args')
         // 归属会话只认绑定表；客户端显式传值时必须与绑定一致，不能自行决定归属。
@@ -486,6 +700,174 @@ function formatEvent(event: EventEnvelope): string {
   return `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`
 }
 
+/**
+ * `GET /api/taktflow.workflow-stream?space=&id=`：流程修订 SSE。
+ *
+ * 先通过 api-core 读一次 workflow 确认 id 合法且流程存在（400/404 还是 JSON），
+ * 再订阅。数据就是 api-core 的 WorkflowChangedEvent，不伪造初始快照或重放。
+ */
+async function handleWorkflowStream(
+  request: Request,
+  service: TaktflowService,
+  core: ApiCore,
+  active: Set<ActiveStream>,
+  shutdown: AbortSignal,
+): Promise<Response> {
+  const signals = [request.signal, shutdown]
+  try {
+    if (signals.some((signal) => signal.aborted)) return new Response(null, { status: 204 })
+    const url = new URL(request.url)
+    const space = await abortable(resolveSpace(service, url.searchParams.get('space')), signals)
+    const id = url.searchParams.get('id')?.trim() ?? ''
+    if (id === '') throw new ApiError(400, '缺少 id 参数')
+
+    // 校验期间同样可能与 abort/宿主卸载竞速；失败时保持 JSON 400/404 语义。
+    await abortable(core.read(space.stores, 'workflow', { id }), signals)
+    return await openWorkflowStream(request, core, space, id, active, shutdown)
+  } catch (error) {
+    if (error instanceof StreamAborted) return new Response(null, { status: 204 })
+    return errorResponse(error)
+  }
+}
+
+async function openWorkflowStream(
+  request: Request,
+  core: ApiCore,
+  space: SpaceHandle,
+  id: string,
+  active: Set<ActiveStream>,
+  shutdown: AbortSignal,
+): Promise<Response> {
+  if (shutdown.aborted) return new Response(null, { status: 204 })
+  const encoder = new TextEncoder()
+
+  let closed = false
+  let responseStarted = false
+  let startupFailed = false
+  let startupFailure: unknown
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
+  let heartbeat: ReturnType<typeof setInterval> | undefined
+  let unwatch: (() => Promise<void>) | undefined
+
+  const closeStream = (): void => {
+    try {
+      streamController?.close()
+    } catch {
+      // 流已经关闭/取消，重复 close 不抛给调用方。
+    }
+  }
+
+  const stopWatch = (): void => {
+    const stop = unwatch
+    unwatch = undefined
+    if (stop !== undefined) void Promise.resolve(stop()).catch(() => {})
+  }
+
+  const finish = (): void => {
+    if (closed) return
+    closed = true
+    if (heartbeat !== undefined) {
+      clearInterval(heartbeat)
+      heartbeat = undefined
+    }
+    request.signal.removeEventListener('abort', onAbort)
+    active.delete(record)
+    // 取消、断开、宿主卸载、订阅报错都必须释放 workflow watch（含轮询 timer）。
+    stopWatch()
+  }
+
+  const onAbort = (): void => {
+    finish()
+    closeStream()
+  }
+
+  const record: ActiveStream = {
+    close: () => {
+      finish()
+      closeStream()
+    },
+  }
+
+  active.add(record)
+  request.signal.addEventListener('abort', onAbort, { once: true })
+  if (request.signal.aborted || shutdown.aborted) {
+    finish()
+    return new Response(null, { status: 204 })
+  }
+
+  try {
+    const subscribe = core.subscribeWorkflow(
+      space.stores,
+      id,
+      (event: WorkflowChangedEvent) => {
+        if (closed) return
+        try {
+          streamController?.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+        } catch {
+          finish()
+          closeStream()
+        }
+      },
+      (error) => {
+        if (closed) return
+        if (!responseStarted) {
+          // subscribeWorkflow 可能在返回 stop 函数之前同步报错；此时响应还没发出，
+          // 记下错误交给上层转成 JSON 500，不能 close 后返回 204 把错误吞掉。
+          startupFailed = true
+          startupFailure = error
+          finish()
+          return
+        }
+        // 响应头已经发出，订阅轮询失败无法再转 JSON；结束流让 EventSource 重连。
+        finish()
+        closeStream()
+      },
+    )
+    if (typeof subscribe === 'function') unwatch = subscribe
+  } catch (error) {
+    finish()
+    throw error
+  }
+  // 订阅可能在返回 stop 前同步报错（onError 已 finish）；此时补一次 stopWatch，避免 listener 泄漏。
+  if (closed) {
+    stopWatch()
+    if (startupFailed) throw startupFailure
+    return new Response(null, { status: 204 })
+  }
+
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (closed) {
+        try {
+          controller.close()
+        } catch {
+          // 已关闭。
+        }
+        return
+      }
+      streamController = controller
+      heartbeat = setInterval(() => {
+        if (closed) return
+        try {
+          controller.enqueue(encoder.encode(': keep-alive\n\n'))
+        } catch {
+          finish()
+          closeStream()
+        }
+      }, 15_000)
+      heartbeat.unref?.()
+    },
+    cancel() {
+      // 客户端 reader.cancel()：释放 workflow 订阅和轮询 timer。
+      finish()
+    },
+  })
+
+  const response = new Response(body, { headers: SSE_HEADERS })
+  responseStarted = true
+  return response
+}
+
 /** SSE 请求在真正建立流之前被 abort/宿主卸载；对外统一转成 204。 */
 class StreamAborted extends Error {
   constructor() {
@@ -672,6 +1054,10 @@ function isWriteOp(op: string): op is TaktWriteOp {
   return (WRITE_OPS as readonly string[]).includes(op)
 }
 
+function isPluginWriteOp(op: TaktWriteOp): op is TaktPluginWriteOp {
+  return (PLUGIN_WRITE_OPS as readonly string[]).includes(op)
+}
+
 function resolveUser(config: RoutesConfig): string {
   const configured = config.user?.trim()
   return configured === undefined || configured === '' ? userInfo().username : configured
@@ -683,6 +1069,9 @@ function json(value: unknown, status = 200): Response {
 
 /** 浏览器只拿到稳定错误码和可读文案，不暴露堆栈、文件路径或原始异常。 */
 function errorResponse(error: unknown): Response {
+  if (error instanceof LeaseHeldApiError) {
+    return json({ ok: false, error: { code: 'TAKT_LEASE_HELD', message: error.message } }, 409)
+  }
   if (error instanceof ApiError) {
     return json(
       { ok: false, error: { code: error.status >= 500 ? 'TAKT_INTERNAL' : 'TAKT_BAD_REQUEST', message: error.message } },

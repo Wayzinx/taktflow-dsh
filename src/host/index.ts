@@ -1,3 +1,6 @@
+import { createHarnesses } from '@taktflow/harness'
+import type { HarnessInfo, ModelInfo, TaktConfig } from '@taktflow/core'
+import { BUNDLED_ROLE_NAMES } from '../roles/defaults.js'
 import type { HostContext } from './dsh-types.js'
 import { PlaceholderApprovals } from './approvals.js'
 import { createLeadServices, type LeadServices } from './lead/services.js'
@@ -7,10 +10,10 @@ import { PlaceholderBindings } from './bindings.js'
 import { InMemoryPermissionRegistry, createWriteGuard } from './permissions.js'
 import { DshRolePresets } from './presets.js'
 import { DshRunManager, type RunManagerDeps } from './runs.js'
-import { registerRoutes } from './routes.js'
+import { registerRoutes, type RoutesCatalog } from './routes.js'
 import { FsSpaceRegistry } from './space.js'
 import { createWorkflowCatalog } from '../workflows/index.js'
-import type { Notifier, SpaceHandle, SpaceRegistry, TaktflowService, WorkflowCatalog } from './types.js'
+import type { Autonomy, Notifier, RoleHarness, SpaceHandle, SpaceRegistry, TaktflowService, WorkflowCatalog } from './types.js'
 
 /** 宿主行的包名/行名；cordis.patch.yml 必须用这个精确包名。 */
 export const name = 'taktflow'
@@ -27,6 +30,10 @@ export interface Config {
   spaces?: string[]
   /** 审计里代表的人；默认 os.userInfo().username。不参与 hostOwner。 */
   user?: string
+  /** 自主程度默认值；空间 takt.config.json 的 autonomy 优先。缺省 full。 */
+  autonomy?: Autonomy
+  /** 角色子 Agent 执行方式；缺省 dsh-host（App 模型 + 编队可见）。 */
+  roleHarness?: RoleHarness
 }
 
 /** 仅供程序化组装和隔离测试；生产仍使用随包流程目录。 */
@@ -41,14 +48,14 @@ export interface ServiceDeps {
  *
  * 没有 ctx（纯程序化组装/测试）时，Lead 层的绑定、审批、通知保持占位实现。
  */
-export function createService(config: Config = {}, ctx?: HostContext, deps: ServiceDeps = {}): TaktflowService {
+export function createService(config: Config = {}, ctx?: HostContext, deps: ServiceDeps = {}): TaktflowService & { catalog: RoutesCatalog } {
   const registry = new FsSpaceRegistry({ spaces: config.spaces })
   let runs: DshRunManager
   const ownership = new FsOwnership({ ctx, onLeaseLost: (space) => runs.cancelOwnedSpace(space) })
   const permissions = new InMemoryPermissionRegistry()
   const presets = new DshRolePresets(ctx)
-  const workflows = deps.workflows ?? createWorkflowCatalog()
-  runs = new DshRunManager({ ...deps, ctx, spaces: registry, ownership, permissions, presets, workflows })
+  const workflows = deps.workflows ?? createWorkflowCatalog(registry)
+  runs = new DshRunManager({ ...deps, config, ctx, spaces: registry, ownership, permissions, presets, workflows })
   const lead: LeadServices = ctx
     ? createLeadServices({
         spaces: registry,
@@ -58,8 +65,92 @@ export function createService(config: Config = {}, ctx?: HostContext, deps: Serv
         config,
       })
     : { bindings: new PlaceholderBindings(), approvals: new PlaceholderApprovals(), notifier: new PlaceholderNotifier() }
+  // 自主代答与升级通知在 Lead 层创建后才能用；运行启动前接线，后续 drive 读最新实例。
+  runs.setCollaborators({ approvals: lead.approvals, notifier: lead.notifier })
   const spaces = ctx ? attachOnOpen(registry, lead.notifier) : registry
-  return { spaces, ownership, runs, permissions, presets, workflows, ...lead }
+  const catalog = createRuntimeCatalog(ctx)
+  return { spaces, ownership, runs, permissions, presets, workflows, ...lead, catalog }
+}
+
+/**
+ * 面板 harnesses/models 的生产目录。
+ *
+ * 每次读操作按本次 stores 的配置重新构造：空间配置在运行间变化后，面板看到的
+ * 是当前实际可用的 harness 与模型，而不是插件加载时的快照。dsh-host 由宿主
+ * 上下文提供，只有宿主存在时才标记可用。
+ */
+function createRuntimeCatalog(ctx: HostContext | undefined): RoutesCatalog {
+  return {
+    async getHarnesses(stores) {
+      const config = stores.config
+      const entries: HarnessInfo[] = []
+      if (ctx !== undefined) {
+        entries.push({
+          id: 'dsh-host',
+          displayName: 'DeepSeek Harness (dsh-host)',
+          source: 'plugin',
+          available: true,
+          capabilities: { resume: false, structuredOutput: true, toolEvents: false, usage: false, customProvider: false, sandbox: true, mcp: true },
+          roles: rolesForHarness(config, 'dsh-host'),
+        })
+      }
+      const harnesses = createHarnesses({ config, projectDir: stores.projectDir })
+      for (const [id, adapter] of Object.entries(harnesses)) {
+        let available = false
+        let reason: string | undefined
+        try {
+          const probe = await adapter.available()
+          available = probe.ok
+          reason = probe.reason
+        } catch (error) {
+          reason = error instanceof Error ? error.message : String(error)
+        }
+        entries.push({
+          id,
+          displayName: adapter.displayName,
+          source: (config.harnesses ?? []).some((item) => item.id === id) ? 'cli' : 'builtin',
+          available,
+          ...(reason === undefined ? {} : { reason }),
+          capabilities: adapter.capabilities ?? {},
+          roles: rolesForHarness(config, id),
+        })
+      }
+      return entries
+    },
+    async getModels(stores) {
+      const config = stores.config
+      const providers = config.providers ?? {}
+      return Object.entries(config.models ?? {}).map(([alias, model]): ModelInfo => {
+        const provider = providers[model.provider]
+        const keyEnv = provider?.apiKeyEnv
+        const keyPresent = keyEnv !== undefined && keyEnv !== '' && (process.env[keyEnv] ?? '') !== ''
+        return {
+          alias,
+          provider: model.provider,
+          protocol: provider?.protocol ?? 'openai-chat',
+          id: model.id,
+          ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
+          ...(model.price === undefined ? {} : { price: { input: model.price.input, output: model.price.output } }),
+          keyPresent,
+        }
+      })
+    },
+  }
+}
+
+/** 角色 → 默认 harness；随包角色默认 dsh-host，空间配置覆盖后按配置归属。 */
+function rolesForHarness(config: TaktConfig, harness: string): string[] {
+  const roles = new Set<string>()
+  for (const [role, selector] of Object.entries(config.roles ?? {})) {
+    if (selector.harness === harness) roles.add(role)
+  }
+  if (harness === 'dsh-host') {
+    for (const role of BUNDLED_ROLE_NAMES) {
+      const configured = config.roles?.[role]?.harness
+      if (configured === undefined || configured === 'dsh-host') roles.add(role)
+    }
+  }
+  return [...roles].sort()
 }
 
 /** 空间第一次被工具或路由打开时挂上通知器（attach 幂等）；通知失败不影响打开。 */

@@ -18,6 +18,8 @@ import type {
   ToolExecutionContext,
 } from '../dsh-types.js'
 import { bindingsFile, createBindings } from '../bindings.js'
+import { autoAnswerPath } from '../approvals.js'
+import { beginAutonomyAnswer } from '../autonomy-state.js'
 import { createLeadServices } from './services.js'
 import {
   assertLeadWritablePath,
@@ -152,7 +154,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
-async function makeHarness(options: { withCtx?: boolean; user?: string } = {}): Promise<Harness> {
+async function makeHarness(options: { withCtx?: boolean; user?: string; workflows?: WorkflowCatalog } = {}): Promise<Harness> {
   const root = await mkdtemp(path.join(tmpdir(), 'taktflow-lead-'))
   roots.push(root)
   const stores = await initProject(root, { name: 'lead-test' })
@@ -160,7 +162,7 @@ async function makeHarness(options: { withCtx?: boolean; user?: string } = {}): 
   const ownership = new FakeOwnership()
   const bindings = createBindings({ ownership })
   const runs = new FakeRuns()
-  const workflows: WorkflowCatalog = {
+  const workflows: WorkflowCatalog = options.workflows ?? {
     ids: () => ['p0-delivery'],
     load: async () => {
       throw new Error('测试不加载流程')
@@ -266,6 +268,34 @@ async function seedAttention(
   requirementId: string,
   runId = 'run-001',
 ): Promise<AttentionItem> {
+  // 待办冻结了 attempt，core 落回答时会核对节点快照；测试必须提供真实 run/node，
+  // 不能只造 attention 记录，否则会被 freshness 判为“节点不存在”。
+  const node = { id: 'design', status: 'waiting_human' as const, attempts: 1, outputs: [] }
+  const existing = await h.space.stores.runs.get(runId)
+  if (existing !== undefined) {
+    if (existing.nodes.design === undefined) {
+      existing.nodes.design = node
+      await h.space.stores.runs.save(existing)
+    }
+  } else {
+    await h.space.stores.runs.create({
+      runId,
+      workflowId: 'p0-delivery',
+      workflowVersion: '1',
+      requirementId,
+      status: 'waiting_human',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      args: {},
+      nodes: { design: node },
+      expansions: [],
+    }, {
+      id: 'p0-delivery',
+      title: 'P0 交付',
+      version: '1',
+      stages: [],
+      nodes: [],
+    })
+  }
   return await h.space.stores.attention.create({
     requestId,
     runId,
@@ -437,6 +467,25 @@ describe('takt_status', () => {
     expect(result.next_actions.join('\n')).toContain('takt_requirement bind')
   })
 
+  it('takt_status 使用空间异步目录展示流程，不依赖 ids 缓存', async () => {
+    let listedFor: string | undefined
+    const workflows: WorkflowCatalog = {
+      ids: () => ['p0-delivery'],
+      list: async (space) => {
+        listedFor = space?.root
+        return ['p0-delivery', 'standard']
+      },
+      load: async () => {
+        throw new Error('测试不加载流程')
+      },
+    }
+    const h = await makeHarness({ workflows })
+    const result = await h.call('takt_status', {})
+    expect(result.ok).toBe(true)
+    expect(result.workflows).toEqual(['p0-delivery', 'standard'])
+    expect(listedFor).toBe(h.root)
+  })
+
   it('未绑定时显式请求需求也拒绝', async () => {
     const h = await makeHarness()
     await seedRequirement(h, 'REQ-001')
@@ -458,7 +507,78 @@ describe('takt_status', () => {
     expect((result.requirement as { id: string }).id).toBe('REQ-001')
     expect((result.run as { runId: string }).runId).toBe('run-001')
     expect((result.attention as unknown[]).length).toBe(1)
+    // 旧字段保留，同时追加可核对的运行增量视图。
+    const runStatus = result.runStatus as {
+      runId: string
+      pending: Array<{ requestId: string; handling: string; escalation: boolean }>
+    }
+    expect(runStatus.runId).toBe('run-001')
+    expect(runStatus.pending[0]).toMatchObject({ requestId: 'run-001:design', handling: 'human', escalation: false })
     expect(result.next_actions.join('\n')).toContain('takt_ask_human')
+  })
+
+  it('runStatus 从真实决策产物给出自主升级原因与来源，不把普通待办冒充升级', async () => {
+    const h = await makeHarness()
+    await seedRequirement(h, 'REQ-001')
+    await bindRequirement(h, 'REQ-001')
+    await seedRun(h, 'run-001', 'REQ-001', '2026-01-02T00:00:00.000Z')
+    const item = await seedAttention(h, 'run-001:design', 'REQ-001')
+    const decisionPath = autoAnswerPath(item.requestId)
+    await h.space.stores.workspaces.writeArtifact({
+      ref: { workspace: 'REQ-001', path: decisionPath },
+      content: [
+        '# 自主审批记录',
+        '',
+        '- 处置：escalate',
+        '',
+        '## Blocker',
+        '',
+        '- 缺少质量报告正文',
+        '',
+        '## 未解决项',
+        '',
+        '- 回归范围未确认',
+        '',
+        '## 理由',
+        '',
+        '证据不足，需要人判断',
+        '',
+      ].join('\n'),
+      kind: 'decision',
+      author: { type: 'agent', role: 'release-reviewer', harness: 'dsh-host', onBehalfOf: 'alice' },
+      reason: '自主升级',
+      producedBy: { runId: 'run-001', nodeId: 'design' },
+    })
+
+    const result = await h.call('takt_status', {})
+    const pending = (result.runStatus as {
+      pending: Array<{
+        requestId: string
+        handling: string
+        escalation: boolean
+        escalationReason: string | null
+        escalationSource: string | null
+        marker: { type: string } | null
+      }>
+    }).pending
+    expect(pending[0]).toMatchObject({
+      requestId: item.requestId,
+      handling: 'human',
+      escalation: true,
+      escalationReason: '证据不足，需要人判断',
+      escalationSource: `${decisionPath}@v1`,
+      marker: { type: 'autonomy.escalated' },
+    })
+
+    // AI 正在处理时 handling=ai，即使同路径有历史升级产物也不显示为“等人升级”。
+    const release = beginAutonomyAnswer(h.space.root, item.requestId)
+    try {
+      const during = await h.call('takt_status', {})
+      expect((during.runStatus as { pending: Array<{ handling: string; escalation: boolean }> }).pending[0])
+        .toMatchObject({ handling: 'ai', escalation: false })
+    } finally {
+      release()
+    }
   })
 })
 
@@ -1042,6 +1162,48 @@ describe('takt_run', () => {
     })
     expect((result.audit as { actor: Actor }).actor).toMatchObject({ role: 'lead', onBehalfOf: expect.any(String) })
     expect(h.ownership.ensureCalls).toBeGreaterThan(0)
+  })
+
+  it('ids 只有 p0 时显式 start 空间流程仍按异步目录校验并透传 workflow', async () => {
+    const workflows: WorkflowCatalog = {
+      ids: () => ['p0-delivery'],
+      list: async () => ['p0-delivery', 'standard'],
+      load: async () => {
+        throw new Error('测试不加载流程')
+      },
+    }
+    const h = await makeHarness({ workflows })
+    await seedRequirement(h, 'REQ-001')
+    await bindRequirement(h, 'REQ-001')
+    const result = await h.call('takt_run', {
+      action: 'start',
+      requestKey: 'run-req-space',
+      workflow: 'standard',
+    })
+    expect(result.ok).toBe(true)
+    expect(h.runs.starts).toHaveLength(1)
+    expect(h.runs.starts[0]).toMatchObject({ requirementId: 'REQ-001', workflowId: 'standard' })
+  })
+
+  it('省略 workflow 时使用空间 defaultId 的首个自定义流程', async () => {
+    const workflows: WorkflowCatalog = {
+      ids: () => ['p0-delivery'],
+      list: async () => ['p0-delivery', 'custom-first'],
+      defaultId: async () => 'custom-first',
+      load: async () => {
+        throw new Error('测试不加载流程')
+      },
+    }
+    const h = await makeHarness({ workflows })
+    await seedRequirement(h, 'REQ-001')
+    await bindRequirement(h, 'REQ-001')
+    const result = await h.call('takt_run', {
+      action: 'start',
+      requestKey: 'run-req-default',
+    })
+    expect(result.ok).toBe(true)
+    expect(h.runs.starts).toHaveLength(1)
+    expect(h.runs.starts[0]).toMatchObject({ requirementId: 'REQ-001', workflowId: 'custom-first' })
   })
 
   it('未知流程返回 TAKT_UNSUPPORTED_NODE', async () => {

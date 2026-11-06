@@ -148,18 +148,18 @@ describe('taktflow/lead 行', () => {
 })
 
 describe('taktflow/role 行', () => {
-  it('inject 不包含 tools，避免角色行自己注册工具', () => {
+  it('inject 包含 tools，用于注册角色局部 skill 白名单工具', () => {
     expect(roleName).toBe('taktflow/role')
-    expect(roleInject).toEqual(['taktflow', 'systemPrompt', 'skills'])
+    expect(roleInject).toEqual(['taktflow', 'systemPrompt', 'skills', 'tools'])
   })
 
-  it('apply 注册角色提示词与同名 taktflow 技能', async () => {
+  it('apply 注册角色提示词，不再额外注册内置 taktflow 技能', async () => {
     const ctx = contextWithService()
     applyRole(ctx as unknown as RoleContext)
 
     expect(ctx.promptSections.map((section) => section.name)).toEqual(['taktflow:role'])
-    expect(ctx.registeredSkills.map((skill) => skill.name)).toEqual(['taktflow'])
-    expect(ctx.registeredSkills[0]?.source).toBe('bundled')
+    // 角色只能看到 profile 声明的 skills；内置技能不得静默出现在注册表里。
+    expect(ctx.registeredSkills).toEqual([])
     expect(String(ctx.promptSections[0]?.text)).toContain('script 节点')
   })
 })

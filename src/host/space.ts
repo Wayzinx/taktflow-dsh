@@ -167,6 +167,11 @@ export class FsSpaceRegistry implements SpaceRegistry {
   }
 }
 
+/** 空间 handle 的配置签名：config 与解析后的 paths 都变化才算变。 */
+function spaceSignature(stores: Awaited<ReturnType<typeof openProject>>): string {
+  return JSON.stringify([stores.projectDir, stores.config, stores.paths])
+}
+
 async function exists(target: string): Promise<boolean> {
   try {
     await access(target)

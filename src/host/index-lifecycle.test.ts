@@ -43,7 +43,7 @@ it('真实Cordis式并发顶层卸载：先等runs，再lease，最后移除guar
   vi.spyOn(service.ownership as FsOwnership, 'releaseAll').mockImplementation(async () => {
     order.push('lease')
     expect(ctx.guards).toHaveLength(1)
-    expect(ctx.routes).toHaveLength(6)
+    expect(ctx.routes).toHaveLength(7)
     expect(ctx.get('taktflow')).toBe(service)
   })
   const unloading = Promise.all(ctx.topLevel.map((dispose) => dispose()))

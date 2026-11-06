@@ -2,6 +2,7 @@ import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentProfile } from '@taktflow/core'
 import { DshRolePresets } from './presets.js'
+import type { RoleSkillSnapshots } from './role-skills.js'
 import { FakeHostContext } from './testing/fake-ctx.js'
 import type { SpaceHandle } from './types.js'
 import type { AgentPresetDefinition } from './dsh-types.js'
@@ -45,10 +46,9 @@ describe('动态角色 preset', () => {
     const rows = ctx.presets[0]!.plugins as Array<{ id: string; name: string; config?: Record<string, unknown> }>
     expect(rows.map((row) => row.name)).toEqual([
       '@deepseek-ai/dsh-persona', '@deepseek-ai/dsh-agent-instructions', '@deepseek-ai/dsh-time-context',
-      '@deepseek-ai/dsh-tool-fs', '@deepseek-ai/dsh-tool-fs-search', '@deepseek-ai/dsh-skill-filesystem',
-      '@deepseek-ai/dsh-tool-skill', 'taktflow/role',
+      '@deepseek-ai/dsh-tool-fs', '@deepseek-ai/dsh-tool-fs-search', 'taktflow/role',
     ])
-    expect(rows.find((row) => row.id === 'tool-fs')!.config).toEqual({ write: false, edit: false })
+    expect(rows.find((row) => row.id === 'tool-fs')!.config).toEqual({ write: false, edit: false, applyPatch: false })
     expect(rows.find((row) => row.id === 'agent-instructions')!.config).toEqual({ maxBytes: 65536 })
     expect(rows.find((row) => row.id === 'tool-fs-search')!.config).toEqual({ sampleOverCapGlobResults: false })
     expect(rows.at(-1)!.config).toMatchObject({ role: 'dev', spaceRoot: space.root, instructions: profile.instructions, skills: ['coding'] })
@@ -159,5 +159,65 @@ describe('动态角色 preset', () => {
     const handle = await presets.acquire(space, 'dev', writable)
     await expect(Promise.resolve(handle.release())).rejects.toThrow('注销失败')
     await expect(Promise.resolve(handle.release())).rejects.toThrow('注销失败')
+  })
+
+  it('技能快照进入角色配置与哈希，handle 返回实际注册名', async () => {
+    const { ctx } = fixture()
+    const skills: RoleSkillSnapshots = {
+      dev: [{ name: 'coding', description: '编码约定', content: '# 编码', path: '.takt/skills/coding/SKILL.md' }],
+    }
+    const presets = new DshRolePresets(ctx, { profiles: { dev: profile }, skills })
+    const handle = await presets.acquire(space, 'dev', writable)
+    const rows = ctx.presets[0]!.plugins as Array<{ id: string; config?: Record<string, unknown> }>
+    expect(rows.at(-1)!.config).toMatchObject({
+      skills: ['coding'],
+      skillSnapshot: [{ name: 'coding', description: '编码约定', content: '# 编码', path: '.takt/skills/coding/SKILL.md' }],
+    })
+    expect(handle.skills).toEqual(['coding'])
+    const changed = await new DshRolePresets(ctx, {
+      profiles: { dev: profile },
+      skills: { dev: [{ name: 'coding', description: '编码约定', content: '# 新编码', path: '.takt/skills/coding/SKILL.md' }] },
+    }).acquire(space, 'dev', writable)
+    expect(changed.cfgHash).not.toBe(handle.cfgHash)
+    expect(changed.skills).toEqual(['coding'])
+    await handle.release()
+    await changed.release()
+  })
+
+  it('快照缺少声明技能或含未声明技能时明确失败', async () => {
+    const { ctx } = fixture()
+    await expect(new DshRolePresets(ctx, { profiles: { dev: profile }, skills: {} }).acquire(space, 'dev', writable))
+      .rejects.toThrow('缺少冻结的技能快照：coding')
+    await expect(new DshRolePresets(ctx, {
+      profiles: { dev: profile },
+      skills: { dev: [
+        { name: 'coding', description: '编码约定', content: '# 编码', path: '.takt/skills/coding/SKILL.md' },
+        { name: 'other', description: '别的', content: '正文', path: '.takt/skills/other/SKILL.md' },
+      ] },
+    }).acquire(space, 'dev', writable)).rejects.toThrow('包含未声明技能：other')
+  })
+
+  it('旧调用方没有快照时 handle.skills 为空，不把声明名冒充成已注册', async () => {
+    const { ctx } = fixture()
+    const handle = await new DshRolePresets(ctx, { profiles: { dev: profile } }).acquire(space, 'dev', writable)
+    expect(handle.skills).toEqual([])
+    const rows = ctx.presets[0]!.plugins as Array<{ id: string; config?: Record<string, unknown> }>
+    expect(rows.at(-1)!.config).toMatchObject({ skills: ['coding'] })
+    expect(rows.at(-1)!.config).not.toHaveProperty('skillSnapshot')
+    await handle.release()
+  })
+
+  it('快照使用无原型字典，__proto__ 角色名仍能正常查找', async () => {
+    const ctx = new FakeHostContext()
+    ctx.setService('agentPresets', ctx.agentPresets)
+    const profiles = Object.create(null) as Record<string, AgentProfile>
+    profiles['__proto__'] = { ...profile, role: '__proto__', skills: [] }
+    const skills = Object.create(null) as RoleSkillSnapshots
+    skills['__proto__'] = []
+    const presets = new DshRolePresets(ctx, { profiles, skills })
+    const handle = await presets.acquire(space, '__proto__', writable)
+    expect(handle.skills).toEqual([])
+    await handle.release()
+    await ctx.dispose()
   })
 })

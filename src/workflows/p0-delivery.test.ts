@@ -181,11 +181,11 @@ describe('p0-delivery 流程与目录', () => {
     expect(implement.writeScope).toEqual(['src/**'])
     const design = workflow.nodes.find((node) => node.id === 'design') as AgentNodeDef
     expect(design.outputs?.map((output) => output.path)).toEqual(['design/design.md'])
-    // 物理写范围落在需求目录下，逻辑产物路径仍是 design/**。
-    expect(design.writeScope).toEqual(['.takt/workspaces/*/design/**'])
+    // 物理写范围落在需求目录下，逻辑产物路径仍是 design/**；新老布局都兼容。
+    expect(design.writeScope).toEqual(['requirements/*/design/**', '.takt/workspaces/*/design/**'])
     const report = workflow.nodes.find((node) => node.id === 'report') as AgentNodeDef
     expect(report.outputs?.map((output) => output.path)).toEqual(['reports/summary.md'])
-    expect(report.writeScope).toEqual(['.takt/workspaces/*/reports/**'])
+    expect(report.writeScope).toEqual(['requirements/*/reports/**', '.takt/workspaces/*/reports/**'])
   })
 
   it('clarify/design 纳入 clarifications/**，clarify prompt 要求读取 requirement.json 元数据', async () => {

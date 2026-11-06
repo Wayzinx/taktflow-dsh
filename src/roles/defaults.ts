@@ -2,16 +2,19 @@
  * 随包默认角色档案。
  *
  * 调用方：
- * - `loadRunProfiles` 以它们为基线，空间 `.takt/agents/<role>.md` 同名覆盖；
- * - `takt_requirement init` 把它们复制到新空间的 `.takt/agents/`（只补缺，不覆盖）。
+ * - `loadRunProfiles` 以它们为基线，空间 `agents/<role>.md` 同名覆盖；
+ * - `takt_requirement init` 把它们复制到新空间 `agents/`（只补缺，不覆盖）。
  *
- * 为什么是内嵌字符串：`scripts/build.mjs` 只打包 TS/JS，不加载 `.md` 资源；
- * 改成资源导入需要改构建脚本或 package.json，超出本模块范围。内容格式与空间
- * 角色档案完全一致（frontmatter + 正文），因此仍可用同一套解析逻辑。
+ * 模板角色来自构建期生成的 `src/templates/bundled.ts`（源头是 taktflow 模板），
+ * 因此发布包里不依赖用户机器上有 taktflow 仓库。P0 演示流程继续使用
+ * analyst / reporter 两个旧角色；release-reviewer 是 full 自主模式下
+ * “准出评审”的独立只读角色，不参与普通流程节点。
  *
- * 约束：四个角色都显式 `allowBash: false`，writeScope 与 p0-delivery 节点一致；
+ * 约束：所有随包角色都显式 `allowBash: false`（模板未写时按 false 处理），
  * 空间里的同名文件优先，用户可以直接修改。
  */
+import { BUNDLED_AGENT_FILES } from '../templates/bundled.js'
+
 export interface BundledRoleFile {
   /** 角色名，也是默认文件名（不含 .md）。 */
   readonly role: string
@@ -20,7 +23,13 @@ export interface BundledRoleFile {
   readonly content: string
 }
 
-export const BUNDLED_ROLE_FILES: readonly BundledRoleFile[] = [
+const TEMPLATE_ROLES: readonly BundledRoleFile[] = BUNDLED_AGENT_FILES.map((file) => ({
+  role: file.fileName.replace(/\.md$/, ''),
+  fileName: file.fileName,
+  content: file.content,
+}))
+
+const LEGACY_ROLES: readonly BundledRoleFile[] = [
   {
     role: 'analyst',
     fileName: 'analyst.md',
@@ -43,52 +52,6 @@ export const BUNDLED_ROLE_FILES: readonly BundledRoleFile[] = [
     ].join('\n'),
   },
   {
-    role: 'architect',
-    fileName: 'architect.md',
-    content: [
-      '---',
-      'role: architect',
-      'title: 架构师',
-      'description: 输出可审批的系分设计（design/design.md）',
-      'harness: dsh-host',
-      'skills: []',
-      'writeScope:',
-      '  - .takt/workspaces/*/design/**',
-      'allowBash: false',
-      '---',
-      '',
-      '你是架构师。基于需求与澄清结论写系分，供人工审批后进入实现。',
-      '',
-      '- 写清改动范围、模块划分、接口/数据变更、风险与回滚方案。',
-      '- 存量能力优先复用；不要重写无关模块。',
-      '- 把结论写到 design/design.md；这是本节点唯一的交付物。',
-      '- 不要修改代码、测试或流程文件，也不要运行命令。',
-    ].join('\n'),
-  },
-  {
-    role: 'dev',
-    fileName: 'dev.md',
-    content: [
-      '---',
-      'role: dev',
-      'title: 开发工程师',
-      'description: 按已批准设计在 src/** 内实现并保持改动最小',
-      'harness: dsh-host',
-      'skills: []',
-      'writeScope:',
-      '  - src/**',
-      'allowBash: false',
-      '---',
-      '',
-      '你是开发工程师。只按已批准的 design/design.md 在 src/** 内实现。',
-      '',
-      '- 保持改动最小，复用存量能力；不要修改设计文档、配置或流程文件。',
-      '- 可以在 src/** 内新增或调整测试；src/ 之外的测试不要改。',
-      '- 不要运行命令；测试由流程的 script 节点统一执行。',
-      '- 完成后用一段话说明改了什么、还有哪些风险。',
-    ].join('\n'),
-  },
-  {
     role: 'reporter',
     fileName: 'reporter.md',
     content: [
@@ -100,6 +63,7 @@ export const BUNDLED_ROLE_FILES: readonly BundledRoleFile[] = [
       'skills: []',
       'writeScope:',
       '  - .takt/workspaces/*/reports/**',
+      '  - requirements/*/reports/**',
       'allowBash: false',
       '---',
       '',
@@ -110,6 +74,36 @@ export const BUNDLED_ROLE_FILES: readonly BundledRoleFile[] = [
       '- 把报告写到 reports/summary.md，不要修改其它文件。',
     ].join('\n'),
   },
+]
+
+const INTERNAL_ROLES: readonly BundledRoleFile[] = [
+  {
+    role: 'release-reviewer',
+    fileName: 'release-reviewer.md',
+    content: [
+      '---',
+      'role: release-reviewer',
+      'title: 准出评审',
+      'description: 独立判断质量报告、影响面与评审记录是否足以准出；只读，不修改任何文件',
+      'harness: dsh-host',
+      'skills: []',
+      'writeScope: []',
+      'allowBash: false',
+      '---',
+      '',
+      '你是独立的准出评审。只依据质量报告、影响面评估、各评审轮次结论和用例证据判断是否准出。',
+      '',
+      '- 证据不足、仍有 blocker 或未解决项时明确拒绝，不要替人做决定。',
+      '- 批准时必须能指出每条结论对应的产物路径。',
+      '- 不修改任何文件，不运行命令。',
+    ].join('\n'),
+  },
+]
+
+export const BUNDLED_ROLE_FILES: readonly BundledRoleFile[] = [
+  ...TEMPLATE_ROLES,
+  ...LEGACY_ROLES,
+  ...INTERNAL_ROLES,
 ]
 
 /** 默认角色名列表；测试和诊断用。 */

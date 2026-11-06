@@ -122,6 +122,23 @@ export function bindingsFile(space: SpaceHandle): string {
   return path.join(space.stores.taktDir, 'dsh', 'bindings.json')
 }
 
+/**
+ * 读取某个需求绑定的真实人（M-J 增量）。
+ *
+ * 调用方：AI 自主代答在写回答前取 `onBehalfOf`，不能用模型输出或当前配置的
+ * 用户冒充。绑定文件损坏时抛错，不静默回退；没有记录时返回 undefined，由调用
+ * 方按“配置用户仅作旧数据回退”的规则决定是否继续。
+ */
+export async function bindingActor(
+  space: SpaceHandle,
+  requirementId: string,
+): Promise<Extract<Actor, { type: 'human' }> | undefined> {
+  const rid = assertRequirementId(requirementId)
+  const state = await readBindingsFile(bindingsFile(space))
+  const entry = state.bindings.find((item) => item.requirementId === rid)
+  return entry === undefined ? undefined : cloneActor(entry.by) as Extract<Actor, { type: 'human' }>
+}
+
 interface BindingEntry {
   requirementId: string
   sessionId: string

@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
+import path from 'node:path'
 import { extractJsonBlock, type AgentProfile, type HarnessAdapter, type HarnessEvent, type HarnessRequest, type HarnessResult } from '@taktflow/core'
 import { collectSecrets } from '@taktflow/harness'
 import type { AgentTraceHandle, AgentTraceHub, AgentTraceOutcome } from './agent-trace.js'
 import type { HostContext, SessionEvent, SubagentActivation } from './dsh-types.js'
+import type { RoleSkillSnapshots } from './role-skills.js'
 import { supportsDshOutputSchema } from './dsh-schema.js'
 import { TaktToolError, type Ownership, type PermissionRegistry, type RolePresetHandle, type RolePresets, type SpaceHandle } from './types.js'
 
@@ -17,6 +19,8 @@ export interface DshHarnessDeps {
   profiles?: Record<string, AgentProfile>
   /** 运行开始时冻结的角色来源；有 traces 时必填，禁止从角色名猜测。 */
   profileSources?: Record<string, 'space' | 'bundled'>
+  /** 运行开始时冻结的角色技能；提供时校验 preset 实际注册的 skills 与之一致。 */
+  roleSkills?: RoleSkillSnapshots
   /** 追溯中心；缺失时保持原执行语义，不写追溯文件。 */
   traces?: AgentTraceHub
   /** RunManager 取消整条运行；回调不可等待当前 harness 所属任务。 */
@@ -48,6 +52,24 @@ function waitForCapacity(signal: AbortSignal, milliseconds: number): Promise<voi
 function presetPlugins(handle: RolePresetHandle): string[] {
   const value = (handle as RolePresetHandle & { plugins?: unknown }).plugins
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+/** preset 实际注册成功的角色 skill；旧替身没有该字段时返回 undefined，表示未知。 */
+function presetSkills(handle: RolePresetHandle): string[] | undefined {
+  const value = (handle as RolePresetHandle & { skills?: unknown }).skills
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : undefined
+}
+
+function sameNames(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false
+  const sortedLeft = [...left].sort()
+  const sortedRight = [...right].sort()
+  return sortedLeft.every((name, index) => name === sortedRight[index])
+}
+
+function within(root: string, target: string): boolean {
+  const relative = path.relative(root, target)
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
 }
 
 function errorMessage(error: unknown): string {
@@ -88,18 +110,46 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       const runId = req.env?.TAKT_RUN_ID
       const nodeId = req.env?.TAKT_NODE
       if (!role || !runId || !nodeId) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', 'dsh-host 请求缺少角色、运行或节点身份')
-      if (await realpath(req.cwd) !== space.root) throw new TaktToolError('TAKT_SPACE_ROOT_MISMATCH', 'P0 节点 cwd 必须是空间根')
+      // cwd 可以是空间内 worktree；只要求 realpath containment，不再要求等于空间根。
+      const requestedCwd = await realpath(req.cwd)
+      const spaceRoot = await realpath(space.root)
+      if (!within(spaceRoot, requestedCwd)) throw new TaktToolError('TAKT_SPACE_ROOT_MISMATCH', '节点 cwd 必须在空间根内')
+      // core 会传入本地 sandbox；只接受 provider=local 且 workdir 与 cwd 一致，外部 sandbox 仍拒绝。
+      if (req.sandbox !== undefined) {
+        if (req.sandbox.provider !== 'local') {
+          throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `dsh-host 只接受本地 sandbox，拒绝外部 sandbox：${req.sandbox.provider}`)
+        }
+        const workdir = req.sandbox.spec?.workdir
+        if (typeof workdir !== 'string' || workdir.trim() === '') {
+          throw new TaktToolError('TAKT_UNSUPPORTED_NODE', '本地 sandbox 缺少 workdir')
+        }
+        const sandboxCwd = await realpath(path.isAbsolute(workdir) ? workdir : path.resolve(requestedCwd, workdir))
+        if (sandboxCwd !== requestedCwd) {
+          throw new TaktToolError('TAKT_SPACE_ROOT_MISMATCH', '本地 sandbox 的 workdir 与节点 cwd 不一致')
+        }
+      }
+      if (req.provider !== undefined || req.sessionId !== undefined) {
+        throw new TaktToolError('TAKT_UNSUPPORTED_NODE', 'dsh-host 不支持独立 provider 或会话续聊')
+      }
       const run = await space.stores.runs.get(runId)
       const node = run?.nodes[nodeId]
-      if (node === undefined || node.attempts < 1) throw new TaktToolError('TAKT_RUN_BUSY', `运行中的节点身份不可用：${runId}/${nodeId}`)
+      if (run === undefined || node === undefined || node.attempts < 1) {
+        throw new TaktToolError('TAKT_RUN_BUSY', `运行中的节点身份不可用：${runId}/${nodeId}`)
+      }
       const nodeRef = { runId, nodeId, attempt: node.attempts }
       const profile = deps.profiles?.[role]
       const allowBash = req.tools?.allowBash === true || profile?.allowBash === true
       if (allowBash) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', 'P0 dsh-host 不支持 shell')
-      if (req.provider !== undefined || req.sandbox !== undefined || req.sessionId !== undefined) {
-        throw new TaktToolError('TAKT_UNSUPPORTED_NODE', 'dsh-host 不支持独立 provider、外部 sandbox 或会话续聊')
+      const artifactDir = space.stores.workspaces?.dir(run.requirementId)
+      if (typeof artifactDir !== 'string' || artifactDir === '') {
+        throw new TaktToolError('TAKT_UNSUPPORTED_NODE', '空间缺少当前需求的公共产物目录')
+      }
+      const artifactRoot = await realpath(artifactDir)
+      if (!within(spaceRoot, artifactRoot)) {
+        throw new TaktToolError('TAKT_SPACE_ROOT_MISMATCH', '当前需求产物目录不在空间根内')
       }
       const writeScope = [...(req.tools?.writeScope ?? profile?.writeScope ?? [])]
+      const readScope = profile?.readScope === undefined ? undefined : [...profile.readScope]
       const readOnly = writeScope.length === 0
       const requireParent = async () => {
         const parent = ctx.agents.get(deps.ownerSessionId)
@@ -109,7 +159,11 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       }
       await requireParent()
       const childId = randomUUID()
-      const releasePermission = deps.permissions.register({ childId, nodeRef, cwd: space.root, writeScope, allowBash: false, readOnly })
+      const releasePermission = deps.permissions.register({
+        childId, nodeRef, cwd: requestedCwd, spaceRoot, artifactRoot, writeScope,
+        ...(readScope === undefined ? {} : { readScope }),
+        allowBash: false, readOnly,
+      })
       let preset: RolePresetHandle | undefined
       let activation: SubagentActivation | undefined
       let disposal: Promise<void> | undefined
@@ -122,6 +176,14 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       try {
         preset = await deps.presets.acquire(space, role, { readOnly, allowBash: false })
         signal.throwIfAborted()
+        const actualSkills = presetSkills(preset)
+        // 生产 preset 必须报告实际注册的 skills；旧 fake preset 没有该字段时保持兼容。
+        if (deps.roleSkills !== undefined && actualSkills !== undefined) {
+          const expected = (deps.roleSkills[role] ?? []).map((skill) => skill.name)
+          if (!sameNames(expected, actualSkills)) {
+            throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `角色 ${role} 的 preset 实际注册技能与冻结快照不一致`)
+          }
+        }
         await deps.onPreset?.(role, { id: preset.id, cfgHash: preset.cfgHash }, nodeRef)
         const outputSchema = supportsDshOutputSchema(req.resultSchema) ? req.resultSchema : undefined
         const prompt = [req.systemAppend, req.prompt,
@@ -136,9 +198,15 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
           if (source === undefined) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `追溯缺少冻结的角色来源：${role}`)
           trace = await deps.traces.begin(space, {
             runId, nodeId, attempt: nodeRef.attempt, label, role, sessionId: childId,
-            preset: { id: preset.id, cfgHash: preset.cfgHash, plugins: presetPlugins(preset) },
+            preset: {
+              id: preset.id, cfgHash: preset.cfgHash, plugins: presetPlugins(preset),
+              ...(actualSkills === undefined ? {} : { skills: [...actualSkills] }),
+            },
             profile: {
-              title: profile.title, description: profile.description, skills: [...profile.skills],
+              title: profile.title, description: profile.description,
+              // 有 handle 实际技能时以它为准；旧 fake preset 缺字段才退回声明名。
+              skills: actualSkills === undefined ? [...profile.skills] : [...actualSkills],
+              declaredSkills: [...profile.skills],
               writeScope: [...profile.writeScope], readOnly, source,
             },
             prompt,
@@ -162,11 +230,8 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
               provider: 'spawn', label, childId, signal, delivery: 'caller',
               request: {
                 prompt: [{ type: 'text', text: prompt }], agentPreset: preset.id,
-                ...(outputSchema === undefined ? {} : { outputSchema }), parent, cwd: space.root,
-                ...(req.model === undefined && req.effort === undefined ? {} : { agentOptions: {
-                  ...(req.model === undefined ? {} : { model: req.model }),
-                  ...(req.effort === undefined ? {} : { reasoningEffort: req.effort }),
-                } }),
+                ...(outputSchema === undefined ? {} : { outputSchema }), parent, cwd: requestedCwd,
+                // 不传 agentOptions：dsh 子 Agent 使用 App 模型，req.model/effort 不能谎报为实际模型。
               },
             })
           } catch (error) {
@@ -180,7 +245,10 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         // child 在 result 前就可能被销毁；这里只取发布瞬间的真实 options。
         const child = ctx.agents.get(childId)
         trace?.running(child?.options.model, child?.options.reasoningEffort)
-        onEvent({ type: 'started', sessionId: childId, ...(req.model === undefined ? {} : { model: req.model }) })
+        onEvent({
+          type: 'started', sessionId: childId,
+          ...(child?.options.model === undefined ? {} : { model: child.options.model }),
+        })
         const result = await activation.result
         const finalText = result.output.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
         if (finalText !== '') onEvent({ type: 'message', role: 'assistant', text: finalText })

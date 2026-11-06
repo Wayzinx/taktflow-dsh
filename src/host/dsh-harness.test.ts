@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -43,11 +43,20 @@ const devProfile: AgentProfile = {
   harness: { harness: 'dsh-host' },
   skills: ['coding'],
   writeScope: ['out/**'],
+  readScope: ['out/**'],
   allowBash: false,
 }
 
 let root: string
-beforeEach(async () => { root = await realpath(await mkdtemp(path.join(tmpdir(), 'takt-dsh-harness-'))) })
+let artifact: string
+let worktree: string
+beforeEach(async () => {
+  root = await realpath(await mkdtemp(path.join(tmpdir(), 'takt-dsh-harness-')))
+  artifact = path.join(root, '.takt', 'workspaces', 'REQ-1')
+  worktree = path.join(root, 'worktrees', 'REQ-1')
+  await mkdir(artifact, { recursive: true })
+  await mkdir(worktree, { recursive: true })
+})
 afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
 function fixture(options: { trace?: boolean } = {}) {
@@ -61,7 +70,13 @@ function fixture(options: { trace?: boolean } = {}) {
     calls.push('preset')
     return { id: 'role-preset', cfgHash: 'abcdef12', plugins: ['persona', 'tool-fs'], release: releasePreset }
   })
-  const space = { root, stores: { runs: { get: async () => ({ requirementId: 'REQ-1', nodes: { build: { attempts: 2 } } }) } } } as unknown as SpaceHandle
+  const space = {
+    root,
+    stores: {
+      runs: { get: async () => ({ requirementId: 'REQ-1', nodes: { build: { attempts: 2 } } }) },
+      workspaces: { dir: () => artifact },
+    },
+  } as unknown as SpaceHandle
   const traces = options.trace === true ? traceSpy() : undefined
   const deps: DshHarnessDeps = {
     ctx, space, ownerSessionId: parent.id, presets: { acquire }, queueIntervalMs: 1,
@@ -110,10 +125,18 @@ describe('dsh-host 节点生命周期', () => {
     f.req.effort = 'high'
     f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
       expect(spec.request.outputSchema).toEqual(f.req.resultSchema)
-      expect(spec.request.agentOptions).toEqual({ model: 'model-a', reasoningEffort: 'high' })
+      // req.model/effort 不能覆盖 dsh 子 Agent；实际模型由 App 选择并只从 child options 报告。
+      expect(Object.hasOwn(spec.request, 'agentOptions')).toBe(false)
+      const child: Agent = {
+        id: spec.childId!, options: { provider: 'local', model: 'app-model', reasoningEffort: 'high' },
+        session: { header: { id: spec.childId!, cwd: root } }, followup() {}, inject() {},
+      }
+      f.ctx.agents.get = (id) => id === spec.childId ? child : f.parent
       return { childId: spec.childId!, result: Promise.resolve({ output: [], structured: { ok: true }, stopReason: 'completed' }), dispose: f.dispose }
     })
-    expect(await f.run()).toMatchObject({ ok: true, structured: { ok: true } })
+    const result = await f.run()
+    expect(result).toMatchObject({ ok: true, structured: { ok: true } })
+    expect(f.events[0]).toMatchObject({ type: 'started', model: 'app-model' })
   })
 
   it('不支持的 schema 不透传，从最后的 JSON 代码块提取', async () => {
@@ -277,7 +300,7 @@ describe('dsh-host 节点生命周期', () => {
     expect(await f.run()).toMatchObject({ ok: false, error: '未完成' })
   })
 
-  it('空写范围传递只读变体；shell 与子目录 cwd 均拒绝', async () => {
+  it('空写范围传递只读变体；shell 与空间外 cwd 均拒绝', async () => {
     const f = fixture()
     f.req.tools = { writeScope: [] }
     await f.run()
@@ -287,6 +310,54 @@ describe('dsh-host 节点生命周期', () => {
     f.req.tools.allowBash = false
     f.req.cwd = tmpdir()
     await expect(f.run()).rejects.toMatchObject({ code: 'TAKT_SPACE_ROOT_MISMATCH' })
+  })
+})
+
+describe('dsh-host worktree 与 sandbox', () => {
+  it('接受空间内 worktree cwd 与 local sandbox，权限登记两域 scope', async () => {
+    const f = fixture()
+    f.deps.profiles = { dev: devProfile }
+    f.req.cwd = worktree
+    f.req.sandbox = {
+      id: 'local', provider: 'local', spec: { workdir: worktree, mounts: [] },
+    } as unknown as NonNullable<HarnessRequest['sandbox']>
+    let captured: PermissionScope | undefined
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
+      captured = f.permissions.get(spec.childId!)
+      expect(spec.request.cwd).toBe(worktree)
+      return { childId: spec.childId!, result: Promise.resolve({ output: [], stopReason: 'completed' }), dispose: f.dispose }
+    })
+    expect((await f.run()).ok).toBe(true)
+    expect(captured).toMatchObject({
+      cwd: worktree, spaceRoot: root, artifactRoot: artifact,
+      writeScope: ['out/**'], readScope: ['out/**'], allowBash: false,
+    })
+    expect(f.permissions.size).toBe(0)
+  })
+
+  it('外部 sandbox 与 workdir 不一致都拒绝，且不登记资源', async () => {
+    const f = fixture()
+    f.req.sandbox = {
+      id: 'docker', provider: 'docker', spec: { workdir: root, mounts: [] },
+    } as unknown as NonNullable<HarnessRequest['sandbox']>
+    await expect(f.run()).rejects.toThrow('只接受本地 sandbox')
+    expect(f.calls).toEqual([])
+    f.req.sandbox = {
+      id: 'local', provider: 'local', spec: { workdir: tmpdir(), mounts: [] },
+    } as unknown as NonNullable<HarnessRequest['sandbox']>
+    await expect(f.run()).rejects.toThrow('workdir 与节点 cwd 不一致')
+    expect(f.calls).toEqual([])
+  })
+
+  it('缺少当前需求产物目录或目录在空间根外时明确失败', async () => {
+    const f = fixture()
+    const stores = f.deps.space as unknown as { stores: { workspaces?: { dir: () => string } } }
+    stores.stores.workspaces = undefined
+    await expect(f.run()).rejects.toThrow('缺少当前需求的公共产物目录')
+    expect(f.calls).toEqual([])
+    stores.stores.workspaces = { dir: () => tmpdir() }
+    await expect(f.run()).rejects.toThrow('当前需求产物目录不在空间根内')
+    expect(f.calls).toEqual([])
   })
 })
 
@@ -438,5 +509,35 @@ describe('dsh-host 追溯接线', () => {
     f.deps.profileSources = { dev: 'space' }
     f.deps.profiles = {}
     await expect(f.run()).rejects.toThrow('追溯缺少角色档案')
+  })
+
+  it('trace 记录 handle 实际 skills 与档案声明名，不把声明名冒充成已注册', async () => {
+    const f = fixture({ trace: true })
+    f.deps.profiles = { dev: { ...devProfile, skills: ['coding', 'review'] } }
+    f.deps.roleSkills = {
+      dev: [{ name: 'coding', description: '编码约定', content: '正文', path: '.takt/skills/coding/SKILL.md' }],
+    }
+    f.acquire.mockImplementationOnce(async () => ({
+      id: 'role-preset', cfgHash: 'abcdef12', plugins: ['persona'], skills: ['coding'], release: f.releasePreset,
+    }))
+    await f.run()
+    expect(f.traces!.starts[0]!.preset).toMatchObject({ skills: ['coding'] })
+    expect(f.traces!.starts[0]!.profile).toMatchObject({
+      skills: ['coding'], declaredSkills: ['coding', 'review'],
+    })
+  })
+
+  it('preset 实际 skills 与冻结快照不一致时明确失败并释放资源', async () => {
+    const f = fixture({ trace: true })
+    f.deps.roleSkills = {
+      dev: [{ name: 'review', description: '评审', content: '正文', path: '.takt/skills/review/SKILL.md' }],
+    }
+    f.acquire.mockImplementationOnce(async () => ({
+      id: 'role-preset', cfgHash: 'abcdef12', plugins: ['persona'], skills: ['coding'], release: f.releasePreset,
+    }))
+    await expect(f.run()).rejects.toThrow('实际注册技能与冻结快照不一致')
+    expect(f.ctx.subagents.startActivation).not.toHaveBeenCalled()
+    expect(f.permissions.size).toBe(0)
+    expect(f.releasePreset).toHaveBeenCalledOnce()
   })
 })

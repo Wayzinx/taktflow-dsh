@@ -2,7 +2,7 @@
  * dsh 宿主 API 的本地结构类型。
  *
  * 本包不安装 `@deepseek-ai/*`：这里只摘抄实际用到的字段，运行时值只允许从
- * `dsh-runtime.ts` 取。来源注释指向 dsh 0.2.1-rc.3 的已发布包（npm）或桌面版随附的包源码。类型只约束本插件消费的字段，不追求与
+ * `dsh-runtime.ts` 取。来源注释指向 dsh 0.2.2-rc.1 的已发布包（npm）或桌面版随附的包源码。类型只约束本插件消费的字段，不追求与
  * 官方声明逐字段相同；升级 dsh 时按注释里的来源对账。
  */
 
@@ -89,11 +89,11 @@ export interface UserMessage extends MessageBase {
   readonly role: 'user'
 }
 
-/** 来源：@deepseek-ai/dsh-agent@0.2.1-rc.3/lib/types/types.d.ts:11-14。 */
+/** 来源：@deepseek-ai/dsh-agent@0.2.2-rc.1/lib/types/types.d.ts:11-14。 */
 export interface Agent {
   /** Session-backed Agent identity。 */
   readonly id: string
-  /** 来源：@deepseek-ai/dsh-agent@0.2.1-rc.3/lib/types/runtime-types.d.ts:139-145；官方为必填。 */
+  /** 来源：@deepseek-ai/dsh-agent@0.2.2-rc.1/lib/types/runtime-types.d.ts:139-145；官方为必填。 */
   readonly options: AgentOptions
   /** 来源：同上 :141；官方为必填，这里只约束 id/header。 */
   readonly session: Session
@@ -107,7 +107,7 @@ export interface Agent {
   inject(message: UserMessage): void
 }
 
-/** 来源：@deepseek-ai/dsh-agent@0.2.1-rc.3/lib/types/runtime-types.d.ts:22-34。 */
+/** 来源：@deepseek-ai/dsh-agent@0.2.2-rc.1/lib/types/runtime-types.d.ts:22-34。 */
 export interface AgentOptions {
   readonly provider?: string
   readonly model?: string
@@ -116,7 +116,7 @@ export interface AgentOptions {
 }
 
 /**
- * 来源：@deepseek-ai/dsh-session@0.2.1-rc.3/lib/types/types.d.ts:59-95。
+ * 来源：@deepseek-ai/dsh-session@0.2.2-rc.1/lib/types/types.d.ts:59-95。
  * 只约束消费字段；官方还要求 version/createdAt/isSeeded 等。
  */
 export interface SessionHeader {
@@ -127,7 +127,7 @@ export interface SessionHeader {
 
 /**
  * 会话事件流里的单条事件。
- * 来源：@deepseek-ai/dsh-session@0.2.1-rc.3/lib/types/types.d.ts:256-405（SessionEvent）。
+ * 来源：@deepseek-ai/dsh-session@0.2.2-rc.1/lib/types/types.d.ts:256-405（SessionEvent）。
  * data 的具体形状随 type 变化，消费方必须按事件类型自行收窄。
  */
 export interface SessionEvent {
@@ -139,7 +139,7 @@ export interface SessionEvent {
 }
 
 /**
- * 来源：@deepseek-ai/dsh-session@0.2.1-rc.3/lib/types/index.d.ts:295-312（requestHeader/requestContext）。
+ * 来源：@deepseek-ai/dsh-session@0.2.2-rc.1/lib/types/index.d.ts:295-312（requestHeader/requestContext）。
  * 这里只约束 Agent.session 上实际读取的字段。
  */
 export interface Session {
@@ -149,7 +149,7 @@ export interface Session {
 }
 
 /**
- * 来源：@deepseek-ai/dsh-llm@0.2.1-rc.3/lib/types/index.d.ts（TokenUsage）。
+ * 来源：@deepseek-ai/dsh-llm@0.2.2-rc.1/lib/types/index.d.ts（TokenUsage）。
  * assistant/message 事件里的用量；缺字段表示该次响应没有报告。
  */
 export interface TokenUsage {
@@ -161,7 +161,7 @@ export interface TokenUsage {
   readonly reasoningTokens?: number
 }
 
-/** 来源：@deepseek-ai/dsh-subagent@0.2.1-rc.3/lib/types/types.d.ts:127-144。 */
+/** 来源：@deepseek-ai/dsh-subagent@0.2.2-rc.1/lib/types/types.d.ts:127-144。 */
 export interface SubagentStartRequest {
   readonly cwd?: string
   readonly agentPreset?: string
@@ -175,7 +175,7 @@ export interface SubagentStartRequest {
   readonly maxDepth?: number
 }
 
-/** 来源：@deepseek-ai/dsh-subagent@0.2.1-rc.3/lib/types/types.d.ts:25-38。 */
+/** 来源：@deepseek-ai/dsh-subagent@0.2.2-rc.1/lib/types/types.d.ts:25-38。 */
 export interface SubagentActivationSpec {
   readonly provider: string
   readonly label: string
@@ -185,7 +185,7 @@ export interface SubagentActivationSpec {
   readonly delivery: 'parent' | 'caller'
 }
 
-/** 来源：@deepseek-ai/dsh-subagent@0.2.1-rc.3/lib/types/types.d.ts:40-56。 */
+/** 来源：@deepseek-ai/dsh-subagent@0.2.2-rc.1/lib/types/types.d.ts:40-56。 */
 export interface SubagentActivation {
   readonly childId: string
   readonly messageId?: string
@@ -193,7 +193,7 @@ export interface SubagentActivation {
   dispose(): Promise<void>
 }
 
-/** 来源：@deepseek-ai/dsh-subagent@0.2.1-rc.3/lib/types/types.d.ts:237-258。 */
+/** 来源：@deepseek-ai/dsh-subagent@0.2.2-rc.1/lib/types/types.d.ts:237-258。 */
 export interface SubagentResult {
   readonly output: readonly ContentBlock[]
   readonly structured?: unknown
@@ -201,7 +201,7 @@ export interface SubagentResult {
   readonly stopReason: string
 }
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/index.d.ts:216-241。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/index.d.ts:216-241。 */
 export interface ToolExecutionInput {
   readonly callId: string
   readonly rootCallId?: string
@@ -212,13 +212,13 @@ export interface ToolExecutionInput {
   readonly signal: AbortSignal
 }
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/index.d.ts:282-286。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/index.d.ts:282-286。 */
 export interface ToolExecution extends ToolExecutionInput {
   readonly rootCallId: string
   readonly token: symbol
 }
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/index.d.ts:305-321。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/index.d.ts:305-321。 */
 export interface ToolRunContext extends ToolExecution {
   deferContext(context: UserMessage): void
   concludeTurn(): void
@@ -227,7 +227,7 @@ export interface ToolRunContext extends ToolExecution {
 /** 本包对官方 ToolRunContext 的别名；审批与守卫只需要这套字段。 */
 export type ToolExecutionContext = ToolRunContext
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/index.d.ts:522（同步守卫）。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/index.d.ts:522（同步守卫）。 */
 export type ToolGuard = (execution: Readonly<ToolExecution>) => string | undefined
 
 /** 来源：@deepseek-ai/dsh-api-session-controller（桌面版随附）/lib/typert.host.js:3170-3176。 */
@@ -240,19 +240,19 @@ export interface ToolSchema {
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/index.d.ts:106-113。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/index.d.ts:106-113。 */
 export interface ToolOutputDefinition {
   readonly schema: Record<string, unknown>
   render(args: unknown, value: JsonValue): ContentBlock[]
 }
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/index.d.ts:115-175。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/index.d.ts:115-175。 */
 export interface ToolDefinition extends ToolSchema {
   readonly output: ToolOutputDefinition
   execute(args: unknown, exec: ToolRunContext): Promise<unknown>
 }
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/schema.d.ts:1-72。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/schema.d.ts:1-72。 */
 export interface ValueSchemaAnnotations {
   description?: string
   title?: string
@@ -323,7 +323,7 @@ export type ValueSchemaSpec =
 export type ParameterPropertySpec = ValueSchemaSpec & { required?: true }
 export type ParameterSchemaSpec = Record<string, ParameterPropertySpec>
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/schema.d.ts:178-210。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/schema.d.ts:178-210。 */
 export interface DefineToolOptions {
   readonly name: string
   readonly description: string
@@ -338,7 +338,7 @@ export interface DefineToolOptions {
   execute(args: unknown, exec: ToolRunContext): Promise<unknown>
 }
 
-/** 来源：@deepseek-ai/dsh-tools@0.2.1-rc.3/lib/types/schema.d.ts:248。 */
+/** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/schema.d.ts:248。 */
 export type DefineTool = (options: DefineToolOptions) => ToolDefinition
 
 /** 来源：@deepseek-ai/dsh-agent-preset-registry（桌面版随附）/lib/typert.host.js:660-661。 */
@@ -359,7 +359,7 @@ export interface AgentPresetSummary {
   readonly broken?: string
 }
 
-/** 来源：@deepseek-ai/dsh-system-prompt@0.2.1-rc.3/lib/types/index.d.ts:47-67。 */
+/** 来源：@deepseek-ai/dsh-system-prompt@0.2.2-rc.1/lib/types/index.d.ts:47-67。 */
 export interface SystemPromptSection {
   readonly name: string
   readonly order: number
@@ -367,7 +367,7 @@ export interface SystemPromptSection {
   readonly interpolate?: boolean
 }
 
-/** 来源：@deepseek-ai/dsh-skill@0.2.1-rc.3/lib/types/index.d.ts:20,37-44,78-84。 */
+/** 来源：@deepseek-ai/dsh-skill@0.2.2-rc.1/lib/types/index.d.ts:20,37-44,78-84。 */
 export type SkillSource =
   | 'project-dsh'
   | 'project-agents'
@@ -395,7 +395,7 @@ export interface SkillRegistration {
   readonly provider?: string
 }
 
-/** 来源：@deepseek-ai/dsh-client-connection@0.2.1-rc.3/lib/types/rpc.d.ts:119-132。 */
+/** 来源：@deepseek-ai/dsh-client-connection@0.2.2-rc.1/lib/types/rpc.d.ts:119-132。 */
 export interface ConnectionFetchRoute {
   readonly path: string
   readonly methods: readonly ('GET' | 'HEAD' | 'POST')[]

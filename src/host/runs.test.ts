@@ -1,16 +1,19 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { agent, human, initProject, readLease, type AgentProfile, type NodeDef, type WorkflowDefinition } from '@taktflow/core'
+import { agent, human, initProject, readLease, type AgentProfile, type HarnessRequest, type HarnessResult, type NodeDef, type WorkflowDefinition } from '@taktflow/core'
 import { AgentTraceHub, agentTraceHubFor } from './agent-trace.js'
-import type { Agent, SubagentActivationSpec, SubagentResult } from './dsh-types.js'
+import type { createDshHarness } from './dsh-harness.js'
+import type { Agent, AgentPresetDefinition, SubagentActivationSpec, SubagentResult } from './dsh-types.js'
+import { DshRolePresets } from './presets.js'
+import type { RoleSkillSnapshots } from './role-skills.js'
 import { DshRunManager } from './runs.js'
 import { FsOwnership } from './ownership.js'
 import { InMemoryPermissionRegistry } from './permissions.js'
 import { FsSpaceRegistry } from './space.js'
 import { FakeHostContext } from './testing/fake-ctx.js'
-import type { RolePresets, SpaceHandle } from './types.js'
+import type { Approvals, RolePresets, SpaceHandle } from './types.js'
 
 const roots: string[] = []
 const cleanups: Array<() => Promise<void>> = []
@@ -28,12 +31,21 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-async function fixture(nodes: NodeDef[] = simple(), options: { traces?: AgentTraceHub } = {}) {
+interface FixtureOptions {
+  traces?: AgentTraceHub
+  /** 用真实 DshRolePresets（会向 FakeHostContext.agentPresets 注册带 skillSnapshot 的组合）。 */
+  realPresets?: boolean
+  config?: { autonomy?: 'full' | 'checkpoints' | 'manual'; roleHarness?: 'dsh-host' | 'profile'; user?: string }
+  harnessFactory?: typeof createDshHarness
+  approvals?: Approvals
+}
+
+async function fixture(nodes: NodeDef[] = simple(), options: FixtureOptions = {}) {
   const root = await mkdtemp(join(tmpdir(), 'takt-runs-'))
   roots.push(root)
   const stores = await initProject(root)
-  const roleFile = join(stores.taktDir, 'agents/dev.md')
-  const roleText = (instructions = '原始角色') => `---\nrole: dev\nharness: dsh-host\nwriteScope: []\nskills: []\n---\n${instructions}\n`
+  const roleFile = join(stores.paths.agents, 'dev.md')
+  const roleText = (instructions = '原始角色', skills = '[]') => `---\nrole: dev\nharness: dsh-host\nwriteScope: []\nskills: ${skills}\n---\n${instructions}\n`
   await writeFile(roleFile, roleText())
   const spaces = new FsSpaceRegistry()
   const space = await spaces.open(root)
@@ -44,20 +56,34 @@ async function fixture(nodes: NodeDef[] = simple(), options: { traces?: AgentTra
   const ownership = new FsOwnership({ ctx, hostId: 'runs-test' })
   const permissions = new InMemoryPermissionRegistry()
   const acquired: AgentProfile[][] = []
-  const presets: RolePresets & { fork(profiles: Record<string, AgentProfile>): RolePresets } = {
+  const forkedSkills: RoleSkillSnapshots[] = []
+  const stub = {
     acquire: vi.fn(async () => ({ id: 'test-preset', cfgHash: 'test-hash', release() {} })),
-    fork(profiles) { acquired.push(Object.values(profiles)); return this },
+    fork(profiles: Record<string, AgentProfile>, skills?: RoleSkillSnapshots) {
+      acquired.push(Object.values(profiles))
+      if (skills !== undefined) forkedSkills.push(skills)
+      return this
+    },
   }
+  const presets: RolePresets = options.realPresets === true
+    ? (() => {
+        ctx.setService('agentPresets', ctx.agentPresets)
+        return new DshRolePresets(ctx)
+      })()
+    : stub
   let workflow = definition(nodes)
   const workflows = { ids: () => ['test'], load: vi.fn(async () => workflow) }
   const manager = new DshRunManager({
     ctx, spaces, ownership, presets, permissions, workflows, log() {},
     ...(options.traces === undefined ? {} : { traces: options.traces }),
+    ...(options.config === undefined ? {} : { config: options.config }),
+    ...(options.harnessFactory === undefined ? {} : { harnessFactory: options.harnessFactory }),
+    ...(options.approvals === undefined ? {} : { approvals: options.approvals }),
   })
   cleanups.push(async () => { await manager.disposeAll(); await ownership.releaseAll(); await ctx.dispose() })
   const input = { space, requirementId, workflowId: 'test', ownerSessionId: 'lead', requestKey: 'start-1' }
   const setWorkflow = (next: WorkflowDefinition) => { workflow = next }
-  return { root, stores, space, spaces, ctx, lead, ownership, permissions, presets, acquired, workflows, manager, input, roleFile, roleText, setWorkflow }
+  return { root, stores, space, spaces, ctx, lead, ownership, permissions, presets, acquired, forkedSkills, workflows, manager, input, roleFile, roleText, setWorkflow }
 }
 
 async function status(space: SpaceHandle, runId: string, expected: string): Promise<void> {
@@ -99,7 +125,7 @@ describe('RunManager 真实 core 生命周期', () => {
     f.setWorkflow(definition([agent({ id: 'work', title: '执行', role: 'ghost', harness: { harness: 'dsh-host' }, prompt: '完成任务', writeScope: [] })]))
     await expect(f.manager.start(f.input)).rejects.toThrow('角色不存在')
     expect(await f.space.stores.runs.list()).toHaveLength(0)
-    await writeFile(join(f.stores.taktDir, 'agents', 'ghost.md'), '---\nrole: ghost\nharness: dsh-host\nwriteScope: []\nskills: []\n---\n幽灵角色\n')
+    await writeFile(join(f.stores.paths.agents, 'ghost.md'), '---\nrole: ghost\nharness: dsh-host\nwriteScope: []\nskills: []\n---\n幽灵角色\n')
     vi.spyOn(f.ownership, 'recordRun').mockRejectedValueOnce(new Error('owner写入失败'))
     await expect(f.manager.start(f.input)).rejects.toThrow('owner写入失败')
     await vi.waitFor(async () => expect((await f.space.stores.runs.list())[0]?.status).toBe('failed'))
@@ -190,7 +216,7 @@ describe('RunManager 真实 core 生命周期', () => {
     await status(f.space, runId, 'succeeded')
     const saved = await readFile(join(f.space.stores.taktDir, 'runs', runId, 'dsh-runtime.json'), 'utf8')
     expect(saved).not.toContain('原始角色')
-    expect(JSON.parse(saved)).toMatchObject({ version: 1, workflow: expect.stringMatching(/^[a-f0-9]{64}$/) })
+    expect(JSON.parse(saved)).toMatchObject({ version: 2, workflow: expect.stringMatching(/^[a-f0-9]{64}$/) })
   })
 
   it('清理失败不伪装取消成功，卸载不释放lease且保留权限', async () => {
@@ -409,5 +435,149 @@ describe('RunManager 真实 core 生命周期', () => {
     const shared = agentTraceHubFor(f.permissions)
     expect(shared).toBeInstanceOf(AgentTraceHub)
     expect(await shared!.read(f.space, runId)).toMatchObject([{ runId, nodeId: 'work', status: 'completed' }])
+  })
+
+  it('full 模式在引擎启动前克隆并关闭显式 args 的评审签字，输入对象不被修改', async () => {
+    const f = await fixture(simple(), { config: { autonomy: 'full' } })
+    const args = {
+      review: { humanSignoff: true, maxRounds: 2 },
+      reviews: { work: { humanSignoff: true, maxReworks: 3 } },
+    }
+    const { runId } = await f.manager.start({ ...f.input, args })
+    await status(f.space, runId, 'succeeded')
+    // core 的 configureReviews 优先使用 args；落盘状态必须已经是强制关闭后的版本。
+    expect((await f.space.stores.runs.get(runId))?.args).toMatchObject({
+      review: { humanSignoff: false, maxRounds: 2 },
+      reviews: { work: { humanSignoff: false, maxReworks: 3 } },
+    })
+    expect(args.review.humanSignoff).toBe(true)
+    expect(args.reviews.work.humanSignoff).toBe(true)
+  })
+
+  it('等待期间修改 SKILL.md 不会改变运行开始时冻结的角色技能快照', async () => {
+    const f = await fixture(
+      [human({ id: 'approval', title: '审批', ask: '批准？', form: 'approve' }), ...simple().map((node) => ({ ...node, needs: ['approval'] }))],
+      { realPresets: true, config: { autonomy: 'manual' } },
+    )
+    await writeFile(f.roleFile, f.roleText('原始角色', '[demo]'))
+    const skillDir = join(f.stores.paths.skills, 'demo')
+    await mkdir(skillDir, { recursive: true })
+    const skillFile = join(skillDir, 'SKILL.md')
+    const skillText = (content: string) => `---\nname: demo\ndescription: 演示技能\n---\n${content}\n`
+    await writeFile(skillFile, skillText('版本一'))
+    const registered: AgentPresetDefinition[] = []
+    const register = f.ctx.agentPresets.register.bind(f.ctx.agentPresets)
+    f.ctx.agentPresets.register = async (definition) => {
+      registered.push(structuredClone(definition))
+      return register(definition)
+    }
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'waiting_human')
+    // 等待期间改技能文件：本次运行必须继续使用开始时冻结的正文。
+    await writeFile(skillFile, skillText('版本二'))
+    const item = (await f.space.stores.attention.list({ pending: true }))[0]!
+    const answered = await f.space.stores.attention.answer(item.requestId, { decision: 'approve', by })
+    await f.manager.onAnswered(f.space, answered)
+    await status(f.space, runId, 'succeeded')
+    const rolePlugins = registered
+      .flatMap((definition) => definition.plugins as Array<{ name?: string; config?: unknown }>)
+      .filter((plugin) => plugin.name === 'taktflow/role')
+    const snapshots = rolePlugins.map((plugin) => (plugin.config as { skillSnapshot?: Array<{ content: string }> }).skillSnapshot ?? [])
+    expect(snapshots.flat().map((skill) => skill.content)).toContain('版本一')
+    expect(JSON.stringify(registered)).not.toContain('版本二')
+  })
+
+  it('dsh-host 遇到空间 docker sandbox 在管理器层明确拒绝，不静默降级 local', async () => {
+    const f = await fixture()
+    const configFile = join(f.root, 'takt.config.json')
+    const config = JSON.parse(await readFile(configFile, 'utf8'))
+    config.sandbox = { provider: 'docker' }
+    await writeFile(configFile, `${JSON.stringify(config, null, 2)}\n`)
+    await expect(f.manager.start(f.input)).rejects.toMatchObject({
+      code: 'TAKT_UNSUPPORTED_NODE',
+      message: expect.stringContaining('docker'),
+    })
+    expect(await f.space.stores.runs.list()).toHaveLength(0)
+    expect(f.ctx.activations).toHaveLength(0)
+  })
+
+  it('自主代答后的 engine.resume 失败会把运行收敛 failed，不留无执行者的 running', async () => {
+    const releaseAnswer = deferred<void>()
+    const approvals: Approvals = {
+      present: async () => {},
+      answer: async () => { throw new Error('不应走人工入口') },
+      async answerAsAgent() {
+        await releaseAnswer.promise
+        return { disposition: 'answer', answered: true }
+      },
+    }
+    const fakeHarness = {
+      id: 'dsh-host',
+      displayName: 'fake dsh-host',
+      capabilities: {},
+      async available() { return { ok: true } },
+      async run(_request: HarnessRequest): Promise<HarnessResult> {
+        return {
+          ok: true,
+          finalText: '',
+          structured: {
+            disposition: 'answer', confidence: 0.95, evidence: [], blockers: [], unresolved: [],
+            rationale: '冻结证据足够', answer: '按默认配置继续',
+          },
+        }
+      },
+      async drain() {},
+    }
+    const harnessFactory = (() => fakeHarness) as unknown as typeof createDshHarness
+    const f = await fixture(
+      [human({ id: 'approval', title: '答复', ask: '怎么继续？', form: 'answer' }), ...simple().map((node) => ({ ...node, needs: ['approval'] }))],
+      { config: { autonomy: 'full', user: '审批人' }, harnessFactory, approvals },
+    )
+    const { runId } = await f.manager.start(f.input)
+    await vi.waitFor(async () => expect((await f.space.stores.attention.list({ pending: true }))).toHaveLength(1))
+    // drive 正在 answerAsAgent 里等闸门；此时替换 resume，模拟引擎恢复失败。
+    const internals = f.manager as unknown as { records: Map<string, { engine: { resume(...args: unknown[]): Promise<unknown> } }> }
+    const record = internals.records.get(`${f.space.root}\0${runId}`)
+    expect(record).toBeDefined()
+    record!.engine.resume = async () => { throw new Error('resume 注入失败') }
+    releaseAnswer.resolve()
+    await status(f.space, runId, 'failed')
+    // fail() 先落 run 状态，run.finished 与 error log 随后异步写入；等两个最终事件都落盘再断言。
+    await vi.waitFor(async () => {
+      const events = await f.space.stores.events.read(runId)
+      expect(events.some((event) => event.type === 'run.finished' && (event.data as { status: string }).status === 'failed')).toBe(true)
+      expect(events.some((event) => event.type === 'log' && String((event.data as { message: string }).message).includes('resume 注入失败'))).toBe(true)
+    }, { timeout: 5_000 })
+  })
+
+  it('历史运行缺 autonomy 时按 manual 恢复，不被新宿主 full 默认升级为自动批准', async () => {
+    const f = await fixture(
+      [human({ id: 'approval', title: '审批', ask: '批准？', form: 'approve' }), ...simple().map((node) => ({ ...node, needs: ['approval'] }))],
+      { config: { autonomy: 'manual' } },
+    )
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'waiting_human')
+    await f.manager.disposeAll()
+    // 模拟旧版本落盘的 owner：没有 autonomy 字段。
+    const ownerFile = join(f.root, '.takt', 'runs', runId, 'owner.json')
+    const owner = JSON.parse(await readFile(ownerFile, 'utf8'))
+    delete owner.autonomy
+    await writeFile(ownerFile, `${JSON.stringify(owner, null, 2)}\n`)
+    const answerAsAgent = vi.fn(async () => ({ disposition: 'answer' as const, answered: true }))
+    const manager = new DshRunManager({
+      ctx: f.ctx, spaces: f.spaces, ownership: f.ownership, presets: f.presets, permissions: f.permissions,
+      workflows: f.workflows,
+      approvals: { present: async () => {}, answer: async () => { throw new Error('不应走人工入口') }, answerAsAgent },
+      // 新宿主默认 full；旧运行必须仍按开始时的 manual 语义恢复。
+      config: { autonomy: 'full' },
+      log() {},
+    })
+    cleanups.push(() => manager.disposeAll())
+    await manager.resume(f.space, runId, by)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(answerAsAgent).not.toHaveBeenCalled()
+    expect((await f.space.stores.runs.get(runId))?.status).toBe('waiting_human')
+    const identity = JSON.parse(await readFile(join(f.space.stores.taktDir, 'runs', runId, 'dsh-runtime.json'), 'utf8'))
+    expect(identity.autonomy).toBe('manual')
   })
 })

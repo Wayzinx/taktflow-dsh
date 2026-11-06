@@ -1,4 +1,4 @@
-import { readFile, readdir } from 'node:fs/promises'
+import { lstat, readFile, readdir } from 'node:fs/promises'
 import { join, relative, sep } from 'node:path'
 import { assertNodeId, assertNoSymlinks, assertRunId, writeFileAtomic } from '@taktflow/core'
 import { collectSecrets, createRedactor } from '@taktflow/harness'
@@ -30,7 +30,7 @@ export interface AgentTraceStart {
   label: string
   role: string
   sessionId: string
-  preset: { id: string; cfgHash: string; plugins: string[] }
+  preset: { id: string; cfgHash: string; plugins: string[]; skills?: string[] }
   profile: AgentTrace['profile']
   prompt: string
   systemAppend?: string
@@ -146,6 +146,26 @@ interface SpaceTraceStore {
   pendingSessions: Set<string>
 }
 
+async function pathExists(file: string): Promise<boolean> {
+  try {
+    await lstat(file)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/** 读取单条落盘记录；损坏或半写文件视为不存在，由调用方按首次执行处理。 */
+async function readTraceFile(file: string): Promise<AgentTrace | undefined> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(file, 'utf8'))
+    return isAgentTrace(parsed) ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -154,8 +174,18 @@ function traceKey(runId: string, nodeId: string, attempt: number): string {
   return `${runId}\0${nodeId}#${attempt}`
 }
 
+/** 一条落盘记录的合并键；同一 node/attempt 的不同 session 各保留一条。 */
+function recordKey(runId: string, nodeId: string, attempt: number, sessionId: string): string {
+  return `${runId}\0${nodeId}#${attempt}\0${sessionId}`
+}
+
 function assertAttempt(attempt: number): void {
   if (!Number.isSafeInteger(attempt) || attempt < 1) throw new Error(`非法尝试序号：${attempt}`)
+}
+
+/** sessionId 只作为文件名片段；URI 编码后再转义 `~`，避免路径分隔符和分隔符歧义。 */
+function encodeSessionId(sessionId: string): string {
+  return encodeURIComponent(sessionId).replace(/~/g, '%7E')
 }
 
 /** 记录文件路径；nodeId 允许 `/`，因此可能落在 agents 下的子目录。 */
@@ -164,6 +194,29 @@ export function agentTraceFile(space: SpaceHandle, runId: string, nodeId: string
   assertNodeId(nodeId)
   assertAttempt(attempt)
   return join(space.stores.taktDir, 'runs', runId, 'agents', `${nodeId}#${attempt}.json`)
+}
+
+/**
+ * 同一 node/attempt 的后续执行文件；review 节点会顺序调用多个评审者/作者，
+ * 首次执行仍写旧的 `node#attempt.json`，后续执行用本函数生成带 sessionId 的独立文件。
+ */
+export function agentTraceSessionFile(
+  space: SpaceHandle,
+  runId: string,
+  nodeId: string,
+  attempt: number,
+  sessionId: string,
+): string {
+  assertRunId(runId)
+  assertNodeId(nodeId)
+  assertAttempt(attempt)
+  return join(
+    space.stores.taktDir,
+    'runs',
+    runId,
+    'agents',
+    `${nodeId}#${attempt}~${encodeSessionId(sessionId)}.json`,
+  )
 }
 
 /** 按 UTF-8 字节截断，附带标记；先脱敏再截断由调用方保证。 */
@@ -248,9 +301,11 @@ function isAgentTrace(value: unknown): value is AgentTrace {
   if (typeof value.prompt !== 'string') return false
   if (!isRecord(value.preset) || typeof value.preset.id !== 'string' || typeof value.preset.cfgHash !== 'string') return false
   if (!isStringArray(value.preset.plugins)) return false
+  if (value.preset.skills !== undefined && !isStringArray(value.preset.skills)) return false
   if (!isRecord(value.profile)) return false
   if (typeof value.profile.title !== 'string' || typeof value.profile.description !== 'string') return false
   if (!isStringArray(value.profile.skills) || !isStringArray(value.profile.writeScope)) return false
+  if (value.profile.declaredSkills !== undefined && !isStringArray(value.profile.declaredSkills)) return false
   if (typeof value.profile.readOnly !== 'boolean') return false
   if (value.profile.source !== 'space' && value.profile.source !== 'bundled') return false
   if (!Array.isArray(value.tools)) return false
@@ -290,7 +345,9 @@ function compareTrace(a: AgentTrace, b: AgentTrace): number {
   const right = Number.isNaN(bt) ? 0 : bt
   if (left !== right) return left - right
   const byNode = a.nodeId.localeCompare(b.nodeId)
-  return byNode !== 0 ? byNode : a.attempt - b.attempt
+  if (byNode !== 0) return byNode
+  const byAttempt = a.attempt - b.attempt
+  return byAttempt !== 0 ? byAttempt : a.sessionId.localeCompare(b.sessionId)
 }
 
 /**
@@ -300,6 +357,8 @@ function compareTrace(a: AgentTrace, b: AgentTrace): number {
  * 时机：节点启动前 begin，发布后 running，结束时 finish，最终 dispose。
  * 失败语义：首次写盘失败则不启动子 Agent；最终刷新失败向调用方抛出，不能假成功。
  * 并发：同一记录的所有写盘串行；运行中的刷新最多每 2 秒一次，denial 同步入内存。
+ * 同一 node/attempt 同时只允许一个活动执行（byKey 互斥）；前一个 dispose 后，
+ * 下一个执行写独立的 session 文件，read 按 sessionId 合并保留每次调用。
  */
 export class AgentTraceHub implements AgentTraceRecorder {
   private readonly spaces = new Map<string, SpaceTraceStore>()
@@ -316,8 +375,25 @@ export class AgentTraceHub implements AgentTraceRecorder {
     store.pendingKeys.add(key)
     store.pendingSessions.add(input.sessionId)
     try {
-      const file = agentTraceFile(space, input.runId, input.nodeId, input.attempt)
-      await assertNoSymlinks(space.root, file)
+      const legacyFile = agentTraceFile(space, input.runId, input.nodeId, input.attempt)
+      await assertNoSymlinks(space.root, legacyFile)
+      // 首次执行沿用旧文件名；同一 node/attempt 的后续执行（review 的多位评审者/作者）
+      // 必须写独立文件，否则前一位的 trace 会被覆盖。
+      const legacyExists = await pathExists(legacyFile)
+      const file = legacyExists
+        ? agentTraceSessionFile(space, input.runId, input.nodeId, input.attempt, input.sessionId)
+        : legacyFile
+      if (legacyExists) {
+        await assertNoSymlinks(space.root, file)
+        if (await pathExists(file)) throw new Error(`该子会话已有追溯记录：${input.sessionId}`)
+        // 生产 sessionId 不应复用，但旧格式文件不经过 bySession：第二次 begin
+        // 会选 `node#attempt~session.json` 而看不到 legacy 文件。读 legacy 的
+        // 合法记录，同 session 重用时明确拒绝，避免 read 按 session 归并覆盖视图。
+        const legacy = await readTraceFile(legacyFile)
+        if (legacy !== undefined && legacy.sessionId === input.sessionId) {
+          throw new Error(`该子会话已有追溯记录：${input.sessionId}`)
+        }
+      }
       // 每次 begin 冻结本次请求的密钥集合；同一空间后续换 provider 不能影响旧记录。
       const redact = createRedactor([
         ...collectSecrets(undefined, space.stores.config?.providers ?? {}),
@@ -337,11 +413,17 @@ export class AgentTraceHub implements AgentTraceRecorder {
         id: truncateChars(redact(input.preset.id), 200),
         cfgHash: truncateChars(redact(input.preset.cfgHash), 200),
         plugins: input.preset.plugins.map((name) => truncateChars(redact(name), 200)),
+        ...(input.preset.skills === undefined
+          ? {}
+          : { skills: input.preset.skills.map((skill) => truncateChars(redact(skill), 200)) }),
       },
       profile: {
         title: truncateChars(redact(input.profile.title), 200),
         description: truncateChars(redact(input.profile.description), 1_000),
         skills: input.profile.skills.map((skill) => truncateChars(redact(skill), 200)),
+        ...(input.profile.declaredSkills === undefined
+          ? {}
+          : { declaredSkills: input.profile.declaredSkills.map((skill) => truncateChars(redact(skill), 200)) }),
         writeScope: input.profile.writeScope.map((scope) => truncateChars(redact(scope), 200)),
         readOnly: input.profile.readOnly,
         source: input.profile.source,
@@ -383,13 +465,16 @@ export class AgentTraceHub implements AgentTraceRecorder {
     if (nodeId !== undefined) assertNodeId(nodeId)
     const persisted = await this.readPersisted(space, runId, nodeId)
     const merged = new Map<string, AgentTrace>()
-    for (const trace of persisted) merged.set(traceKey(trace.runId, trace.nodeId, trace.attempt), trace)
+    for (const trace of persisted) {
+      merged.set(recordKey(trace.runId, trace.nodeId, trace.attempt, trace.sessionId), trace)
+    }
     const store = this.spaces.get(space.root)
     if (store !== undefined) {
       for (const active of store.byKey.values()) {
         if (active.record.runId !== runId) continue
         if (nodeId !== undefined && active.record.nodeId !== nodeId) continue
-        merged.set(active.key, structuredClone(active.record))
+        const record = active.record
+        merged.set(recordKey(record.runId, record.nodeId, record.attempt, record.sessionId), structuredClone(record))
       }
     }
     return [...merged.values()].sort(compareTrace)
@@ -700,8 +785,13 @@ export class AgentTraceHub implements AgentTraceRecorder {
       if (parsed.runId !== runId) continue
       if (nodeId !== undefined && parsed.nodeId !== nodeId) continue
       // 内容必须与文件名位置一致；防止手工放置的文件冒充其它节点。
+      // 兼容旧格式 `node#attempt.json` 和同 node/attempt 后续执行的 `node#attempt~session.json`。
       const relativePath = relative(agentsDir, file).split(sep).join('/')
-      if (relativePath !== `${parsed.nodeId}#${parsed.attempt}.json`) continue
+      const expected = [
+        `${parsed.nodeId}#${parsed.attempt}.json`,
+        `${parsed.nodeId}#${parsed.attempt}~${encodeSessionId(parsed.sessionId)}.json`,
+      ]
+      if (!expected.includes(relativePath)) continue
       traces.push(parsed)
     }
     return traces

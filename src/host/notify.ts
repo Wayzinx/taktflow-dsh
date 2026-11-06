@@ -10,6 +10,7 @@ import {
   type RunStatus,
 } from '@taktflow/core'
 import { collectSecrets, createRedactor } from '@taktflow/harness'
+import { isAutonomyAnswering } from './autonomy-state.js'
 import type { HostContext, UserMessage } from './dsh-types.js'
 import { notImplemented } from './errors.js'
 import type { Bindings, Notifier, SpaceHandle } from './types.js'
@@ -267,33 +268,20 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       state.lastSeq.set(run.runId, event.seq)
       if (event.type === 'human.requested') sawHumanRequest = true
       if (event.type === 'run.finished') sawFinish = true
-      handleEvent(state, run, event)
+      await handleEvent(state, run, event)
     }
     state.lastStatus.set(run.runId, run.status)
     if (previousStatus !== undefined && previousStatus !== run.status) {
       // 事件里已经有更具体的描述时不再重复一条状态行。
       const covered = (run.status === 'waiting_human' && sawHumanRequest) ||
         (['failed', 'succeeded', 'cancelled'].includes(run.status) && sawFinish)
-      if (!covered) enqueueStatus(state, run, run.status)
+      if (!covered) await enqueueStatus(state, run, run.status)
     }
   }
 
   async function enqueueInitialStatus(state: AttachedSpace, run: RunState): Promise<void> {
     if (run.status === 'waiting_human') {
-      let ids: string[] = []
-      try {
-        const pending = await state.space.stores.attention.list({ requirementId: run.requirementId, pending: true })
-        ids = pending.filter((item) => item.runId === run.runId).map((item) => item.requestId)
-      } catch {
-        // 待办读不到时仍通知状态，不让一次读失败吞掉唤醒。
-      }
-      enqueue(state, {
-        requirementId: run.requirementId,
-        runId: run.runId,
-        line: `当前状态：waiting_human${ids.length ? `，待审批 requestId=${ids.join(',')}` : ''}`,
-        wake: 'human',
-        requestIds: ids,
-      })
+      await enqueueWaitingHuman(state, run, '当前状态')
       return
     }
     // 历史终态只补快照和普通上下文，不用唤醒打扰 Lead。
@@ -304,12 +292,15 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     })
   }
 
-  function enqueueStatus(state: AttachedSpace, run: RunState, status: RunStatus): void {
-    const wake = status === 'waiting_human' ? 'human'
-      : status === 'failed' ? 'failed'
-        : status === 'cancelled' ? 'cancelled'
-          : status === 'succeeded' ? 'succeeded'
-            : undefined
+  async function enqueueStatus(state: AttachedSpace, run: RunState, status: RunStatus): Promise<void> {
+    if (status === 'waiting_human') {
+      await enqueueWaitingHuman(state, run, '运行状态')
+      return
+    }
+    const wake = status === 'failed' ? 'failed'
+      : status === 'cancelled' ? 'cancelled'
+        : status === 'succeeded' ? 'succeeded'
+          : undefined
     enqueue(state, {
       requirementId: run.requirementId,
       runId: run.runId,
@@ -318,7 +309,56 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     })
   }
 
-  function handleEvent(state: AttachedSpace, run: RunState, event: EventEnvelope): void {
+  /**
+   * 等待人工的统一入队：只唤醒“当前仍未回答且未被 AI 处理”的具体 request。
+   *
+   * - 全部待办都在 AI 处理：完全抑制，升级由 notifyEscalation 单独补发；
+   * - 没有任何未回答待办：只记普通进度，不再用旧状态唤醒；
+   * - 读不到待办：退回按运行状态唤醒，避免一次瞬时读失败吞掉真实待办。
+   */
+  async function enqueueWaitingHuman(state: AttachedSpace, run: RunState, label: string): Promise<void> {
+    const pending = await humanPendingForRun(state, run.requirementId, run.runId)
+    if (pending !== undefined) {
+      if (pending.pendingCount > 0 && pending.ids.length === 0) return
+      if (pending.pendingCount === 0) {
+        enqueue(state, { requirementId: run.requirementId, runId: run.runId, line: `${label}：waiting_human` })
+        return
+      }
+      enqueue(state, {
+        requirementId: run.requirementId,
+        runId: run.runId,
+        line: `${label}：waiting_human，待审批 requestId=${pending.ids.join(',')}`,
+        wake: 'human',
+        requestIds: pending.ids,
+      })
+      return
+    }
+    enqueue(state, { requirementId: run.requirementId, runId: run.runId, line: `${label}：waiting_human`, wake: 'human' })
+  }
+
+  /**
+   * 某个具体 request 当前是否仍可人工处理。
+   *
+   * 历史 `human.requested` 可能在待办已回答、运行已终态后才被本轮轮询读到；
+   * 只看 AI marker 会让旧事件在 marker 释放后重新唤醒人。读失败返回 undefined，
+   * 调用方保留唤醒，避免一次瞬时读失败吞掉真实待办。
+   */
+  async function requestLive(state: AttachedSpace, requirementId: RequirementId, requestId: string): Promise<boolean | undefined> {
+    try {
+      const items = await state.space.stores.attention.list({ requirementId })
+      const item = items.find((entry) => entry.requestId === requestId)
+      // 事件引用的待办读不到（测试替身/瞬时不一致）时无法证明它已过期，
+      // 保留唤醒；只有明确看到已回答或所属运行终态才抑制。
+      if (item === undefined) return undefined
+      if (item.answeredAt !== undefined) return false
+      const run = await state.space.stores.runs.get(item.runId)
+      return run !== undefined && (run.status === 'running' || run.status === 'waiting_human')
+    } catch {
+      return undefined
+    }
+  }
+
+  async function handleEvent(state: AttachedSpace, run: RunState, event: EventEnvelope): Promise<void> {
     const requirementId = run.requirementId
     const runId = run.runId
     const node = event.nodeId ? `节点=${event.nodeId} ` : ''
@@ -326,6 +366,11 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     switch (event.type) {
       case 'human.requested': {
         const data = event.data as EventPayloads['human.requested']
+        // 普通 human 待办正在由 AI 处理：审计事件保留，但不唤醒 Lead。
+        if (isAutonomyAnswering(state.space.root, data.requestId)) return
+        // 历史事件回放时待办可能已回答或运行已终态；旧 request 不能再唤醒人。
+        const live = await requestLive(state, requirementId, data.requestId)
+        if (live === false) return
         enqueue(state, {
           requirementId,
           runId,
@@ -347,6 +392,12 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       }
       case 'run.finished': {
         const data = event.data as EventPayloads['run.finished']
+        // core 每次收敛到 waiting_human 都会 emit run.finished；不能按状态名直接
+        // 唤醒，必须和状态迁移一样按“该 run 当前仍 pending 且未由 AI 处理”判定。
+        if (data.status === 'waiting_human') {
+          await enqueueWaitingHuman(state, run, '运行结束')
+          return
+        }
         enqueue(state, {
           requirementId,
           runId,
@@ -377,6 +428,8 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         const data = event.data as EventPayloads['human.answered']
         const pending = state.undelivered.get(requirementId)
         if (pending?.requestIds.includes(data.requestId)) state.undelivered.delete(requirementId)
+        // 同一合并窗口里已排队的唤醒也要撤掉，不能等 deliver 时再提醒旧待办。
+        dropRequestFromBatches(state, requirementId, data.requestId)
         enqueue(state, {
           requirementId,
           runId,
@@ -397,6 +450,57 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         // 日志、harness 流式消息等不进通知，避免刷屏；快照仍会随 dirty 更新。
         return
     }
+  }
+
+  /**
+   * 某运行当前仍待人处理的待办。
+   *
+   * `ids` 排除正在被 AI 处理的普通待办；`pendingCount` 保留原始数量，用于区分
+   * “没有待办”和“有待办但全部由 AI 处理”两种抑制原因。
+   */
+  async function humanPendingForRun(
+    state: AttachedSpace,
+    requirementId: RequirementId,
+    runId: string,
+  ): Promise<{ ids: string[]; pendingCount: number } | undefined> {
+    try {
+      const pending = await state.space.stores.attention.list({ requirementId, pending: true })
+      const forRun = pending.filter((item) => item.runId === runId && item.answeredAt === undefined)
+      return {
+        ids: forRun.filter((item) => !isAutonomyAnswering(state.space.root, item.requestId)).map((item) => item.requestId),
+        pendingCount: forRun.length,
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 真人已答：从同需求合并批次中撤掉对应 requestId 和唤醒文案。 */
+  function dropRequestFromBatches(state: AttachedSpace, requirementId: RequirementId, requestId: string): void {
+    const batch = state.pending.get(requirementId)
+    if (batch === undefined) return
+    batch.requestIds.delete(requestId)
+    batch.priorityLines = batch.priorityLines.filter((line) => !line.includes(requestId))
+    if (batch.wake === 'human' && batch.requestIds.size === 0) batch.wake = undefined
+  }
+
+  /**
+   * 投递前复核人工唤醒：只保留仍 pending 且运行未终态的 requestId。
+   * 回答/取消与合并窗口存在时间差，入队时的判断不能作为投递依据。
+   */
+  async function revalidateHumanBatch(state: AttachedSpace, batch: PendingBatch): Promise<void> {
+    if (batch.wake !== 'human' || batch.requestIds.size === 0) return
+    const dropped: string[] = []
+    for (const requestId of [...batch.requestIds]) {
+      // 只有能证明过期（已答或运行终态）才撤掉；读取失败/记录缺失保留唤醒。
+      if (await requestLive(state, batch.requirementId, requestId) === false) {
+        batch.requestIds.delete(requestId)
+        dropped.push(requestId)
+      }
+    }
+    if (dropped.length === 0) return
+    batch.priorityLines = batch.priorityLines.filter((line) => !dropped.some((requestId) => line.includes(requestId)))
+    if (batch.requestIds.size === 0) batch.wake = undefined
   }
 
   function wakeForStatus(status: RunStatus): WakeReason | undefined {
@@ -439,6 +543,10 @@ export function createNotifier(deps: NotifierDeps): Notifier {
   }
 
   async function deliver(state: AttachedSpace, batch: PendingBatch): Promise<void> {
+    if (state.closed) return
+    // 入队与投递之间有合并窗口：回答、取消或 AI 处理都可能已经发生，
+    // 投递前按当前待办和运行状态复核，不能把旧唤醒发出去。
+    await revalidateHumanBatch(state, batch)
     if (state.closed) return
     const text = formatMessage(batch, state.redact)
     state.lastMessage.set(batch.requirementId, text)
@@ -584,7 +692,34 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     await Promise.allSettled([...state.inflight])
   }
 
-  return { attach, detach }
+  /**
+   * AI 升级后补一条真正的唤醒：AI 处理期间 human.requested 被抑制，升级时
+   * 必须让 Lead 知道“现在需要人来回答”。
+   */
+  async function notifyEscalation(space: SpaceHandle, notice: {
+    requirementId: RequirementId
+    runId: string
+    requestId: string
+    line: string
+  }): Promise<void> {
+    const state = states.get(space.root)
+    if (!state || state.closed) return
+    // 升级与真人抢答可能同时发生；已答待办不再补发唤醒。读失败时仍发，避免吞掉升级。
+    const pending = await state.space.stores.attention.list({ requirementId: notice.requirementId, pending: true })
+      .catch(() => undefined)
+    if (pending !== undefined && !pending.some((item) => item.requestId === notice.requestId && item.answeredAt === undefined)) return
+    if (state.closed) return
+    state.dirty.add(notice.requirementId)
+    enqueue(state, {
+      requirementId: notice.requirementId,
+      runId: notice.runId,
+      line: notice.line,
+      wake: 'human',
+      requestIds: [notice.requestId],
+    })
+  }
+
+  return { attach, detach, notifyEscalation }
 }
 
 function userMessage(text: string): UserMessage {

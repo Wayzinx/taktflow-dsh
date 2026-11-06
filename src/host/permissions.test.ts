@@ -64,6 +64,15 @@ describe('InMemoryPermissionRegistry', () => {
     expect(registry.lookup('child')?.writeScope).toEqual(['allowed/**'])
     expect(() => registry.lookup('child')?.writeScope.push('**')).toThrow()
   })
+  it('读取范围拒绝空模式和绝对 glob，登记失败不占用 childId', () => {
+    const registry = new InMemoryPermissionRegistry()
+    expect(() => registry.register(scope({ readScope: [''] }))).toThrow('非空字符串')
+    expect(() => registry.register(scope({ readScope: ['/**'] }))).toThrow('相对 glob')
+    expect(() => registry.register(scope({ readScope: ['/src/**'] }))).toThrow('相对 glob')
+    expect(registry.lookup('child')).toBeUndefined()
+    registry.register(scope({ readScope: ['src/**'] }))
+    expect(registry.lookup('child')?.readScope).toEqual(['src/**'])
+  })
 })
 
 describe('createWriteGuard', () => {
@@ -213,5 +222,201 @@ describe('createWriteGuard', () => {
       denials: { recordDenial() { throw new Error('追溯不可用') } },
     })
     expect(guard(exec('write', { file_path: 'other/file.ts' }))).toContain('拒绝')
+  })
+})
+
+describe('readScope 读取范围', () => {
+  const readGuard = (overrides: Partial<PermissionScope> = {}) => {
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope(overrides))
+    return { registry, guard: createWriteGuard(registry) }
+  }
+
+  it('缺省不限制读取；空数组拒绝 read/read_image/glob/grep/list', () => {
+    expect(readGuard().guard(exec('read', { file_path: '../elsewhere' }))).toBeUndefined()
+    const { guard } = readGuard({ readScope: [] })
+    for (const [name, args] of [
+      ['read', { file_path: 'allowed/file.ts' }],
+      ['read_image', { file_path: 'allowed/pic.png' }],
+      ['glob', { pattern: '**/*.ts', path: 'allowed' }],
+      ['grep', { pattern: 'x', path: 'allowed' }],
+      ['list', { path: 'allowed' }],
+    ] as const) expect(guard(exec(name, args))).toContain('不在读取范围内')
+  })
+
+  it('文件读取按 cwd 相对与空间根相对匹配，绝对路径同样校验', async () => {
+    const artifact = path.join(root, '.takt', 'workspaces', 'REQ-1')
+    const worktree = path.join(root, 'worktrees', 'REQ-1')
+    await mkdir(path.join(artifact, 'tasks'), { recursive: true })
+    await mkdir(path.join(root, 'requirements', 'REQ-1'), { recursive: true })
+    await mkdir(worktree, { recursive: true })
+    const { guard } = readGuard({
+      cwd: worktree, spaceRoot: root, artifactRoot: artifact,
+      readScope: ['src/**', '.takt/workspaces/**', 'requirements/**'],
+    })
+    expect(guard(exec('read', { file_path: 'src/file.ts' }))).toBeUndefined()
+    expect(guard(exec('read', { file_path: `${worktree}/src/file.ts` }))).toBeUndefined()
+    expect(guard(exec('read', { file_path: `${artifact}/tasks/spec.md` }))).toBeUndefined()
+    expect(guard(exec('read', { file_path: 'requirements/REQ-1/spec.md' }))).toBeUndefined()
+    expect(guard(exec('read', { file_path: `${root}/other/secret.txt` }))).toContain('不在读取范围内')
+    expect(guard(exec('read_image', { file_path: 'src/pic.png' }))).toBeUndefined()
+    expect(guard(exec('read_image', { file_path: 'other/pic.png' }))).toContain('不在读取范围内')
+  })
+
+  it('物理 .. 回到范围内放行，symlink 指向范围外或其它范围拒绝', async () => {
+    await mkdir(path.join(root, 'allowed', 'sub'), { recursive: true })
+    await symlink(outside, path.join(root, 'allowed', 'external'))
+    await symlink(path.join(root, 'other'), path.join(root, 'allowed', 'internal'))
+    await symlink(path.join(root, 'allowed'), path.join(root, 'alias'))
+    const { guard } = readGuard({ readScope: ['allowed/**'] })
+    expect(guard(exec('read', { file_path: 'other/../allowed/file.ts' }))).toBeUndefined()
+    expect(guard(exec('read', { file_path: 'allowed/missing/../file.ts' }))).toContain('无法安全解析')
+    expect(guard(exec('read', { file_path: 'allowed/external/secret' }))).toContain('空间根之外')
+    expect(guard(exec('read', { file_path: 'allowed/internal/secret' }))).toContain('不在读取范围内')
+    expect(guard(exec('read', { file_path: 'alias/file.ts' }))).toBeUndefined()
+  })
+
+  it('目录搜索必须证明整棵子树在范围内；省略 path 等于 cwd', async () => {
+    await mkdir(path.join(root, 'allowed', 'sub'), { recursive: true })
+    await writeFile(path.join(root, 'allowed', 'sub', 'file.ts'), '')
+    const scoped = readGuard({ readScope: ['allowed/**'] }).guard
+    expect(scoped(exec('glob', { pattern: '**/*.ts', path: 'allowed' }))).toBeUndefined()
+    expect(scoped(exec('glob', { pattern: '**/*.ts', path: 'allowed/sub' }))).toBeUndefined()
+    expect(scoped(exec('grep', { pattern: 'x', path: 'allowed' }))).toBeUndefined()
+    expect(scoped(exec('grep', { pattern: 'x', path: 'allowed/sub/file.ts' }))).toBeUndefined()
+    expect(scoped(exec('list', { path: 'allowed' }))).toBeUndefined()
+    expect(scoped(exec('glob', { pattern: '**/*.ts', path: 'other' }))).toContain('整棵子树不在读取范围内')
+    expect(scoped(exec('glob', { pattern: '**/*.ts' }))).toContain('整棵子树不在读取范围内')
+    expect(scoped(exec('grep', { pattern: 'x', path: 'other' }))).toContain('整棵子树不在读取范围内')
+    expect(scoped(exec('list', { path: '.' }))).toContain('整棵子树不在读取范围内')
+    const all = readGuard({ readScope: ['**'] }).guard
+    expect(all(exec('glob', { pattern: '**/*.ts' }))).toBeUndefined()
+    expect(all(exec('grep', { pattern: 'x', path: '.' }))).toBeUndefined()
+    expect(all(exec('list', {}))).toBeUndefined()
+  })
+
+  it('合法通配符前缀按目录及祖先证明整树覆盖，不误拒合法 glob', async () => {
+    await mkdir(path.join(root, 'src', 'host', 'role'), { recursive: true })
+    const { guard } = readGuard({ readScope: ['src/**/role/**'] })
+    expect(guard(exec('read', { file_path: 'src/host/role/index.ts' }))).toBeUndefined()
+    expect(guard(exec('grep', { pattern: 'x', path: 'src/host/role' }))).toBeUndefined()
+    expect(guard(exec('glob', { pattern: '**/*.ts', path: 'src/host/role/sub' }))).toBeUndefined()
+    expect(guard(exec('grep', { pattern: 'x', path: 'src/host' }))).toContain('整棵子树不在读取范围内')
+    expect(guard(exec('grep', { pattern: 'x', path: '.' }))).toContain('整棵子树不在读取范围内')
+    expect(guard(exec('read', { file_path: 'src/host/index.ts' }))).toContain('不在读取范围内')
+  })
+
+  it('绝对 readScope 不会比文件读取更宽；[]/**/正常 ** 保持一致', () => {
+    const raw = (patterns: string[]) => ({
+      register: () => () => {},
+      lookup: () => scope({ readScope: patterns }),
+    })
+    for (const patterns of [['/**'], ['/src/**']]) {
+      const guard = createWriteGuard(raw(patterns))
+      expect(guard(exec('read', { file_path: 'src/host/index.ts' }))).toContain('不在读取范围内')
+      expect(guard(exec('grep', { pattern: 'x', path: '.' }))).toContain('整棵子树不在读取范围内')
+      expect(guard(exec('list', {}))).toContain('整棵子树不在读取范围内')
+    }
+    const empty = readGuard({ readScope: [] }).guard
+    expect(empty(exec('read', { file_path: 'src/host/index.ts' }))).toContain('不在读取范围内')
+    expect(empty(exec('grep', { pattern: 'x', path: '.' }))).toContain('整棵子树不在读取范围内')
+    const all = readGuard({ readScope: ['**'] }).guard
+    expect(all(exec('read', { file_path: 'src/host/index.ts' }))).toBeUndefined()
+    expect(all(exec('grep', { pattern: 'x', path: '.' }))).toBeUndefined()
+  })
+
+  it('读取拒绝同样登记 trace.denials，且不影响放行', () => {
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope({ readScope: ['allowed/**'] }))
+    const { calls, recorder } = denialRecorder()
+    const guard = createWriteGuard(registry, { denials: recorder })
+    expect(guard(exec('read', { file_path: 'allowed/file.ts' }))).toBeUndefined()
+    expect(calls).toHaveLength(0)
+    expect(guard(exec('read', { file_path: 'other/file.ts' }))).toContain('拒绝')
+    expect(calls[0]!.denial).toMatchObject({ tool: 'read', path: 'other/file.ts' })
+    expect(calls[0]!.denial.reason).toContain('不在读取范围内')
+  })
+})
+
+describe('两域写权限（worktree + 当前需求产物）', () => {
+  let artifact: string
+  let worktree: string
+  const patterns = ['src/**', 'package.json', '.takt/workspaces/**/tasks/**', 'requirements/**/tasks/**']
+
+  beforeEach(async () => {
+    artifact = path.join(root, '.takt', 'workspaces', 'REQ-1')
+    worktree = path.join(root, 'worktrees', 'REQ-1')
+    await mkdir(path.join(artifact, 'tasks'), { recursive: true })
+    await mkdir(path.join(root, '.takt', 'workspaces', 'REQ-2', 'tasks'), { recursive: true })
+    await mkdir(path.join(root, 'requirements', 'REQ-1', 'tasks'), { recursive: true })
+    await mkdir(path.join(root, 'requirements', 'REQ-2', 'tasks'), { recursive: true })
+    await mkdir(path.join(worktree, 'src'), { recursive: true })
+    await mkdir(path.join(root, 'src'), { recursive: true })
+  })
+
+  const twoDomain = (cwd: string) => {
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope({ cwd, spaceRoot: root, artifactRoot: artifact, writeScope: patterns }))
+    return createWriteGuard(registry)
+  }
+
+  it('worktree 代码按 cwd 相对匹配，空间根同名代码不能借 src/** 授权', () => {
+    const guard = twoDomain(worktree)
+    expect(guard(exec('write', { file_path: 'src/file.ts' }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: `${worktree}/src/file.ts` }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: `${root}/src/file.ts` }))).toContain('代码写入必须在当前工作目录内')
+    expect(guard(exec('write', { file_path: `${root}/package.json` }))).toContain('代码写入必须在当前工作目录内')
+  })
+
+  it('只允许真实 artifactRoot；不凭 basename 额外放行 legacy 同 ID 目录', () => {
+    const guard = twoDomain(worktree)
+    expect(guard(exec('write', { file_path: `${artifact}/tasks/t.md` }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: `${root}/requirements/REQ-1/tasks/t.md` }))).toContain('公共产物只允许写入当前需求目录')
+    expect(guard(exec('write', { file_path: `${root}/.takt/workspaces/REQ-2/tasks/t.md` }))).toContain('公共产物只允许写入当前需求目录')
+    expect(guard(exec('write', { file_path: `${root}/requirements/REQ-2/tasks/t.md` }))).toContain('公共产物只允许写入当前需求目录')
+    expect(guard(exec('write', { file_path: `${root}/.takt/runs/run-1/x.json` }))).toContain('代码写入必须在当前工作目录内')
+  })
+
+  it('cwd 为空间根时保留 P0 代码路径，但兄弟需求仍按当前需求隔离', () => {
+    const guard = twoDomain(root)
+    expect(guard(exec('write', { file_path: 'src/file.ts' }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: 'package.json' }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: '.takt/workspaces/REQ-1/tasks/t.md' }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: '.takt/workspaces/REQ-2/tasks/t.md' }))).toContain('公共产物只允许写入当前需求目录')
+    expect(guard(exec('write', { file_path: 'requirements/REQ-1/tasks/t.md' }))).toContain('公共产物只允许写入当前需求目录')
+    expect(guard(exec('write', { file_path: 'requirements/REQ-2/tasks/t.md' }))).toContain('公共产物只允许写入当前需求目录')
+  })
+
+  it('自定义需求目录按实际父目录保护兄弟，兄弟目录不能落入 cwd 代码域', async () => {
+    const customArtifact = path.join(root, 'src', 'host', 'lead')
+    await mkdir(customArtifact, { recursive: true })
+    await mkdir(path.join(root, 'src', 'host', 'role'), { recursive: true })
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope({
+      spaceRoot: root, artifactRoot: customArtifact, writeScope: ['src/host/**'],
+    }))
+    const guard = createWriteGuard(registry)
+    expect(guard(exec('write', { file_path: 'src/host/lead/design.md' }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: 'src/host/role/index.ts' }))).toContain('公共产物只允许写入当前需求目录')
+    expect(guard(exec('write', { file_path: 'src/host/lead-neighbor/file.ts' }))).toContain('公共产物只允许写入当前需求目录')
+  })
+
+  it('legacy requirements 布局只允许实际当前需求，另一布局不能创建第二份产物', () => {
+    const legacyArtifact = path.join(root, 'requirements', 'REQ-1')
+    const registry = new InMemoryPermissionRegistry()
+    registry.register(scope({
+      spaceRoot: root, artifactRoot: legacyArtifact,
+      writeScope: ['requirements/**/tasks/**', '.takt/workspaces/**/tasks/**'],
+    }))
+    const guard = createWriteGuard(registry)
+    expect(guard(exec('write', { file_path: 'requirements/REQ-1/tasks/t.md' }))).toBeUndefined()
+    expect(guard(exec('write', { file_path: 'requirements/REQ-2/tasks/t.md' }))).toContain('公共产物只允许写入当前需求目录')
+    expect(guard(exec('write', { file_path: '.takt/workspaces/REQ-1/tasks/t.md' }))).toContain('公共产物只允许写入当前需求目录')
+  })
+
+  it('worktree 内 symlink 指向空间根代码仍按物理目标拒绝', async () => {
+    await symlink(path.join(root, 'src'), path.join(worktree, 'src-link'))
+    const guard = twoDomain(worktree)
+    expect(guard(exec('write', { file_path: 'src-link/file.ts' }))).toContain('代码写入必须在当前工作目录内')
   })
 })

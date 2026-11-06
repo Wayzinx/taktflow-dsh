@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { appendFile, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -8,14 +8,17 @@ import {
   snapshotWorkflow,
   type Actor,
   type AttentionItem,
+  type HarnessInfo,
+  type ModelInfo,
   type ProjectStores,
   type RunState,
   type WorkflowDefinition,
 } from '@taktflow/core'
+import { ApiError, type ApiCore } from '@taktflow/server'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentTraceHub, bindAgentTraceHub, type AgentTraceReader } from './agent-trace.js'
 import { ApprovalInputError } from './approvals.js'
-import { WRITE_OPS, registerRoutes, type RoutesService } from './routes.js'
+import { WRITE_OPS, registerRoutes, type RoutesConfig, type RoutesService } from './routes.js'
 import { FakeHostContext } from './testing/fake-ctx.js'
 import {
   TaktToolError,
@@ -60,7 +63,7 @@ interface Fixture {
   readTraces: ReturnType<typeof vi.fn>
 }
 
-async function makeFixture(): Promise<Fixture> {
+async function makeFixture(overrides: Partial<RoutesConfig> = {}): Promise<Fixture> {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'takt-routes-')))
   dirs.push(dir)
   const stores = await initProject(dir, { name: 'routes' })
@@ -139,7 +142,7 @@ async function makeFixture(): Promise<Fixture> {
 
   const host = new FakeHostContext()
   hosts.push(host)
-  registerRoutes(host, service, { user: '面板用户' })
+  registerRoutes(host, service, { user: '面板用户', ...overrides })
 
   return { host, space, stores, requirementId: requirement.id, service, ownership, runs, approvals, readTraces }
 }
@@ -199,6 +202,49 @@ async function createRun(stores: ProjectStores, requirementId: string): Promise<
     data: { workflowId: workflow.id, workflowVersion: workflow.version, args: {} },
   })
   return runId
+}
+
+const WORKFLOW_FILE = 'route-wf.workflow.ts'
+
+/** 最小可被 workflow-source 解析的流程源码；冲突/校验测试不会走到 tsx 校验子进程。 */
+function workflowSource(title: string): string {
+  return `export default defineWorkflow({\n  id: 'route-wf',\n  title: '${title}',\n  version: '1',\n  stages: [],\n  nodes: [],\n})\n`
+}
+
+async function writeWorkflowFile(space: SpaceHandle, title: string): Promise<void> {
+  await writeFile(join(space.root, 'workflows', WORKFLOW_FILE), workflowSource(title), 'utf8')
+}
+
+/** 建流程文件并读一次 workflows，让 workflow-source 登记初始修订，返回当前 rev。 */
+async function seedWorkflow(host: FakeHostContext, space: SpaceHandle): Promise<string> {
+  await writeWorkflowFile(space, '路由测试')
+  const listed = await getJson(host, '/api/taktflow', { space: space.root, p: 'workflows' })
+  expect(listed.status).toBe(200)
+  const entry = (listed.body.data as Array<{ id: string; rev: string }>).find((item) => item.id === 'route-wf')
+  if (entry === undefined) throw new Error('流程未登记')
+  return entry.rev
+}
+
+/**
+ * 用假 api-core 观察 workflow-stream 的订阅/清理；read 默认成功（跳过真实 tsx 校验）。
+ * 真实 store 的读取/写入由其它用例覆盖。
+ */
+function fakeWorkflowCore(
+  read: () => Promise<unknown> = async () => ({ id: 'route-wf' }),
+  onSubscribe?: (onError: (error: unknown) => void) => void,
+) {
+  const unwatch = vi.fn(async () => {})
+  const readMock = vi.fn(read)
+  let receive: ((event: unknown) => void) | undefined
+  let fail: ((error: unknown) => void) | undefined
+  const subscribeWorkflow = vi.fn((_stores: ProjectStores, _id: string, onEvent: (event: unknown) => void, onError: (error: unknown) => void) => {
+    receive = onEvent
+    fail = onError
+    onSubscribe?.(onError)
+    return unwatch
+  })
+  const core = { read: readMock, subscribeWorkflow } as unknown as ApiCore
+  return { core, unwatch, readMock, subscribeWorkflow, handlers: () => ({ receive, fail }) }
 }
 
 function sampleTrace(runId: string): AgentTrace {
@@ -272,6 +318,7 @@ describe('registerRoutes：路由与读操作', () => {
       '/api/taktflow',
       '/api/taktflow.op',
       '/api/taktflow.stream',
+      '/api/taktflow.workflow-stream',
       '/api/taktflow.agents',
     ]))
 
@@ -382,6 +429,85 @@ describe('registerRoutes：路由与读操作', () => {
     expect((await getJson(host, '/api/taktflow.agents', { space: space.root, run: '../run' })).status).toBe(400)
     expect((await getJson(host, '/api/taktflow.agents', { space: space.root, run: runId, node: '..' })).status).toBe(400)
     expect((await getJson(host, '/api/taktflow.agents', { space: space.root, run: 'run-missing' })).status).toBe(404)
+  })
+})
+
+describe('registerRoutes：M2 读操作与运行时目录', () => {
+  const harness: HarnessInfo = {
+    id: 'native',
+    displayName: 'dsh 原生子 Agent',
+    source: 'native',
+    available: true,
+    capabilities: {},
+    roles: ['dev'],
+  }
+  const model: ModelInfo = {
+    alias: 'default',
+    provider: 'openai',
+    protocol: 'openai-chat',
+    id: 'gpt-test',
+    keyPresent: true,
+  }
+
+  it('GET 透出 M2 读操作（space/reviews/workflows），但明确拒绝 room/chat', async () => {
+    const { host, space, requirementId } = await makeFixture()
+
+    const detail = await getJson(host, '/api/taktflow', { space: space.root, p: 'space' })
+    expect(detail.status).toBe(200)
+    expect(detail.body.data).toMatchObject({ name: 'routes', workflows: [], members: [] })
+
+    const reviews = await getJson(host, '/api/taktflow', { space: space.root, p: 'reviews', id: requirementId })
+    expect(reviews.status).toBe(200)
+    expect(reviews.body.data).toEqual([])
+
+    const workflows = await getJson(host, '/api/taktflow', { space: space.root, p: 'workflows' })
+    expect(workflows.status).toBe(200)
+    expect(workflows.body.data).toEqual([])
+
+    for (const p of ['room', 'chat']) {
+      const blocked = await getJson(host, '/api/taktflow', { space: space.root, p, id: requirementId })
+      expect(blocked.status).toBe(400)
+      expect(blocked.body.ok).toBe(false)
+      expect(blocked.body.error.message).toContain('群聊')
+    }
+  })
+
+  it('harnesses/models 没有运行时目录时返回 501，不用空数组冒充', async () => {
+    const { host, space } = await makeFixture()
+    for (const p of ['harnesses', 'models']) {
+      const { status, body } = await getJson(host, '/api/taktflow', { space: space.root, p })
+      expect(status).toBe(501)
+      expect(body.ok).toBe(false)
+      expect(body.error.message).toContain('未接入运行时')
+    }
+  })
+
+  it('harnesses/models 从 service.catalog 取真实目录', async () => {
+    const { host, space, service } = await makeFixture()
+    const getHarnesses = vi.fn(async () => [harness])
+    const getModels = vi.fn(async () => [model])
+    service.catalog = { getHarnesses, getModels }
+
+    const harnesses = await getJson(host, '/api/taktflow', { space: space.root, p: 'harnesses' })
+    expect(harnesses).toEqual({ status: 200, body: { ok: true, data: [harness] } })
+    const models = await getJson(host, '/api/taktflow', { space: space.root, p: 'models' })
+    expect(models).toEqual({ status: 200, body: { ok: true, data: [model] } })
+    expect(getHarnesses).toHaveBeenCalledWith(space.stores)
+    expect(getModels).toHaveBeenCalledWith(space.stores)
+  })
+
+  it('service.catalog 只提供 getCatalog 时也能拆出 harnesses/models', async () => {
+    const { host, space, service } = await makeFixture()
+    service.catalog = { getCatalog: async () => ({ harnesses: [harness], models: [model] }) }
+    expect((await getJson(host, '/api/taktflow', { space: space.root, p: 'harnesses' })).body.data).toEqual([harness])
+    expect((await getJson(host, '/api/taktflow', { space: space.root, p: 'models' })).body.data).toEqual([model])
+  })
+
+  it('service.catalog 直接提供静态 harnesses/models 数组时原样透出', async () => {
+    const { host, space, service } = await makeFixture()
+    service.catalog = { harnesses: [harness], models: [model] }
+    expect((await getJson(host, '/api/taktflow', { space: space.root, p: 'harnesses' })).body.data).toEqual([harness])
+    expect((await getJson(host, '/api/taktflow', { space: space.root, p: 'models' })).body.data).toEqual([model])
   })
 })
 
@@ -514,7 +640,7 @@ describe('registerRoutes：写操作白名单', () => {
 
   it('未知写操作 400，且不拿租约、不调用任何服务', async () => {
     const { host, space, ownership, approvals, runs } = await makeFixture()
-    const { status, body } = await postJson(host, { space: space.root, p: 'artifact.edit' })
+    const { status, body } = await postJson(host, { space: space.root, p: 'chat.send' })
     expect(status).toBe(400)
     expect(body.error.message).toContain('未知写操作')
     expect(ownership.ensureLease).not.toHaveBeenCalled()
@@ -522,8 +648,14 @@ describe('registerRoutes：写操作白名单', () => {
     expect(runs.start).not.toHaveBeenCalled()
   })
 
-  it('白名单固定为四个操作', () => {
-    expect([...WRITE_OPS]).toEqual(['attention.answer', 'run.start', 'run.cancel', 'lease.release'])
+  it('白名单固定为 14 项：4 个插件操作 + 10 个 api-core 操作，且不含群聊写', () => {
+    expect([...WRITE_OPS]).toEqual([
+      'attention.answer', 'run.start', 'run.cancel', 'lease.release',
+      'artifact.edit', 'comment.add', 'space.members', 'space.repo.add', 'space.repo.sync', 'space.file.edit',
+      'workflow.edit', 'workflow.source.replace', 'workflow.layout', 'workflow.rollback',
+    ])
+    expect(WRITE_OPS as readonly string[]).not.toContain('room.members')
+    expect(WRITE_OPS as readonly string[]).not.toContain('chat.send')
   })
 
   it('租约被 CLI 占用时所有写都返回 409', async () => {
@@ -589,6 +721,97 @@ describe('registerRoutes：写操作白名单', () => {
     expect(ownership.release).not.toHaveBeenCalled()
   })
 
+  it('POST api-core 写操作：嵌套 params/body 原样交给 core，actor 固定为宿主 human', async () => {
+    const { host, space, stores, requirementId, ownership } = await makeFixture()
+
+    const edited = await postJson(host, {
+      space: space.root,
+      p: 'artifact.edit',
+      params: { id: requirementId, path: 'prd.md' },
+      body: {
+        content: '# PRD\n',
+        reason: '面板修改',
+        author: { type: 'human', id: '伪造用户', via: 'dsh-web' },
+        by: { type: 'agent', id: '伪造 Agent' },
+      },
+    })
+    expect(edited.status).toBe(200)
+    expect(edited.body).toMatchObject({ ok: true, data: { version: 1, staleNodes: [] } })
+    expect(ownership.ensureLease).toHaveBeenCalled()
+
+    const artifacts = await stores.workspaces.listArtifacts(requirementId)
+    const record = artifacts.find((item) => item.path === 'prd.md')
+    expect(record?.versions.at(-1)?.author).toEqual({ type: 'human', id: '面板用户', via: 'dsh-web' })
+
+    const commented = await postJson(host, {
+      space: space.root,
+      p: 'comment.add',
+      params: { id: requirementId },
+      body: {
+        path: 'prd.md',
+        version: 1,
+        body: '评审意见',
+        author: { type: 'human', id: '伪造用户' },
+      },
+    })
+    expect(commented.status).toBe(200)
+    const comments = await stores.workspaces.listComments(requirementId, 'prd.md')
+    expect(comments.at(-1)?.author).toEqual({ type: 'human', id: '面板用户', via: 'dsh-web' })
+  })
+
+  it('api-core 写操作的 params 必须是对象且值全为字符串', async () => {
+    const { host, space, ownership, requirementId } = await makeFixture()
+    const badValue = await postJson(host, {
+      space: space.root,
+      p: 'artifact.edit',
+      params: { id: requirementId, path: 123 },
+      body: { content: 'x', reason: '测试' },
+    })
+    expect(badValue.status).toBe(400)
+    expect(badValue.body.error.message).toContain('params.path')
+
+    const badShape = await postJson(host, {
+      space: space.root,
+      p: 'artifact.edit',
+      params: [],
+      body: { content: 'x', reason: '测试' },
+    })
+    expect(badShape.status).toBe(400)
+    expect(badShape.body.error.message).toContain('params 必须是对象')
+    expect(ownership.ensureLease).not.toHaveBeenCalled()
+  })
+
+  it('api-core 写操作同样受租约保护，冲突时不落盘', async () => {
+    const { host, space, ownership, stores, requirementId } = await makeFixture()
+    ownership.ensureLease.mockRejectedValue(new TaktToolError('TAKT_LEASE_HELD', '空间已被 CLI 占用'))
+
+    const result = await postJson(host, {
+      space: space.root,
+      p: 'artifact.edit',
+      params: { id: requirementId, path: 'blocked.md' },
+      body: { content: '# 被拒绝', reason: '测试' },
+    })
+    expect(result.status).toBe(409)
+    expect(result.body.error.code).toBe('TAKT_LEASE_HELD')
+    expect(await stores.workspaces.listArtifacts(requirementId)).toEqual([])
+  })
+
+  it('run.start 未指定流程时使用空间配置的第一项', async () => {
+    const { host, space, runs, service } = await makeFixture()
+    const list = vi.fn(async () => [{ id: 'taktflow-standard', title: '标准交付' }])
+    ;(service.workflows as unknown as { list: typeof list }).list = list
+
+    const { status } = await postJson(host, {
+      space: space.root,
+      p: 'run.start',
+      requirementId: 'req-1',
+      requestKey: 'key-1',
+    })
+    expect(status).toBe(200)
+    expect(list).toHaveBeenCalledWith(space)
+    expect(runs.start).toHaveBeenCalledWith(expect.objectContaining({ workflowId: 'taktflow-standard' }))
+  })
+
   it('GET 直接 dispatch 写路由也返回 405，不拿租约、不执行写', async () => {
     const { host, space, ownership } = await makeFixture()
     const response = await route(host, '/api/taktflow.op').fetch(
@@ -610,6 +833,222 @@ describe('registerRoutes：写操作白名单', () => {
     }))
     expect(response.status).toBe(400)
     expect((await response.json()).error.message).toContain('合法 JSON')
+  })
+})
+
+describe('registerRoutes：workflow 协同', () => {
+  it('workflow.layout 通过真实 workflow store 写入布局文件', async () => {
+    const { host, space } = await makeFixture()
+    await seedWorkflow(host, space)
+
+    const layout = { nodes: { design: { x: 10, y: 20 } }, viewport: { x: 0, y: 0, zoom: 1 } }
+    const { status, body } = await postJson(host, {
+      space: space.root,
+      p: 'workflow.layout',
+      params: { id: 'route-wf' },
+      body: layout,
+    })
+    expect(status).toBe(200)
+    expect(body).toEqual({ ok: true, data: layout })
+
+    const saved = JSON.parse(await readFile(join(space.root, 'workflows', 'route-wf.layout.json'), 'utf8'))
+    expect(saved).toEqual(layout)
+  })
+
+  it('workflow.edit 冲突返回 409 和原 WorkflowConflict 对象', async () => {
+    const { host, space } = await makeFixture()
+    const baseRev = await seedWorkflow(host, space)
+    // 外部先把标题改成另一个值，再提交基于旧修订的标题修改：三方合并应冲突。
+    await writeWorkflowFile(space, '外部标题')
+
+    const { status, body } = await postJson(host, {
+      space: space.root,
+      p: 'workflow.edit',
+      params: { id: 'route-wf' },
+      body: {
+        baseRev,
+        edits: [{ op: 'setMeta', key: 'title', value: '面板标题' }],
+        reason: '面板修改',
+      },
+    })
+
+    expect(status).toBe(409)
+    expect(body.ok).toBe(false)
+    expect(body.error.code).toBe('TAKT_WORKFLOW_CONFLICT')
+    expect(body.conflict).toMatchObject({
+      error: 'conflict',
+      base: expect.stringContaining('路由测试'),
+      ours: expect.stringContaining('外部标题'),
+      theirs: expect.stringContaining('面板标题'),
+      currentRev: expect.any(String),
+    })
+  })
+
+  it('workflow.edit 校验失败返回 400 和原 validation 对象', async () => {
+    const { host, space } = await makeFixture()
+    const baseRev = await seedWorkflow(host, space)
+
+    const { status, body } = await postJson(host, {
+      space: space.root,
+      p: 'workflow.edit',
+      params: { id: 'route-wf' },
+      body: {
+        baseRev,
+        edits: [{
+          op: 'addNode',
+          kind: 'agent',
+          props: {
+            id: { kind: 'literal', value: 'design' },
+            prompt: { kind: 'code', code: '}{' },
+          },
+        }],
+      },
+    })
+
+    expect(status).toBe(400)
+    expect(body.ok).toBe(false)
+    expect(body.error.code).toBe('TAKT_WORKFLOW_VALIDATION')
+    expect(body.validation).toMatchObject({
+      error: 'validation',
+      diagnostics: expect.arrayContaining([expect.objectContaining({ severity: 'error' })]),
+    })
+  })
+})
+
+describe('registerRoutes：workflow-stream SSE', () => {
+  function openWorkflowStream(host: FakeHostContext, space: SpaceHandle, id = 'route-wf') {
+    return route(host, '/api/taktflow.workflow-stream').fetch(
+      new Request(
+        `http://localhost/api/taktflow.workflow-stream?space=${encodeURIComponent(space.root)}&id=${encodeURIComponent(id)}`,
+      ),
+    )
+  }
+
+  it('缺 id / 流程不存在 / id 非法时返回 JSON 错误', async () => {
+    const { host, space } = await makeFixture()
+    expect((await getJson(host, '/api/taktflow.workflow-stream', { space: space.root })).status).toBe(400)
+    expect((await getJson(host, '/api/taktflow.workflow-stream', { space: space.root, id: 'missing' })).status).toBe(404)
+    expect((await getJson(host, '/api/taktflow.workflow-stream', { space: space.root, id: '../x' })).status).toBe(400)
+  })
+
+  it('先校验再订阅：read 失败时不调用 subscribeWorkflow', async () => {
+    const fake = fakeWorkflowCore(async () => { throw new ApiError(404, 'workflow 不存在') })
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+
+    const { status, body } = await getJson(host, '/api/taktflow.workflow-stream', { space: space.root, id: 'route-wf' })
+    expect(status).toBe(404)
+    expect(body.error.message).toBe('workflow 不存在')
+    expect(fake.subscribeWorkflow).not.toHaveBeenCalled()
+  })
+
+  it('收到修订事件后按原 WorkflowChangedEvent 写出 data，reader.cancel 清理一次订阅', async () => {
+    const fake = fakeWorkflowCore()
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+
+    const response = await openWorkflowStream(host, space)
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toContain('text/event-stream')
+    const reader = response.body!.getReader()
+
+    const event = {
+      workflowId: 'route-wf',
+      revision: {
+        rev: 'a'.repeat(64),
+        author: { type: 'human', id: '面板用户', via: 'dsh-web' },
+        at: '2026-01-01T00:00:00.000Z',
+      },
+    }
+    fake.handlers().receive!(event)
+    const chunk = await readText(reader)
+    expect(chunk).toBe(`data: ${JSON.stringify(event)}\n\n`)
+
+    await reader.cancel()
+    expect(fake.unwatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('请求 abort 清理一次订阅', async () => {
+    const fake = fakeWorkflowCore()
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+    const controller = new AbortController()
+    const response = await route(host, '/api/taktflow.workflow-stream').fetch(
+      new Request(
+        `http://localhost/api/taktflow.workflow-stream?space=${encodeURIComponent(space.root)}&id=route-wf`,
+        { signal: controller.signal },
+      ),
+    )
+    const reader = response.body!.getReader()
+    controller.abort()
+    await drain(reader)
+    expect(fake.unwatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('宿主卸载清理一次订阅', async () => {
+    const fake = fakeWorkflowCore()
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+    const response = await openWorkflowStream(host, space)
+    const reader = response.body!.getReader()
+
+    await host.dispose()
+    await drain(reader)
+    expect(fake.unwatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('订阅报错时结束流并清理一次订阅', async () => {
+    const fake = fakeWorkflowCore()
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+    const response = await openWorkflowStream(host, space)
+    const reader = response.body!.getReader()
+
+    fake.handlers().fail!(new Error('轮询失败'))
+    const result = await withTimeout(reader.read())
+    expect(result.done).toBe(true)
+    expect(fake.unwatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('subscribeWorkflow 返回前同步报错时走 JSON 500，不吞成 204，且只清理一次订阅', async () => {
+    const fake = fakeWorkflowCore(undefined, (onError) => onError(new Error('启动订阅失败')))
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+
+    const { status, body } = await getJson(host, '/api/taktflow.workflow-stream', {
+      space: space.root,
+      id: 'route-wf',
+    })
+    expect(status).toBe(500)
+    expect(body).toEqual({ ok: false, error: { code: 'TAKT_INTERNAL', message: '服务器内部错误' } })
+    expect(fake.unwatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('准备期 read 阻塞时 abort 返回 204，不订阅', async () => {
+    const fake = fakeWorkflowCore(() => new Promise(() => {}))
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+    const controller = new AbortController()
+    const pending = route(host, '/api/taktflow.workflow-stream').fetch(
+      new Request(
+        `http://localhost/api/taktflow.workflow-stream?space=${encodeURIComponent(space.root)}&id=route-wf`,
+        { signal: controller.signal },
+      ),
+    )
+    await waitFor(() => fake.readMock.mock.calls.length === 1)
+    controller.abort()
+
+    const response = await withTimeout(pending)
+    expect(response.status).toBe(204)
+    expect(fake.subscribeWorkflow).not.toHaveBeenCalled()
+  })
+
+  it('请求进入时已经 abort，立即返回 204', async () => {
+    const fake = fakeWorkflowCore()
+    const { host, space } = await makeFixture({ createCore: () => fake.core })
+    const controller = new AbortController()
+    controller.abort()
+    const response = await withTimeout(route(host, '/api/taktflow.workflow-stream').fetch(
+      new Request(
+        `http://localhost/api/taktflow.workflow-stream?space=${encodeURIComponent(space.root)}&id=route-wf`,
+        { signal: controller.signal },
+      ),
+    ))
+    expect(response.status).toBe(204)
+    expect(fake.subscribeWorkflow).not.toHaveBeenCalled()
   })
 })
 

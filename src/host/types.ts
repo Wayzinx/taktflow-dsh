@@ -10,6 +10,7 @@
  */
 import type {
   Actor,
+  ArtifactRef,
   AttentionItem,
   Insights,
   ProjectStores,
@@ -19,6 +20,25 @@ import type {
   WorkflowDefinition,
 } from '@taktflow/core'
 import type { ToolExecutionContext } from './dsh-types.js'
+
+/**
+ * 自主程度（M-J 增量）。
+ *
+ * - full：review 不需要人工签字；human 节点由 AI 代答，答不了/置信度不足才升级。
+ * - checkpoints：保留 review 人工签字和准出，其它 human 节点 AI 代答。
+ * - manual：全部按流程原样等人。
+ *
+ * 空间 `takt.config.json` 的 autonomy 覆盖插件配置；非法值明确失败，不静默降级。
+ */
+export type Autonomy = 'full' | 'checkpoints' | 'manual'
+
+/**
+ * 角色子 Agent 的执行方式（M-J 增量）。
+ *
+ * dsh-host：所有角色都作为 dsh 原生子 Agent（默认，使用 App 模型与“编队”能力）。
+ * profile：按角色档案里的 harness 走 @taktflow/harness 的外部适配器。
+ */
+export type RoleHarness = 'dsh-host' | 'profile'
 
 /** 技术方案 5.8 的稳定错误码；新增码要同步工具文档和客户端文案。 */
 export type TaktErrorCode =
@@ -91,6 +111,22 @@ export interface RunOwnerMeta {
   presets?: Record<string, { id: string; cfgHash: string }>
   /** 有值表示该运行因离线/宿主丢失终止，不能再 resume。 */
   endReason?: EndReason
+  /**
+   * M-J 增量：运行时冻结的自主程度。
+   *
+   * 开始时从空间配置/插件配置解析一次并落盘；resume 不再读取新配置，避免运行
+   * 中途从 manual 切到 full 后改变审批语义。历史运行没有该字段时必须按 manual
+   * 保守恢复（或拒绝冷恢复），绝不能拿新宿主的 full 默认改写旧人工审批语义。
+   */
+  autonomy?: Autonomy
+  /** M-J 增量：运行时冻结的角色 harness 模式；身份校验会拒绝中途切换。 */
+  roleHarness?: RoleHarness
+  /**
+   * M-J 增量：已经尝试过自主代答的 requestId。
+   *
+   * 在调用模型前落盘；宿主重启后据此把中断的待办交给人，不重复尝试。
+   */
+  autonomyAttempts?: string[]
 }
 
 /**
@@ -141,10 +177,30 @@ export interface PermissionScope {
   childId: string
   nodeRef: { runId: RunId; nodeId: string; attempt: number }
   cwd: string
-  /** glob，相对空间根；空数组表示不可写。 */
+  /**
+   * glob，相对空间根；空数组表示不可写。
+   * 提供 spaceRoot 后按两域计算：代码写入相对 cwd，公共产物相对空间根且仅限
+   * 当前需求；缺省保持旧版“相对空间根”语义。
+   */
   writeScope: string[]
   allowBash: boolean
   readOnly: boolean
+  /**
+   * 空间根 realpath（可选）。有值时 cwd 可以是空间内 worktree；代码 writeScope
+   * 只按 cwd 相对路径匹配，不能再同时按空间根授权。
+   */
+  spaceRoot?: string
+  /**
+   * 当前需求公共产物根 realpath（可选，空间根内）。布局由 stores.paths 的实际目录
+   * 决定（如 `.takt/workspaces/<需求ID>` 或 `requirements/<需求ID>`）；只有该目录
+   * 能按空间根相对 writeScope 写入，其父目录下的兄弟需求一律拒绝。
+   */
+  artifactRoot?: string
+  /**
+   * 读取范围 glob（可选）。数组项按 cwd 相对或空间根相对匹配；缺省不额外限制，
+   * 空数组拒绝所有 read/read_image/glob/grep/list；绝对模式在登记时拒绝。
+   */
+  readScope?: string[]
 }
 
 /**
@@ -163,6 +219,8 @@ export interface PermissionRegistry {
 export interface RolePresetHandle {
   id: string
   cfgHash: string
+  /** 本次 preset 实际注册成功的角色 skill 名；旧实现可省略。 */
+  skills?: string[]
   release(): void
 }
 
@@ -203,6 +261,46 @@ export interface AnswerInput {
 }
 
 /**
+ * AI 自主代答的输入（M-J 增量）。
+ *
+ * 只允许普通 human 节点的 answer/approve；escalate 只写审计、不落回答。
+ * `by` 必须是 dsh-host 子 Agent，且 `onBehalfOf` 等于需求绑定的真实人；
+ * `evidence` 是 AI 实际依据的产物版本，落账前会再次核对未变化。
+ */
+export interface AgentDecisionInput {
+  requestId: string
+  attempt: number
+  artifactVersion?: number
+  /** answer/approve 会落账并推进；escalate 只写审计产物。AI 没有 reject 语义。 */
+  disposition: 'answer' | 'approve' | 'escalate'
+  answer?: string
+  by: Extract<Actor, { type: 'agent' }>
+  /** 0..1；由运行层按阈值决定是否升级，审批层只校验范围。 */
+  confidence: number
+  evidence: ArtifactRef[]
+  /** 运行层在调用模型前冻结的全部产物引用；缺省时只校验 evidence。 */
+  basis?: ArtifactRef[]
+  /** 上述冻结清单的摘要；提供 basis 时必须一致。 */
+  basisDigest?: string
+  /** 取消谓词：stop/卸载/租约丢失后不能再落回答或新增升级产物。 */
+  signal?: AbortSignal
+  blockers: string[]
+  unresolved: string[]
+  rationale: string
+}
+
+/** AI 自主代答的结果；人抢先回答时 answered=false 且不写新版本。 */
+export interface AgentDecisionResult {
+  disposition: AgentDecisionInput['disposition']
+  /** 当前待办（可能已由人回答）。 */
+  item?: AttentionItem
+  /** 本次写入的审计产物；人抢先回答或待办已答时可能没有。 */
+  artifact?: ArtifactRef & { version: number }
+  /** true 表示本次真的写入了回答并推进。 */
+  answered: boolean
+}
+
+/**
  * 待人事项的呈现与回答。
  *
  * present 用 exec.agent + exec.signal 调 ctx.userQuestions.ask（根 Agent 身份
@@ -213,6 +311,14 @@ export interface AnswerInput {
 export interface Approvals {
   present(exec: ToolExecutionContext, space: SpaceHandle, requestId: string): Promise<void>
   answer(space: SpaceHandle, input: AnswerInput): Promise<AttentionItem>
+  /**
+   * M-J 增量（可选）：AI 自主代答入口。
+   *
+   * 与 answer 共用同一把审批守卫锁和 freshness/attempt/lease 校验，但只落账，
+   * 不调用 runs.onAnswered（否则会等待当前运行任务而自锁）。调用方落账后
+   * 直接 `engine.resume`。
+   */
+  answerAsAgent?(space: SpaceHandle, input: AgentDecisionInput): Promise<AgentDecisionResult>
 }
 
 /**
@@ -224,6 +330,18 @@ export interface Approvals {
 export interface Notifier {
   attach(space: SpaceHandle): Promise<void>
   detach(space: SpaceHandle): Promise<void>
+  /**
+   * M-J 增量（可选）：AI 自主代答升级后主动唤醒 Lead。
+   *
+   * 普通 human.requested 在 AI 处理期间会被抑制；只有升级才通过这里补一条
+   * 带唤醒的短句，提醒 Lead 调用 takt_ask_human。实现缺失时调用方只记日志。
+   */
+  notifyEscalation?(space: SpaceHandle, notice: {
+    requirementId: RequirementId
+    runId: RunId
+    requestId: string
+    line: string
+  }): Promise<void>
 }
 
 /**
@@ -236,7 +354,23 @@ export interface Notifier {
  */
 export interface WorkflowCatalog {
   ids(): string[]
-  load(workflowId: string): Promise<WorkflowDefinition>
+  /**
+   * 按 id 加载流程。
+   *
+   * M-J 增量（向后兼容）：可选传入 space，把查找限制在该空间，避免多个空间
+   * 出现同名流程时 start 拿错定义；不传时保持旧行为（跨已注册空间查找）。
+   */
+  load(workflowId: string, space?: SpaceHandle): Promise<WorkflowDefinition>
+  /**
+   * M-J 增量（可选，向后兼容）：异步列出空间配置里的全部流程。
+   *
+   * 为什么需要：`ids()` 是同步的，而空间流程要读配置并动态 import 后才能知道
+   * 真实 id；`takt_status` 与面板应使用 `list()`。旧实现不提供时调用方回退
+   * `ids()`。
+   */
+  list?(space?: SpaceHandle): Promise<string[]>
+  /** M-J 增量（可选）：空间配置里的第一个流程；无空间时回退演示流程。 */
+  defaultId?(space?: SpaceHandle): Promise<string>
 }
 
 /** 宿主行提供给所有 dsh 行/工具的服务门面。 */
@@ -255,8 +389,10 @@ export interface TaktflowService {
 /**
  * 一次职责 Agent 执行（节点的一次尝试）的追溯记录（阶段 3 增量）。
  *
- * dsh-host 适配器在启动时写入、结束时补全，存放在 `.takt/runs/<runId>/agents/<nodeId>#<attempt>.json`；
- * 运行中的记录由路由合并活动状态返回。面板的节点抽屉和“子 Agent”页按它渲染。
+ * dsh-host 适配器在启动时写入、结束时补全，存放在 `.takt/runs/<runId>/agents/`：
+ * 首次执行写 `<nodeId>#<attempt>.json`，同一 node/attempt 的后续执行（review 节点的
+ * 多位评审者/作者）写 `<nodeId>#<attempt>~<编码 sessionId>.json`。因此同一 nodeId+attempt
+ * 可能有多条记录，前端渲染/详情选择应以 sessionId 区分。运行中的记录由路由合并活动状态返回。
  * 文本字段都已脱敏并截断，不含密钥。
  */
 export interface AgentTrace {
@@ -272,10 +408,13 @@ export interface AgentTrace {
   startedAt: string
   endedAt?: string
   durationMs?: number
-  /** 动态注册的角色 preset：id、配置哈希、组合里的插件包名。 */
-  preset: { id: string; cfgHash: string; plugins: string[] }
-  /** 角色档案摘要（来源：空间 .takt/agents 或随包默认）。 */
-  profile: { title: string; description: string; skills: string[]; writeScope: string[]; readOnly: boolean; source: 'space' | 'bundled' }
+  /** 动态注册的角色 preset：id、配置哈希、组合里的插件包名、实际注册的 skill。 */
+  preset: { id: string; cfgHash: string; plugins: string[]; skills?: string[] }
+  /**
+   * 角色档案摘要（来源：空间 .takt/agents 或随包默认）。
+   * skills 是本次实际注册成功的 skill；declaredSkills 是档案声明的名字。
+   */
+  profile: { title: string; description: string; skills: string[]; declaredSkills?: string[]; writeScope: string[]; readOnly: boolean; source: 'space' | 'bundled' }
   /** 发给子 Agent 的完整 prompt（脱敏）。 */
   prompt: string
   systemAppend?: string
