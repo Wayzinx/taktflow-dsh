@@ -93,6 +93,7 @@ export function createDshSource(space: string, options: DshSourceOptions = {}): 
 
   return {
     mock: false,
+    me: () => read('me'),
     project: () => read('project'),
     requirements: () => read('requirements'),
     requirement: (id) => read('requirement', { id }),
@@ -117,9 +118,10 @@ export function createDshSource(space: string, options: DshSourceOptions = {}): 
     // 嵌入时只有一个空间（会话目录），不提供空间切换
     spaces: async () => [],
     space: () => read('space'),
-    setMembers: (members) => write('space.members', {}, { members, reason: '在 dsh 面板里修改成员' }),
-    addRepo: (repo) => write('space.repo.add', {}, { ...repo, reason: '在 dsh 面板里绑定仓库' }),
-    syncRepo: (repoId) => write('space.repo.sync', { repoId }, { reason: '在 dsh 面板里同步仓库' }),
+    setMembers: (members, reason) => write('space.members', {}, { members, reason }),
+    addRepo: (repo, reason) => write('space.repo.add', {}, { ...repo, reason }),
+    updateRepo: (repoId, patch, reason) => write('space.repo.update', { repoId }, { ...patch, reason }),
+    syncRepo: (repoId, reason) => write('space.repo.sync', { repoId }, { reason }),
     spaceFile: (kind, name) => read('space.file', { kind, name }),
     saveSpaceFile: (kind, name, body) => write('space.file.edit', { kind, name }, body),
 
@@ -130,6 +132,25 @@ export function createDshSource(space: string, options: DshSourceOptions = {}): 
     subscribeChat: () => () => {},
 
     requirementReviews: (id) => read('reviews', { id }),
+    disposeReview: (runId, nodeId, body) => write('review.dispose', { runId, nodeId }, body),
+    routePreview: (id, body) => write('route.preview', { id }, body),
+    commands: () => read('commands'),
+    runCommand: (id, body) => write('command.run', { id }, body),
+    lessons: (status) => read('lessons', { status }),
+    updateLesson: (id, body) => write('lesson.update', { id }, body),
+
+    // 评测与归因（docs/design/20）
+    scorecards: (by, workflow) => read('eval.scorecards', { by, workflow }),
+    evalCases: (target) => read('eval.cases', { target }),
+    collectEvalCases: (body) => write('eval.collect', {}, body),
+    evalRuns: () => read('eval.runs'),
+    evalRun: (id) => read('eval.run', { id }),
+    startEvalRun: (body) => write('eval.run', {}, body),
+    evalOutput: (id, caseId, variant) => read('eval.output', { id, case: caseId, variant }),
+    defects: (id) => read('defects', { id }),
+    reportDefect: (id, body) => write('defect.report', { id }, body),
+    attributeDefect: (id, defectId) => write('defect.attribute', { id, defectId }, {}),
+    confirmDefect: (id, defectId, body) => write('defect.confirm', { id, defectId }, body),
 
     workflows: () => read('workflows'),
     workflow: (id) => read('workflow', { id }),

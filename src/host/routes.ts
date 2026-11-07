@@ -85,6 +85,18 @@ export const CORE_WRITE_OPS = [
   'workflow.source.replace',
   'workflow.layout',
   'workflow.rollback',
+  // M3：仓库更新、评审处置、路由预览、命令注册表、经验、评测与缺陷归因（docs/design/20）。
+  // 权限、风险等级与写原因由 api-core / 命令注册表自己校验。
+  'space.repo.update',
+  'review.dispose',
+  'route.preview',
+  'command.run',
+  'lesson.update',
+  'eval.collect',
+  'eval.run',
+  'defect.report',
+  'defect.attribute',
+  'defect.confirm',
 ] as const
 
 /**
