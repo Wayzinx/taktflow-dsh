@@ -234,7 +234,17 @@ export interface RolePresets {
   acquire(
     space: SpaceHandle,
     role: string,
-    variant: { readOnly: boolean; allowBash: boolean },
+    variant: {
+      readOnly: boolean
+      allowBash: boolean
+      /**
+       * M-K 增量（可选）：本次节点实际生效的写入范围。
+       *
+       * 执行器传入 req.tools.writeScope 或角色档案范围；preset 用它决定是否挂载
+       * `takt_selftest`。缺省时仍回退角色档案 writeScope，旧调用方不受影响。
+       */
+      writeScope?: string[]
+    },
   ): Promise<RolePresetHandle>
 }
 
@@ -384,6 +394,20 @@ export interface TaktflowService {
   approvals: Approvals
   notifier: Notifier
   workflows: WorkflowCatalog
+  /**
+   * M-K 增量（可选）：评测、缺陷归因与成绩单服务。
+   *
+   * 旧测试替身/纯程序化组装可以不带；缺失时面板 eval.run/defect.attribute 保持
+   * 501，Lead 的 M3 动作明确失败，不会退化成假成功。
+   */
+  m3?: import('./m3.js').M3Service
+  /**
+   * M-K 增量（可选）：受控自测服务。
+   *
+   * 旧测试替身/纯程序化组装可以不带；角色工具仍会按 preset 条件注册，但执行时
+   * 明确拒绝，不会退化成任意 shell。服务由宿主 createService 创建并随卸载释放。
+   */
+  selftests?: import('./selftest.js').SelftestService
 }
 
 /**
@@ -402,6 +426,13 @@ export interface AgentTrace {
   /** startActivation 的 label，例如 `REQ-1/design#1`。 */
   label: string
   role: string
+  /**
+   * 本次执行对应的节点配方（node.recipe 事件）标识。
+   * 旧记录没有该字段；有值时可在评测/归因面板里按配方回看当时的 prompt、模型与技能。
+   */
+  recipeKey?: string
+  /** node.recipe 事件的 seq；用于在同一 nodeId 的多次尝试间精确定位配方。 */
+  recipeEventSeq?: number
   /** dsh 子会话 id（= 预留的 childId），可在 dsh 的“编队”和会话列表里打开。 */
   sessionId: string
   status: 'starting' | 'running' | 'completed' | 'failed' | 'cancelled'

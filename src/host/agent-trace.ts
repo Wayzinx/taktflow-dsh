@@ -29,6 +29,9 @@ export interface AgentTraceStart {
   attempt: number
   label: string
   role: string
+  /** 当前 attempt 的节点配方标识；允许为空（旧运行、事件缺失或配方尚未记录）。 */
+  recipeKey?: string
+  recipeEventSeq?: number
   sessionId: string
   preset: { id: string; cfgHash: string; plugins: string[]; skills?: string[] }
   profile: AgentTrace['profile']
@@ -323,6 +326,8 @@ function isAgentTrace(value: unknown): value is AgentTrace {
   }
   if (value.endedAt !== undefined && typeof value.endedAt !== 'string') return false
   if (value.durationMs !== undefined && !isNonNegative(value.durationMs)) return false
+  if (value.recipeKey !== undefined && (typeof value.recipeKey !== 'string' || value.recipeKey === '')) return false
+  if (value.recipeEventSeq !== undefined && (!Number.isSafeInteger(value.recipeEventSeq) || (value.recipeEventSeq as number) < 1)) return false
   if (value.model !== undefined && typeof value.model !== 'string') return false
   if (value.effort !== undefined && typeof value.effort !== 'string') return false
   if (value.stopReason !== undefined && typeof value.stopReason !== 'string') return false
@@ -406,6 +411,8 @@ export class AgentTraceHub implements AgentTraceRecorder {
       attempt: input.attempt,
       label: truncateChars(redact(input.label), 200),
       role: truncateChars(redact(input.role), 200),
+      ...(input.recipeKey === undefined ? {} : { recipeKey: truncateChars(redact(input.recipeKey), 200) }),
+      ...(input.recipeEventSeq === undefined ? {} : { recipeEventSeq: input.recipeEventSeq }),
       sessionId: input.sessionId,
       status: 'starting',
       startedAt: new Date(startedMs).toISOString(),

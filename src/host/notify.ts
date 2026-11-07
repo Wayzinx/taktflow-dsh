@@ -3,8 +3,17 @@ import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import {
   assertRequirementId,
+  assertNoSymlinks,
+  getDefect,
+  getEvalRun,
+  listEvalRuns,
+  readJsonFile,
+  validateEvalCase,
+  type DefectDetail,
+  type EvalCase,
   type EventEnvelope,
   type EventPayloads,
+  type EvalRun,
   type RequirementId,
   type RunState,
   type RunStatus,
@@ -40,6 +49,8 @@ interface Notice {
   wake?: WakeReason
   /** 需要保留的待办 ID；用于离线唤醒和过期判断。 */
   requestIds?: string[]
+  /** 候选归因对应的缺陷 ID；投递前要重读该缺陷，不能拿快照代替。 */
+  defectIds?: string[]
 }
 
 interface PendingBatch {
@@ -50,27 +61,32 @@ interface PendingBatch {
   /** 普通进度；空间不足时优先截断。 */
   normalLines: string[]
   requestIds: Set<string>
+  defectIds: Set<string>
+  /** 人工待办短句与完成通知分开，撤销候选时不能删除同缺陷的确认通知。 */
+  humanLines: Set<string>
+  /** 人工待办过期后仍须保留的其它唤醒。 */
+  fallbackWake?: Exclude<WakeReason, 'human'>
   wake?: WakeReason
   timer: ReturnType<typeof setTimeout>
-}
-
-/** Lead 离线时未送达的唤醒；上线后且待办仍存在时补发。 */
-interface Undelivered {
-  text: string
-  wake: WakeReason
-  requestIds: string[]
 }
 
 interface AttachedSpace {
   space: SpaceHandle
   closed: boolean
   initialized: boolean
+  /** M3 各自建立基线，首次读取失败时不能把历史记录当新通知。 */
+  defectsInitialized: boolean
+  evalsInitialized: boolean
   polling: boolean
   timer?: ReturnType<typeof setTimeout>
   /** 每个运行已处理到的最后事件序号；避免重复通知。 */
   lastSeq: Map<string, number>
   /** 每个运行上次通知过的状态；避免同状态重复唤醒。 */
   lastStatus: Map<string, RunStatus>
+  /** 每个需求的 defect-<REQ> 审计流已处理到的序号。 */
+  lastDefectSeq: Map<RequirementId, number>
+  /** 评测运行上次看到的状态；只在终态变化时通知。 */
+  evalStatus: Map<string, EvalRun['status']>
   /** 需要重写快照的需求。 */
   dirty: Set<RequirementId>
   pending: Map<RequirementId, PendingBatch>
@@ -81,7 +97,7 @@ interface AttachedSpace {
   /** 本空间的脱敏器；attach 时纳入 provider headers。 */
   redact: (text: string) => string
   /** Lead 离线时未送达的唤醒。 */
-  undelivered: Map<RequirementId, Undelivered>
+  undelivered: Map<RequirementId, PendingBatch>
 }
 
 interface SnapshotNode {
@@ -203,6 +219,10 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         // 单个运行的事件日志损坏不能拖住其它运行的通知。
       }
     }
+    // M3：缺陷在 defect-<REQ> 独立审计流，评测不在普通运行里；首次轮询只记基线，不回放历史。
+    await pollDefects(state)
+    if (state.closed) return
+    await pollEvals(state)
     state.initialized = true
     if (state.closed) return
     for (const requirementId of [...state.dirty]) {
@@ -212,6 +232,189 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       if (!written && !state.closed) state.dirty.add(requirementId)
     }
     await flushUndelivered(state)
+  }
+
+  /**
+   * 轮询每个需求的 defect-<REQ> 审计流。
+   *
+   * 首次 attach 只把每个流的当前位置记为基线，不回放历史缺陷；之后新增的
+   * 录入 / 候选归因 / 人工确认 / 驳回 / 归因失败都会进入合并通知。
+   */
+  async function pollDefects(state: AttachedSpace): Promise<void> {
+    let requirements
+    try {
+      requirements = await state.space.stores.workspaces.listRequirements()
+    } catch {
+      return
+    }
+    if (!state.defectsInitialized) {
+      // -1 表示 attach 时已存在、尚未成功建立基线的审计流。
+      for (const requirement of requirements) state.lastDefectSeq.set(requirement.id, -1)
+      state.defectsInitialized = true
+    }
+    for (const requirement of requirements) {
+      if (state.closed) return
+      const requirementId = requirement.id
+      const known = state.lastDefectSeq.get(requirementId)
+      try {
+        const events = await state.space.stores.events.read(`defect-${requirementId}`, {
+          afterSeq: Math.max(known ?? 0, 0),
+        })
+        if (known === -1) {
+          state.lastDefectSeq.set(requirementId, events.at(-1)?.seq ?? 0)
+          continue
+        }
+        for (const event of events) {
+          state.lastDefectSeq.set(requirementId, event.seq)
+          await handleDefectEvent(state, requirementId, event)
+        }
+      } catch {
+        // 单个需求的审计流损坏不能拖住其它通知；下一轮会重新尝试。
+      }
+    }
+  }
+
+  async function handleDefectEvent(
+    state: AttachedSpace,
+    requirementId: RequirementId,
+    event: EventEnvelope,
+  ): Promise<void> {
+    if (event.type !== 'log') return
+    const data = event.data as EventPayloads['log']
+    const stream = `defect-${requirementId}`
+    if (data.level === 'error') {
+      // core 归因失败会写 `<id> 归因失败：<error>`；必须让 Lead 看到，不能静默。
+      const failed = /^(D-\d+)\s*归因失败[:：]\s*(.*)$/.exec(data.message)
+      if (failed !== null) {
+        enqueue(state, {
+          requirementId,
+          runId: stream,
+          line: `缺陷 ${failed[1]} 归因失败：${failed[2]}`,
+          wake: 'failed',
+        })
+      }
+      return
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(data.message)
+    } catch {
+      return
+    }
+    if (!isRecord(parsed)) return
+    const defectId = typeof parsed.defectId === 'string'
+      ? parsed.defectId
+      : defectIdFromRef(parsed.ref)
+    if (defectId === undefined) return
+    const action = typeof parsed.action === 'string' ? parsed.action : undefined
+    switch (action) {
+      case 'open':
+        enqueue(state, { requirementId, runId: stream, line: `缺陷 ${defectId} 已录入` })
+        return
+      case 'attributed':
+        enqueue(state, {
+          requirementId,
+          runId: stream,
+          line: `缺陷 ${defectId} 候选归因已生成（auditor），待人工确认`,
+          wake: 'human',
+          defectIds: [defectId],
+        })
+        return
+      case 'confirmed':
+        enqueue(state, { requirementId, runId: stream, line: `缺陷 ${defectId} 归因已由人确认`, wake: 'succeeded' })
+        return
+      case 'closed':
+        enqueue(state, { requirementId, runId: stream, line: `缺陷 ${defectId} 已关闭` })
+        return
+      case 'defect.reject':
+        enqueue(state, { requirementId, runId: stream, line: `缺陷 ${defectId} 候选归因被驳回（候选保留）` })
+        return
+      default:
+        return
+    }
+  }
+
+  /**
+   * 轮询评测运行。
+   *
+   * 首次 attach 只记录已有评测，不回放历史；之后新出现或状态变为 done/failed
+   * 的评测，通过冻结用例的 source.runId 唯一解析需求，再唤醒该需求的 Lead。
+   * 无法唯一归属时不做全空间广播。
+   */
+  async function pollEvals(state: AttachedSpace): Promise<void> {
+    let runs: EvalRun[]
+    try {
+      runs = await listEvalRuns(state.space.stores)
+    } catch {
+      return
+    }
+    const baseline = !state.evalsInitialized
+    state.evalsInitialized = true
+    for (const run of runs) {
+      if (state.closed) return
+      const previous = state.evalStatus.get(run.id)
+      if (baseline && previous === undefined) {
+        state.evalStatus.set(run.id, run.status)
+        continue
+      }
+      if (previous === run.status) continue
+      if (run.status === 'running') {
+        state.evalStatus.set(run.id, run.status)
+        continue
+      }
+      try {
+        await notifyEval(state, run.id)
+        // 来源与终态均读取成功后才推进游标；瞬时失败必须允许下一轮重试。
+        state.evalStatus.set(run.id, run.status)
+      } catch {
+        // 单个评测读取失败不影响其它通知。
+      }
+    }
+  }
+
+  async function notifyEval(state: AttachedSpace, evalRunId: string): Promise<void> {
+    const run = await getEvalRun(state.space.stores, evalRunId)
+    const requirementId = await evalRequirement(state, run)
+    if (requirementId === undefined || state.closed) return
+    if (run.status === 'failed') {
+      const error = run.results.find((item) => item.error !== undefined)?.error
+      enqueue(state, {
+        requirementId,
+        runId: run.id,
+        line: `评测 ${run.id} 失败${error === undefined ? '' : `：${error}`}`,
+        wake: 'failed',
+      })
+      return
+    }
+    const passed = run.results.filter((item) => item.pass === true).length
+    enqueue(state, {
+      requirementId,
+      runId: run.id,
+      line: `评测 ${run.id} 完成：通过 ${passed}/${run.results.length}`,
+      wake: 'succeeded',
+    })
+  }
+
+  /** 用冻结用例的来源运行解析唯一需求；多来源或无来源都明确放弃。 */
+  async function evalRequirement(state: AttachedSpace, run: EvalRun): Promise<RequirementId | undefined> {
+    const requirements = new Set<RequirementId>()
+    for (const caseId of run.caseIds) {
+      // M3 未导出冻结用例读取器，沿用其公开磁盘布局与 id 约束。
+      if (![run.id, caseId].every((id) => /^[A-Za-z0-9][A-Za-z0-9_-]{0,159}$/.test(id))) {
+        throw new Error('评测运行或用例 id 无效')
+      }
+      const file = join(state.space.stores.taktDir, 'evals', 'runs', run.id, 'cases', `${caseId}.json`)
+      await assertNoSymlinks(state.space.stores.taktDir, file)
+      const item = await readJsonFile<EvalCase>(file)
+      if (item === undefined || item.id !== caseId) throw new Error('评测冻结用例缺失或不匹配')
+      validateEvalCase(item)
+      // 混合有来源与无来源用例不能假定唯一归属。
+      if (item.source.runId === undefined) return undefined
+      const source = await state.space.stores.runs.get(item.source.runId)
+      if (source === undefined) throw new Error('评测来源运行暂不可读')
+      requirements.add(source.requirementId)
+    }
+    return requirements.size === 1 ? [...requirements][0] : undefined
   }
 
   /**
@@ -229,16 +432,15 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         if (state.closed) return
         const agent = sessionId ? deps.ctx.agents.get(sessionId) : undefined
         if (!agent) continue
-        if (pending.wake === 'human' && pending.requestIds.length > 0) {
-          const items = await state.space.stores.attention.list({ requirementId, pending: true })
-          if (state.closed) return
-          const stillPending = items.some((item) => pending.requestIds.includes(item.requestId))
-          if (!stillPending) {
-            state.undelivered.delete(requirementId)
-            continue
-          }
+        await revalidateHumanBatch(state, pending)
+        if (state.closed) return
+        if (pending.wake === undefined) {
+          state.undelivered.delete(requirementId)
+          continue
         }
-        agent.followup(userMessage(pending.text))
+        const text = formatMessage(pending, state.redact)
+        agent.followup(userMessage(text))
+        state.lastMessage.set(requirementId, text)
         state.undelivered.delete(requirementId)
       } catch {
         // 绑定 / 待办暂时读不到时保留，下一轮再试。
@@ -358,6 +560,20 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     }
   }
 
+  /** 缺陷是否仍是“有候选、未确认、未在归因”的状态；读失败返回 undefined。 */
+  async function defectCandidateLive(
+    state: AttachedSpace,
+    requirementId: RequirementId,
+    defectId: string,
+  ): Promise<boolean | undefined> {
+    try {
+      const defect = await getDefect(state.space.stores, requirementId, defectId)
+      return isDefectCandidate(defect)
+    } catch {
+      return undefined
+    }
+  }
+
   async function handleEvent(state: AttachedSpace, run: RunState, event: EventEnvelope): Promise<void> {
     const requirementId = run.requirementId
     const runId = run.runId
@@ -426,8 +642,6 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       }
       case 'human.answered': {
         const data = event.data as EventPayloads['human.answered']
-        const pending = state.undelivered.get(requirementId)
-        if (pending?.requestIds.includes(data.requestId)) state.undelivered.delete(requirementId)
         // 同一合并窗口里已排队的唤醒也要撤掉，不能等 deliver 时再提醒旧待办。
         dropRequestFromBatches(state, requirementId, data.requestId)
         enqueue(state, {
@@ -477,11 +691,12 @@ export function createNotifier(deps: NotifierDeps): Notifier {
 
   /** 真人已答：从同需求合并批次中撤掉对应 requestId 和唤醒文案。 */
   function dropRequestFromBatches(state: AttachedSpace, requirementId: RequirementId, requestId: string): void {
-    const batch = state.pending.get(requirementId)
-    if (batch === undefined) return
-    batch.requestIds.delete(requestId)
-    batch.priorityLines = batch.priorityLines.filter((line) => !line.includes(requestId))
-    if (batch.wake === 'human' && batch.requestIds.size === 0) batch.wake = undefined
+    for (const batch of [state.pending.get(requirementId), state.undelivered.get(requirementId)]) {
+      if (batch === undefined) continue
+      batch.requestIds.delete(requestId)
+      batch.priorityLines = batch.priorityLines.filter((line) => !batch.humanLines.has(line) || !line.includes(requestId))
+      if (batch.wake === 'human' && batch.requestIds.size === 0 && batch.defectIds.size === 0) batch.wake = batch.fallbackWake
+    }
   }
 
   /**
@@ -489,7 +704,7 @@ export function createNotifier(deps: NotifierDeps): Notifier {
    * 回答/取消与合并窗口存在时间差，入队时的判断不能作为投递依据。
    */
   async function revalidateHumanBatch(state: AttachedSpace, batch: PendingBatch): Promise<void> {
-    if (batch.wake !== 'human' || batch.requestIds.size === 0) return
+    if (batch.wake !== 'human') return
     const dropped: string[] = []
     for (const requestId of [...batch.requestIds]) {
       // 只有能证明过期（已答或运行终态）才撤掉；读取失败/记录缺失保留唤醒。
@@ -498,9 +713,19 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         dropped.push(requestId)
       }
     }
-    if (dropped.length === 0) return
-    batch.priorityLines = batch.priorityLines.filter((line) => !dropped.some((requestId) => line.includes(requestId)))
-    if (batch.requestIds.size === 0) batch.wake = undefined
+    const droppedDefects: string[] = []
+    for (const defectId of [...batch.defectIds]) {
+      // 候选已被确认、关闭或正在重新归因：旧唤醒不能发。
+      if (await defectCandidateLive(state, batch.requirementId, defectId) === false) {
+        batch.defectIds.delete(defectId)
+        droppedDefects.push(defectId)
+      }
+    }
+    if (dropped.length === 0 && droppedDefects.length === 0) return
+    batch.priorityLines = batch.priorityLines.filter((line) => !batch.humanLines.has(line) || (
+      !dropped.some((requestId) => line.includes(requestId))
+      && !droppedDefects.some((defectId) => line.includes(`缺陷 ${defectId} `))))
+    if (batch.requestIds.size === 0 && batch.defectIds.size === 0) batch.wake = batch.fallbackWake
   }
 
   function wakeForStatus(status: RunStatus): WakeReason | undefined {
@@ -522,6 +747,8 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         priorityLines: [],
         normalLines: [],
         requestIds: new Set(),
+        defectIds: new Set(),
+        humanLines: new Set(),
         timer: setTimeout(() => {
           state.pending.delete(notice.requirementId)
           const task = deliver(state, batch!)
@@ -537,6 +764,11 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     const other = notice.wake ? batch.normalLines : batch.priorityLines
     if (!target.includes(notice.line) && !other.includes(notice.line)) target.push(notice.line)
     for (const requestId of notice.requestIds ?? []) batch.requestIds.add(requestId)
+    for (const defectId of notice.defectIds ?? []) batch.defectIds.add(defectId)
+    if (notice.wake === 'human') batch.humanLines.add(notice.line)
+    else if (notice.wake && (!batch.fallbackWake || WAKE_PRIORITY[notice.wake] > WAKE_PRIORITY[batch.fallbackWake])) {
+      batch.fallbackWake = notice.wake
+    }
     if (notice.wake && (!batch.wake || WAKE_PRIORITY[notice.wake] > WAKE_PRIORITY[batch.wake])) {
       batch.wake = notice.wake
     }
@@ -562,21 +794,13 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         state.undelivered.delete(batch.requirementId)
       } else if (batch.wake) {
         // Lead 离线：先记下唤醒，后续轮询在 Agent 恢复时补发。
-        state.undelivered.set(batch.requirementId, {
-          text,
-          wake: batch.wake,
-          requestIds: [...batch.requestIds],
-        })
+        state.undelivered.set(batch.requirementId, batch)
       }
     } catch {
       // Agent 或绑定故障时只保留快照，不让通知回调把错误抛回定时器；
       // 唤醒类消息记下来，绑定恢复后由 flushUndelivered 补发。
       if (batch.wake && !state.closed) {
-        state.undelivered.set(batch.requirementId, {
-          text,
-          wake: batch.wake,
-          requestIds: [...batch.requestIds],
-        })
+        state.undelivered.set(batch.requirementId, batch)
       }
     }
     if (state.closed) return
@@ -653,9 +877,13 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       space,
       closed: false,
       initialized: false,
+      defectsInitialized: false,
+      evalsInitialized: false,
       polling: false,
       lastSeq: new Map(),
       lastStatus: new Map(),
+      lastDefectSeq: new Map(),
+      evalStatus: new Map(),
       dirty: new Set(),
       pending: new Map(),
       inflight: new Set(),
@@ -720,6 +948,24 @@ export function createNotifier(deps: NotifierDeps): Notifier {
   }
 
   return { attach, detach, notifyEscalation }
+}
+
+/** 缺陷仍是“有候选、未确认、未在归因”。 */
+function isDefectCandidate(defect: DefectDetail): boolean {
+  return defect.status === 'attributed'
+    && defect.attribution !== undefined
+    && defect.attribution.confirmed === undefined
+    && defect.attributing !== true
+}
+
+/** 从审计日志里的产物引用解析缺陷 ID（defects/D-1.md）。 */
+function defectIdFromRef(value: unknown): string | undefined {
+  if (!isRecord(value) || typeof value.path !== 'string') return undefined
+  return /^defects\/(D-\d+)\.md$/.exec(value.path)?.[1]
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function userMessage(text: string): UserMessage {

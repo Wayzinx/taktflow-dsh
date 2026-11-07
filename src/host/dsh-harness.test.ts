@@ -541,3 +541,44 @@ describe('dsh-host 追溯接线', () => {
     expect(f.releasePreset).toHaveBeenCalledOnce()
   })
 })
+
+describe('M3 配方关联', () => {
+  it.each(['missing-start','wrong-attempt','correct'])('只关联当前attempt及角色：%s', async mode => {
+    const f=fixture({trace:true})
+    const recipe=(seq:number,role:string,key:string)=>({type:'node.recipe',seq,nodeId:'build',data:{role,recipeKey:key}})
+    const events=[...(mode==='missing-start'?[]:[{type:'node.started',seq:1,nodeId:'build',data:{attempt:mode==='wrong-attempt'?1:2}}]),
+      recipe(2,'dev','own-recipe'),recipe(3,'reviewer','other-recipe')]
+    f.deps.space.stores.events={read:async()=>events} as unknown as SpaceHandle['stores']['events']
+    await f.run()
+    if(mode==='correct')expect(f.traces!.starts[0]).toMatchObject({recipeKey:'own-recipe',recipeEventSeq:2})
+    else expect(f.traces!.starts[0]!.recipeKey).toBeUndefined()
+  })
+})
+
+describe('原生深冻结结构化结果', () => {
+  it('交给 core 的嵌套对象和数组可规范化，SDK 原结果仍冻结且未变', async () => {
+    const f = fixture()
+    const structured = Object.freeze({ issues: Object.freeze([
+      Object.freeze({ nodeId: 'build', evidence: Object.freeze(['原始证据']) }),
+    ]) })
+    f.req.resultSchema = { type: 'object', properties: {
+      issues: { type: 'array', items: { type: 'object', properties: {
+        nodeId: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } },
+      }, required: ['nodeId', 'evidence'] } },
+    }, required: ['issues'] }
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!, result: Promise.resolve({ output: [], stopReason: 'completed', structured }), dispose: f.dispose,
+    }))
+    const result = await f.run()
+    const mutable = result.structured as { issues: Array<{ nodeId: string; runId?: string; evidence: string[] }> }
+    expect(mutable).toEqual(structured)
+    expect(mutable).not.toBe(structured)
+    mutable.issues[0]!.runId = 'run-1'
+    mutable.issues[0]!.evidence.push('core 补充证据')
+    expect(mutable.issues[0]).toMatchObject({ runId: 'run-1', evidence: ['原始证据', 'core 补充证据'] })
+    expect(structured.issues[0]).toEqual({ nodeId: 'build', evidence: ['原始证据'] })
+    expect(Object.isFrozen(structured.issues)).toBe(true)
+    expect(Object.isFrozen(structured.issues[0])).toBe(true)
+    expect(Object.isFrozen(structured.issues[0]!.evidence)).toBe(true)
+  })
+})

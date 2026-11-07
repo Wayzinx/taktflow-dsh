@@ -23,7 +23,8 @@
 | P0 骨架 | 打包、安装、宿主加载、Lead preset、最小面板；隔离 profile 下的真实安装验证（S4） | ✅ |
 | P0 业务（历史演示流程） | dsh 原生职责 Agent、权限守卫、单写者租约、审批链路、Lead 工具、主面板；真实 dsh + 真实模型跑 `p0-delivery` 演示流程，最终批次 25/25 | ✅ 历史批次 |
 | M-J 标准流程 | `taktflow-standard`、角色能力、autonomy、run-status、状态工具与文档；构建/类型/单测 35 文件 548 项通过；真实 dsh + 模型 standard e2e 已执行 5 批，前 4 批未通过（目录遗漏与 sandbox 包解析已修；第 4 批跑到 loop，5 轮评审、9 条生成用例 8 过 1 失败，因缺基线环境变量升级）；第 5 批跑到 loop 后升级给人（34 项 26 过 8 失败，`ok=false`） | 🚧 到人工升级，未全链通过 |
-| P1 / P2 | 从节点重跑、产物回退、配方指纹、归因视图 | 计划中 |
+| M-K 评测与缺陷归因宿主 | 复用 M3，接入 Lead 缺陷动作（defects / why / report / attribute / scorecard）、人工归因原生卡片、通知及 recipe 追溯；可写角色的受控自测工具 `takt_selftest`（见 [docs/controlled-selftest.md](docs/controlled-selftest.md)）；构建/类型/单测 39 文件 665 项通过。真实 dsh + 模型用 quick-fix 跑完需求 → 自测 → 独立评审 → 交付校验 → 报缺陷 → auditor 归因 → 卡片人工确认 → Lead 汇报，第 7 批 25/25 | ✅ 归因确认闭环；回放评测与前端未真实验收 |
+| P1 / P2 | 从节点重跑、产物回退、配方与归因完整视图；M3 宿主接入以 M-K 行及 spike 新节为准 | 后续及前端整合范围 |
 
 第 5 批最终结果：run `run-20261106-124857-4d67`，34 项验收 26 通过 / 8 失败、整体 `ok=false`；生成 12 条业务用例首轮 9 过 3 失败，独立 6 项产品 AC 通过；研发测试 loop 的 judge 停在 `waiting_human`，最终升级待办保持未回答。未到质量报告/准出/知识回流，不宣称标准全链通过。证据归档见 `e2e/out/standard-history/`。
 

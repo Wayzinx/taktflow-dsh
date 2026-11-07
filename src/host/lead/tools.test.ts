@@ -1310,11 +1310,20 @@ describe('takt_trace', () => {
     expect(result.error?.code).toBe('TAKT_NOT_BOUND')
   })
 
-  it('P1 action 返回明确提示', async () => {
+  it('未实现的 action 返回明确提示', async () => {
     const h = await boundHarness()
-    for (const action of ['coverage', 'why', 'compare']) {
+    for (const action of ['coverage', 'compare']) {
       const result = await h.call('takt_trace', { action })
       expect(result.error?.code).toBe('TAKT_UNSUPPORTED_ACTION')
+    }
+  })
+
+  it('M3 action 在未接线宿主上明确失败，而不是静默成功', async () => {
+    const h = await boundHarness()
+    for (const action of ['defects', 'why', 'scorecard']) {
+      const result = await h.call('takt_trace', { action })
+      expect(result.ok).toBe(false)
+      expect(result.error?.code).toBe('TAKT_UNSUPPORTED_NODE')
     }
   })
 })

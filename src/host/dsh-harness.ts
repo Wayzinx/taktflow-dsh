@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import path from 'node:path'
-import { extractJsonBlock, type AgentProfile, type HarnessAdapter, type HarnessEvent, type HarnessRequest, type HarnessResult } from '@taktflow/core'
+import { extractJsonBlock, type AgentProfile, type HarnessAdapter, type HarnessEvent, type HarnessRequest, type HarnessResult, type WorkflowDefinition } from '@taktflow/core'
 import { collectSecrets } from '@taktflow/harness'
 import type { AgentTraceHandle, AgentTraceHub, AgentTraceOutcome } from './agent-trace.js'
 import type { HostContext, SessionEvent, SubagentActivation } from './dsh-types.js'
 import type { RoleSkillSnapshots } from './role-skills.js'
+import type { SelftestRegistration, SelftestService } from './selftest.js'
 import { supportsDshOutputSchema } from './dsh-schema.js'
 import { TaktToolError, type Ownership, type PermissionRegistry, type RolePresetHandle, type RolePresets, type SpaceHandle } from './types.js'
 
@@ -23,6 +24,10 @@ export interface DshHarnessDeps {
   roleSkills?: RoleSkillSnapshots
   /** 追溯中心；缺失时保持原执行语义，不写追溯文件。 */
   traces?: AgentTraceHub
+  /** M-K：受控自测服务；缺失时角色工具仍可注册，但执行会明确拒绝。 */
+  selftests?: SelftestService
+  /** 运行开始时冻结的流程定义；用于判断节点 strictOutputs 的证据路径。 */
+  workflow?: WorkflowDefinition
   /** RunManager 取消整条运行；回调不可等待当前 harness 所属任务。 */
   onLeadOffline(nodeRef: { runId: string; nodeId: string; attempt: number }): Promise<void>
   /** 启动子 Agent 前把选用的 preset 写进 owner 审计。 */
@@ -78,6 +83,39 @@ function errorMessage(error: unknown): string {
 }
 
 /**
+ * 读取当前 attempt 已记录的节点配方。
+ *
+ * 引擎在 harness.run 之前写入 node.recipe；这里按“最近一次 node.started 之后 +
+ * nodeId + role”匹配，避免 review 节点的多位评审者互相串用配方。
+ * 事件读取失败或配方缺失时返回 undefined，追溯仍可继续，不能因附加信息中断运行。
+ */
+async function currentRecipe(
+  space: SpaceHandle,
+  runId: string,
+  nodeId: string,
+  role: string,
+  attempt: number,
+): Promise<{ key: string; seq: number } | undefined> {
+  try {
+    const events = await space.stores.events.read(runId, { nodeId })
+    const start = events.map((event) => event.type).lastIndexOf('node.started')
+    if (start < 0 || (events[start]!.data as { attempt?: number }).attempt !== attempt) return undefined
+    for (let index = events.length - 1; index > start; index -= 1) {
+      const event = events[index]
+      if (event === undefined) continue
+      if (event.type !== 'node.recipe') continue
+      const data = event.data as { role?: unknown; recipeKey?: unknown } | undefined
+      if (data?.role !== role) continue
+      if (typeof data.recipeKey !== 'string' || data.recipeKey === '') continue
+      return { key: data.recipeKey, seq: event.seq }
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * RunManager 为每次运行创建的 dsh 子 Agent 适配器。
  * 固定 parent 与空间；开始前登记权限，等待真实结果和 teardown 后才释放授权。
  * 启动、审计、取消和清理错误全部向引擎传播，不能当作节点成功。
@@ -85,6 +123,7 @@ function errorMessage(error: unknown): string {
 export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
   const active = new Set<Promise<HarnessResult>>()
   const cleanupFailures: unknown[] = []
+  const selftestChildren = new Set<string>()
   const adapter: HarnessAdapter = {
     id: 'dsh-host',
     displayName: 'DeepSeek Harness (dsh-host)',
@@ -170,11 +209,26 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       let trace: AgentTraceHandle | undefined
       let unsubscribeSession: (() => void | Promise<void>) | undefined
       let outcome: AgentTraceOutcome | undefined
+      let selftest: SelftestRegistration | undefined
       let runError: unknown
       const dispose = (): Promise<void> => disposal ??= Promise.resolve().then(() => activation?.dispose())
-      const abort = () => { void dispose().catch(() => {}) }
+      const abort = () => { selftest?.cancel(signal.reason); void dispose().catch(() => {}) }
       try {
-        preset = await deps.presets.acquire(space, role, { readOnly, allowBash: false })
+        // 启动子 Agent 前冻结受控自测上下文；没有可信命令时只登记错误，不阻断节点启动。
+        if (deps.selftests !== undefined) {
+          selftest = await deps.selftests.register({
+            childId, space, nodeRef, role, requirementId: run.requirementId,
+            cwd: requestedCwd, env: { ...(req.env ?? {}) }, writeScope,
+            signal, sessionId: childId, readOnly, allowBash: false,
+            ...(deps.workflow === undefined ? {} : { workflow: deps.workflow }),
+          })
+          selftestChildren.add(childId)
+        }
+        preset = await deps.presets.acquire(space, role, {
+          readOnly, allowBash: false,
+          // 旧 fake/旧调用方没有自测服务时保持原 variant 形状；生产始终传实际范围。
+          ...(deps.selftests === undefined ? {} : { writeScope }),
+        })
         signal.throwIfAborted()
         const actualSkills = presetSkills(preset)
         // 生产 preset 必须报告实际注册的 skills；旧 fake preset 没有该字段时保持兼容。
@@ -196,8 +250,10 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
           if (profile === undefined) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `追溯缺少角色档案：${role}`)
           const source = deps.profileSources?.[role]
           if (source === undefined) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `追溯缺少冻结的角色来源：${role}`)
+          const recipe = await currentRecipe(space, runId, nodeId, role, nodeRef.attempt)
           trace = await deps.traces.begin(space, {
             runId, nodeId, attempt: nodeRef.attempt, label, role, sessionId: childId,
+            ...(recipe === undefined ? {} : { recipeKey: recipe.key, recipeEventSeq: recipe.seq }),
             preset: {
               id: preset.id, cfgHash: preset.cfgHash, plugins: presetPlugins(preset),
               ...(actualSkills === undefined ? {} : { skills: [...actualSkills] }),
@@ -252,7 +308,9 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         const result = await activation.result
         const finalText = result.output.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
         if (finalText !== '') onEvent({ type: 'message', role: 'assistant', text: finalText })
-        const structured = outputSchema === undefined ? req.resultSchema === undefined ? undefined : extractJsonBlock(finalText) : result.structured
+        const nativeStructured = outputSchema === undefined ? req.resultSchema === undefined ? undefined : extractJsonBlock(finalText) : result.structured
+        // dsh 原生结果可能深冻结；core 会补齐归因 runId、规范化评审项，只能修改独立副本。
+        const structured = nativeStructured === undefined ? undefined : structuredClone(nativeStructured)
         const status = result.stopReason === 'completed' ? 'completed'
           : result.stopReason === 'aborted' || result.stopReason === 'cancelled' ? 'cancelled' : 'failed'
         outcome = {
@@ -283,13 +341,33 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         signal.removeEventListener('abort', abort)
         // 无法确认子 Agent 已停止时保留守卫和 preset，避免清理失败后无权限保护。
         let cleanupError: unknown
+        let activationStopped = true
+        selftest?.cancel(new Error('节点执行已结束'))
         try {
           if (activation !== undefined) await dispose()
-          releasePermission()
-          if (preset !== undefined) await Promise.resolve(preset.release())
         } catch (error) {
+          activationStopped = false
           cleanupFailures.push(error)
           cleanupError = error
+        }
+        // 先取消并等待受控自测进程组；即使 activation 清理失败也要收掉自测子进程。
+        try {
+          if (selftest !== undefined) await selftest.release()
+        } catch (error) {
+          cleanupFailures.push(error)
+          cleanupError ??= error
+        } finally {
+          selftestChildren.delete(childId)
+        }
+        // 无法确认子 Agent 已停止时保留守卫和 preset，避免清理失败后无权限保护。
+        if (activationStopped) {
+          try {
+            releasePermission()
+            if (preset !== undefined) await Promise.resolve(preset.release())
+          } catch (error) {
+            cleanupFailures.push(error)
+            cleanupError ??= error
+          }
         }
         if (trace !== undefined) {
           let finalOutcome: AgentTraceOutcome
@@ -353,6 +431,10 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
     },
     async drain() {
       while (active.size > 0) await Promise.allSettled([...active])
+      // 兜底等待：正常路径 release 已经等待；这里防止取消竞态留下未收敛的自测进程。
+      if (deps?.selftests !== undefined) {
+        for (const childId of [...selftestChildren]) await deps.selftests.drain(childId)
+      }
       if (cleanupFailures.length > 0) throw new AggregateError([...cleanupFailures], 'dsh 子 Agent 资源清理失败')
     },
   }

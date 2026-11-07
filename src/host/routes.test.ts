@@ -387,7 +387,7 @@ describe('registerRoutes：路由与读操作', () => {
   it('追溯路由：返回指定运行/节点的记录，并原样带出最新状态', async () => {
     const { host, space, stores, requirementId, readTraces } = await makeFixture()
     const runId = await createRun(stores, requirementId)
-    const trace = sampleTrace(runId)
+    const trace = { ...sampleTrace(runId), recipeKey: 'recipe-identity', recipeEventSeq: 7 }
     readTraces.mockResolvedValue([trace])
 
     const all = await getJson(host, '/api/taktflow.agents', { space: space.root, run: runId })

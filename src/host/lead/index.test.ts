@@ -160,6 +160,6 @@ describe('taktflow/role 行', () => {
     expect(ctx.promptSections.map((section) => section.name)).toEqual(['taktflow:role'])
     // 角色只能看到 profile 声明的 skills；内置技能不得静默出现在注册表里。
     expect(ctx.registeredSkills).toEqual([])
-    expect(String(ctx.promptSections[0]?.text)).toContain('script 节点')
+    expect(String(ctx.promptSections[0]?.text)).toContain('script/自动化节点')
   })
 })

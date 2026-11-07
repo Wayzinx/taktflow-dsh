@@ -17,6 +17,8 @@ import {
   type Actor,
   type ArtifactRecord,
   type AttentionItem,
+  type DefectDetail,
+  type DefectReportRequest,
   type EventVerifyReason,
   type ExternalLink,
   type Requirement,
@@ -37,8 +39,9 @@ import type {
   ToolExecutionContext,
   ValueSchemaSpec,
 } from '../dsh-types.js'
+import type { M3Service } from '../m3.js'
 import { TaktToolError, type SpaceHandle, type TaktErrorCode, type TaktflowService } from '../types.js'
-import { bindingsUser } from '../bindings.js'
+import { bindingActor, bindingsUser } from '../bindings.js'
 import { escalationForRequest } from '../approvals.js'
 import { isAutonomyAnswering } from '../autonomy-state.js'
 import { buildRunStatus, type RunStatusReport } from './run-status.js'
@@ -1378,19 +1381,35 @@ function taktTraceTool(deps: ToolDeps): DefineToolOptions {
   return {
     name: 'takt_trace',
     description: [
-      '校验运行事件链的完整性（哈希链 + 链尾锚点）。',
-      '何时用：汇报前确认运行审计可信；怀疑日志被截断、篡改或缺失时。',
-      '何时不用：不要手工修复事件日志；先保留现场再报告。',
-      '示例：{"action":"audit","runId":"run-20261105-0001"}',
+      '查看运行审计、逃逸缺陷与归因，以及节点/配方/技能成绩单。',
+      '何时用：',
+      '- audit：汇报前确认运行事件链完整；',
+      '- defects：列出当前需求的缺陷及归因状态；',
+      '- why：查某个缺陷的候选归因（auditor 候选）或已确认归因；不传 defectId 时列出歧义候选；',
+      '- report：运行中发现需求外的问题，录入逃逸缺陷（必须说明 reason）；',
+      '- attribute：为缺陷启动后台归因，立即返回；',
+      '- scorecard：空间级成绩单（跨全部需求），按 node/recipe/skill 汇总。',
+      '何时不用：不要用 why 猜结论；没有记录先 report；候选归因必须由人确认，模型没有确认通道。',
+      '示例：{"action":"defects"}；{"action":"why","defectId":"D-1"}；{"action":"report","title":"…","description":"…","severity":"major","reason":"…"}',
     ].join('\n'),
     parameters: {
       action: {
         type: 'string',
-        enum: ['audit', 'coverage', 'why', 'compare'],
+        enum: ['audit', 'defects', 'why', 'report', 'attribute', 'scorecard'],
         required: true,
-        description: 'P0 只支持 audit；coverage、why、compare 是 P1。',
+        description: '要执行的动作。',
       },
       runId: { type: 'string', description: 'audit 必填：要校验的运行 ID。' },
+      defectId: { type: 'string', description: 'why/attribute 必填：缺陷 ID，如 D-1。' },
+      title: { type: 'string', description: 'report 必填：缺陷标题。' },
+      description: { type: 'string', description: 'report 必填：缺陷现象、影响和复现信息。' },
+      severity: { type: 'string', enum: ['critical', 'major', 'minor'], description: 'report 必填：严重程度。' },
+      reason: { type: 'string', description: 'report 必填：为什么现在录入。' },
+      acs: { type: 'array', items: { type: 'string' }, description: 'report 可选：关联的验收标准 ID，如 AC-1。' },
+      evidence: { type: 'array', items: { type: 'string' }, description: 'report 可选：证据（日志、复现步骤、截图说明）。' },
+      links: { type: 'array', description: 'report 可选：外部链接，元素形如 {"type":"url","url":"…","title":"…"}。' },
+      by: { type: 'string', enum: ['node', 'recipe', 'skill'], description: 'scorecard 可选：汇总维度，缺省 node。' },
+      workflowId: { type: 'string', description: 'scorecard 可选：只看某个流程。' },
     },
     output: { schema: OUTPUT_SCHEMA, render: renderResult },
     async execute(raw, exec) {
@@ -1398,32 +1417,290 @@ function taktTraceTool(deps: ToolDeps): DefineToolOptions {
         const args = asRecord(raw)
         const action = requiredString(args, 'action')
         const caller = await resolveBoundCaller(exec, deps)
-        if (action !== 'audit') return p1('takt_trace', action)
-        const runId = validateRunIdArg(requiredString(args, 'runId'))
-        await ownedRun(caller, runId)
-        const result = await caller.space.stores.events.verify(runId)
-        const explained = explainVerify(runId, result)
-        return success(
-          explained.summary,
-          {
-            runId,
-            verified: result.ok,
-            brokenAt: result.brokenAt ?? null,
-            reason: result.reason ?? null,
-            position: explained.position,
-            ...(result.ok
-              ? {}
-              : { hint: '保留现场：不要手工修改 events.jsonl 或 chain.json；把 brokenAt/reason 交给维护者。' }),
-          },
-          result.ok
-            ? [`takt_run get runId="${runId}"`]
-            : [`takt_run get runId="${runId}"`, 'takt_status'],
+        if (action === 'audit') {
+          const runId = validateRunIdArg(requiredString(args, 'runId'))
+          await ownedRun(caller, runId)
+          const result = await caller.space.stores.events.verify(runId)
+          const explained = explainVerify(runId, result)
+          return success(
+            explained.summary,
+            {
+              runId,
+              verified: result.ok,
+              brokenAt: result.brokenAt ?? null,
+              reason: result.reason ?? null,
+              position: explained.position,
+              ...(result.ok
+                ? {}
+                : { hint: '保留现场：不要手工修改 events.jsonl 或 chain.json；把 brokenAt/reason 交给维护者。' }),
+            },
+            result.ok
+              ? [`takt_run get runId="${runId}"`]
+              : [`takt_run get runId="${runId}"`, 'takt_status'],
+          )
+        }
+        if (action === 'defects') return await traceDefects(caller)
+        if (action === 'why') return await traceWhy(caller, optionalString(args, 'defectId'))
+        if (action === 'report') return await traceReport(caller, args)
+        if (action === 'attribute') return await traceAttribute(caller, requiredString(args, 'defectId'))
+        if (action === 'scorecard') return await traceScorecard(caller, args)
+        return failure(
+          'TAKT_UNSUPPORTED_ACTION',
+          `takt_trace 不支持 action "${action}"`,
+          '使用 audit/defects/why/report/attribute/scorecard。',
         )
       } catch (error) {
         return toFailure(error)
       }
     },
   }
+}
+
+/**
+ * 绑定人的可信身份。
+ *
+ * report 的 onBehalfOf 必须取绑定记录里的真实人，不能用插件配置的当前用户，
+ * 也不能用模型参数；绑定记录缺失时明确失败。
+ */
+async function boundLeadActor(caller: BoundCaller): Promise<Actor> {
+  const bound = await bindingActor(caller.space, caller.requirementId)
+  if (bound === undefined) {
+    throw new TaktToolError(
+      'TAKT_NOT_BOUND',
+      `需求 ${caller.requirementId} 的绑定记录缺少录入人`,
+      '重新绑定需求后再录入缺陷；不要用当前配置用户冒充绑定人。',
+    )
+  }
+  return leadActor(caller.agent, bound.id)
+}
+
+function requireM3(caller: BoundCaller): M3Service {
+  const m3 = caller.service.m3
+  if (m3 === undefined) {
+    throw new TaktToolError(
+      'TAKT_UNSUPPORTED_NODE',
+      '当前宿主没有接入 M3 评测/归因服务',
+      '通过完整 dsh 宿主加载 taktflow 后再试。',
+    )
+  }
+  return m3
+}
+
+/** 归因状态只按持久化数据判定：auditor 候选未确认时不能写成已确认。 */
+function attributionState(defect: DefectDetail): 'confirmed' | 'candidate' | 'attributing' | 'none' {
+  if (defect.attribution?.confirmed !== undefined) return 'confirmed'
+  if (defect.attribution !== undefined) return 'candidate'
+  if (defect.attributing === true) return 'attributing'
+  return 'none'
+}
+
+function summarizeDefect(defect: DefectDetail): Record<string, unknown> {
+  return {
+    defectId: defect.id,
+    title: defect.title,
+    severity: defect.severity,
+    status: defect.status,
+    attributing: defect.attributing === true,
+    attributionState: attributionState(defect),
+  }
+}
+
+async function traceDefects(caller: BoundCaller): Promise<LeadToolResult> {
+  const m3 = requireM3(caller)
+  const defects = await m3.listDefects(caller.space, caller.requirementId)
+  const items = defects.map(summarizeDefect)
+  const counts = { open: 0, attributed: 0, confirmed: 0, closed: 0 }
+  for (const defect of defects) counts[defect.status] += 1
+  if (defects.length === 0) {
+    return success(
+      `需求 ${caller.requirementId} 还没有录入缺陷`,
+      { requirementId: caller.requirementId, count: 0, counts, defects: [] },
+      [
+        'takt_trace report title="…" description="…" severity="major" reason="…"',
+        'takt_run get',
+      ],
+    )
+  }
+  return success(
+    `需求 ${caller.requirementId} 共 ${defects.length} 个缺陷（open ${counts.open}、attributed ${counts.attributed}、confirmed ${counts.confirmed}、closed ${counts.closed}）`,
+    { requirementId: caller.requirementId, count: defects.length, counts, defects: items },
+    [
+      `takt_trace why defectId="${defects[0]!.id}"`,
+      `takt_trace attribute defectId="${defects[0]!.id}"`,
+      'takt_trace report title="…" description="…" severity="major" reason="…"',
+    ],
+  )
+}
+
+async function traceWhy(caller: BoundCaller, defectId: string | undefined): Promise<LeadToolResult> {
+  const m3 = requireM3(caller)
+  const defects = await m3.listDefects(caller.space, caller.requirementId)
+  if (defectId === undefined) {
+    if (defects.length === 0) {
+      return success(
+        `需求 ${caller.requirementId} 没有缺陷记录；不要从运行状态推测“谁的锅”`,
+        { requirementId: caller.requirementId, count: 0, defects: [] },
+        ['takt_trace report title="…" description="…" severity="major" reason="…"'],
+      )
+    }
+    if (defects.length === 1) return explainDefectWhy(defects[0]!)
+    const items = defects.map((defect) => ({ ...summarizeDefect(defect), hint: whyHint(defect) }))
+    return success(
+      `需求 ${caller.requirementId} 有 ${defects.length} 个缺陷，请用 defectId 指定要查的缺陷`,
+      { requirementId: caller.requirementId, ambiguous: true, count: defects.length, defects: items },
+      defects.map((defect) => `takt_trace why defectId="${defect.id}"`),
+    )
+  }
+  const defect = defects.find((entry) => entry.id === defectId)
+  if (defect === undefined) {
+    throw new TaktToolError(
+      'TAKT_NOT_BOUND',
+      `当前需求没有缺陷 ${defectId}`,
+      '用 takt_trace defects 查看当前需求的缺陷；不要引用其它需求的缺陷。',
+    )
+  }
+  return explainDefectWhy(defect)
+}
+
+function whyHint(defect: DefectDetail): string {
+  switch (attributionState(defect)) {
+    case 'confirmed':
+      return '归因已由人确认'
+    case 'candidate':
+      return '有 auditor 候选归因，尚未人工确认'
+    case 'attributing':
+      return '归因进行中'
+    default:
+      return '还没有归因，先 takt_trace attribute'
+  }
+}
+
+function explainDefectWhy(defect: DefectDetail): LeadToolResult {
+  const state = attributionState(defect)
+  const base = {
+    defectId: defect.id,
+    title: defect.title,
+    severity: defect.severity,
+    status: defect.status,
+    attributing: defect.attributing === true,
+    attributionState: state,
+  }
+  if (state === 'none' || state === 'attributing' || defect.attribution === undefined) {
+    return success(
+      state === 'attributing'
+        ? `缺陷 ${defect.id} 的归因仍在进行，还没有可确认的候选`
+        : `缺陷 ${defect.id} 还没有归因记录；不要凭运行状态猜引入点`,
+      base,
+      [`takt_trace attribute defectId="${defect.id}"`, `takt_trace why defectId="${defect.id}"`],
+    )
+  }
+  const attribution = defect.attribution
+  const confirmed = attribution.confirmed
+  const detail = {
+    ...base,
+    confirmed: confirmed !== undefined,
+    by: attribution.by,
+    at: attribution.at,
+    introducedAt: attribution.introducedAt,
+    missedBy: attribution.missedBy,
+    confidence: attribution.confidence,
+    suggestions: attribution.suggestions,
+    precheck: attribution.precheck,
+    ...(confirmed === undefined
+      ? {}
+      : { confirmedBy: confirmed.by, confirmedAt: confirmed.at, note: confirmed.note ?? null, edited: confirmed.edited }),
+  }
+  if (confirmed !== undefined) {
+    return success(
+      `缺陷 ${defect.id} 的归因已由人确认（${confirmed.edited ? '人工修改后确认' : '按候选确认'}）`,
+      detail,
+      [`takt_trace scorecard`, `takt_trace defects`],
+    )
+  }
+  return success(
+    `缺陷 ${defect.id} 有 auditor 候选归因（尚未人工确认，不能当结论）`,
+    detail,
+    [`takt_ask_human defectId="${defect.id}"`, `takt_trace defects`],
+  )
+}
+
+async function traceReport(caller: BoundCaller, args: Record<string, unknown>): Promise<LeadToolResult> {
+  const m3 = requireM3(caller)
+  const title = requiredString(args, 'title')
+  const description = requiredString(args, 'description')
+  const severity = requiredString(args, 'severity')
+  if (severity !== 'critical' && severity !== 'major' && severity !== 'minor') {
+    throw new LeadToolFailure('TAKT_INVALID_INPUT', 'severity 只能是 critical/major/minor', '按工具参数枚举传值。')
+  }
+  const reason = requiredString(args, 'reason')
+  const acs = parseStringArray(args.acs, 'acs')
+  if (acs !== undefined) {
+    const invalid = acs.find((id) => !/^AC-\d+(?:-\d+)?$/.test(id))
+    if (invalid !== undefined) {
+      throw new LeadToolFailure('TAKT_INVALID_INPUT', `acs 不合法：${invalid}`, '验收标准 ID 形如 AC-1 或 AC-1-2。')
+    }
+  }
+  const evidence = parseStringArray(args.evidence, 'evidence')
+  const links = parseLinks(args.links)
+  const request: DefectReportRequest = {
+    title,
+    description,
+    severity,
+    reason,
+    ...(acs === undefined ? {} : { acs }),
+    ...(evidence === undefined ? {} : { evidence }),
+    ...(links === undefined ? {} : { links }),
+  }
+  // 身份来自当前绑定 Lead（agent + onBehalfOf）；模型参数不能指定录入人。
+  const defect = await m3.report(
+    caller.space,
+    caller.requirementId,
+    request,
+    await boundLeadActor(caller),
+  )
+  return success(
+    `已录入缺陷 ${defect.id}（${defect.severity}，${defect.status}）`,
+    { defectId: defect.id, title: defect.title, severity: defect.severity, status: defect.status },
+    [`takt_trace attribute defectId="${defect.id}"`, `takt_trace why defectId="${defect.id}"`],
+  )
+}
+
+async function traceAttribute(caller: BoundCaller, defectId: string): Promise<LeadToolResult> {
+  const m3 = requireM3(caller)
+  const defect = await m3.attribute(
+    caller.space,
+    caller.requirementId,
+    defectId,
+    await boundLeadActor(caller),
+  )
+  return success(
+    `已启动缺陷 ${defectId} 的后台归因，工具立即返回；完成后用 why 查看候选`,
+    {
+      defectId,
+      status: defect.status,
+      attributing: defect.attributing === true,
+      attributionState: attributionState(defect),
+    },
+    [`takt_trace why defectId="${defectId}"`, `takt_ask_human defectId="${defectId}"`],
+  )
+}
+
+async function traceScorecard(caller: BoundCaller, args: Record<string, unknown>): Promise<LeadToolResult> {
+  const m3 = requireM3(caller)
+  const by = optionalString(args, 'by') ?? 'node'
+  if (by !== 'node' && by !== 'recipe' && by !== 'skill') {
+    throw new LeadToolFailure('TAKT_INVALID_INPUT', 'by 只能是 node/recipe/skill', '按工具参数枚举传值。')
+  }
+  const workflowId = optionalString(args, 'workflowId')
+  const entries = await m3.scorecards(caller.space, { by, ...(workflowId === undefined ? {} : { workflowId }) })
+  return success(
+    `空间级成绩单（跨全部需求，按 ${by} 汇总）：${entries.length} 项${entries.length === 0 ? '；空成绩单不代表缺陷已修复' : ''}`,
+    { scope: 'space', requirementId: caller.requirementId, by, workflowId: workflowId ?? null, count: entries.length, entries },
+    [
+      '在面板评测页对失败用例执行 eval.run（按用例来源运行唯一确定需求）',
+      'takt_trace defects',
+    ],
+  )
 }
 
 function explainVerify(
@@ -1453,20 +1730,31 @@ function taktAskHumanTool(deps: ToolDeps): DefineToolOptions {
   return {
     name: 'takt_ask_human',
     description: [
-      '把一条待办（审批/回答）呈现给人，等待人在问题卡片上处理。',
-      '何时用：takt_status 或 takt_run get 显示有待办时；一次只呈现一个 requestId。',
-      '何时不用：不要代替人回答，也不要把审批答案当成工具参数传进来。',
-      '示例：{"requestId":"run-20261105-0001:design"}',
+      '把一条待办（审批/回答）或缺陷归因确认卡片呈现给人，等待人在卡片上处理。',
+      '何时用：takt_status / takt_run get 显示有待办时传 requestId；takt_trace why 显示有候选归因时传 defectId。',
+      '何时不用：不要代替人回答；不要用模型参数提交确认或修改；取消/多选/跳过都不算确认。',
+      '示例：{"requestId":"run-20261105-0001:design"}；{"defectId":"D-1"}',
     ].join('\n'),
     parameters: {
-      requestId: { type: 'string', required: true, description: '待办 ID，来自 takt_status / takt_run get。' },
+      requestId: { type: 'string', description: '待办 ID，来自 takt_status / takt_run get；与 defectId 二选一。' },
+      defectId: { type: 'string', description: '缺陷 ID；打开原生归因确认卡片，与 requestId 二选一。' },
     },
     output: { schema: OUTPUT_SCHEMA, render: renderResult },
     async execute(raw, exec) {
       try {
         const args = asRecord(raw)
         const caller = await resolveBoundCaller(exec, deps)
-        const requestId = requiredString(args, 'requestId')
+        const defectId = optionalString(args, 'defectId')
+        const requestIdArg = optionalString(args, 'requestId')
+        if ((defectId === undefined) === (requestIdArg === undefined)) {
+          throw new LeadToolFailure(
+            'TAKT_INVALID_INPUT',
+            'requestId 与 defectId 必须二选一',
+            '处理运行待办传 requestId；确认缺陷归因传 defectId。',
+          )
+        }
+        if (defectId !== undefined) return await confirmDefectCard(caller, defectId, exec)
+        const requestId = requestIdArg!
         const items = await caller.space.stores.attention.list()
         const item = items.find((entry) => entry.requestId === requestId)
         if (item === undefined) {
@@ -1539,6 +1827,47 @@ function taktAskHumanTool(deps: ToolDeps): DefineToolOptions {
       }
     },
   }
+}
+
+/**
+ * 缺陷归因确认卡片。
+ *
+ * 只有 ctx.userQuestions 返回的人工答案会写入确认；模型无法通过工具参数提交
+ * 确认或修改。卡片内容与哈希由 M3 服务冻结，人回答后还会重读比对。
+ */
+async function confirmDefectCard(
+  caller: BoundCaller,
+  defectId: string,
+  exec: ToolExecutionContext,
+): Promise<LeadToolResult> {
+  const m3 = requireM3(caller)
+  const result = await m3.confirmWithCard(exec, caller.space, caller.requirementId, defectId, caller.human)
+  if (result.confirmed) {
+    return success(
+      `已确认缺陷 ${defectId} 的归因`,
+      {
+        defectId,
+        answered: true,
+        confirmed: true,
+        rejected: false,
+        status: result.defect?.status ?? 'confirmed',
+        ...(result.defect?.attribution === undefined ? {} : { attribution: result.defect.attribution }),
+      },
+      [`takt_trace why defectId="${defectId}"`, 'takt_trace scorecard'],
+    )
+  }
+  if (result.rejected) {
+    return success(
+      `已驳回缺陷 ${defectId} 的候选归因；候选保留，未写入确认状态`,
+      { defectId, answered: true, confirmed: false, rejected: true },
+      [`takt_trace defects`, `takt_trace attribute defectId="${defectId}"`],
+    )
+  }
+  return success(
+    `缺陷 ${defectId} 未确认：${result.message}`,
+    { defectId, answered: result.answered, confirmed: false, rejected: false },
+    [`takt_ask_human defectId="${defectId}"`, `takt_trace why defectId="${defectId}"`],
+  )
 }
 
 // ---------------------------------------------------------------- 结果与工具函数
@@ -1863,6 +2192,20 @@ function parseLinks(value: unknown): ExternalLink[] | undefined {
     const link: ExternalLink = { type: item.type, url: item.url }
     if (typeof item.title === 'string' && item.title !== '') link.title = item.title
     return link
+  })
+}
+
+/** 可选字符串数组；用于缺陷 acs/evidence，元素必须非空。 */
+function parseStringArray(value: unknown, key: string): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) {
+    throw new LeadToolFailure('TAKT_INVALID_INPUT', `${key} 必须是数组`, '元素为非空字符串。')
+  }
+  return value.map((item, index) => {
+    if (typeof item !== 'string' || item.trim() === '') {
+      throw new LeadToolFailure('TAKT_INVALID_INPUT', `${key}[${index}] 必须是非空字符串`, '不要传空元素。')
+    }
+    return item
   })
 }
 

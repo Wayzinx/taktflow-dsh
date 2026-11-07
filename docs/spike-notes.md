@@ -248,3 +248,139 @@ dsh 的顶层 `ctx.effect` 在卸载时并行清理；宿主接线把注册放�
 五批 standard 的真实结果均为 `ok=false`：第 1 批 33 项 1 fail + 14 not-run；第 2 批 33 项 12 fail；第 3 批 34 项 12 fail；第 4 批 34 项 8 fail；第 5 批 34 项 8 fail。第 4 批未到质量报告/准出/知识回流，完整 audit 验收未通过（EventStore.verify 单项通过，但缺少准出 AI 代答留痕，需按 JSON 分开看）。第 5 批同样未到质量报告/准出/知识回流，完整 audit 验收失败；第 5 批是最终交付的真实升级记录，无第 6 批、无全链 PASS。这些是脱敏摘要，不含地址、凭据或绝对路径。
 
 本机探针不替代真实 dsh + 模型 e2e；上面的 548 项单测也不包含浏览器 UI、`profile` 外部 CLI 或真实审批卡片链路，`profile` CLI 与浏览器 UI 未做真实 e2e。
+
+## M-K：M3 评测与缺陷归因宿主接入（2026-11-07）
+
+状态：**实现及本地检查通过；真实 dsh + 模型验收执行两批，均为 FAIL，归因闭环未执行**。第二批在原样 `quick-fix` 的 `tier=T0` 实现节点进入 `waiting_human`：角色没有 shell 或测试执行工具，无法满足“自测结果有证据”的完成标准，而模板的实际 `npm test` 位于后续 `delivery-check`。本次保留该阻塞，不改模板、不伪造测试结果，也不在脚本中额外执行测试来替代节点完成标准。以下事实不改变历史 P0 或 M-J 章节的结论。
+
+### 实现与协议取舍
+
+复用 M3 的缺陷、归因、成绩单和回放评测实现，没有增加第七个 Lead 工具。`takt_trace` 增加 `defects`、`why`、`report`、`attribute`、`scorecard`；report 的身份是代表当前绑定人的 Lead agent，原因进入审计。attribute 后台返回，由独立 auditor 生成候选；why 区分候选与人工确认，scorecard 按整个空间的 node/recipe/skill 汇总。
+
+归因确认使用 `takt_ask_human` 原生问题卡片，宿主按当前绑定、候选哈希和租约重新检查后，以 `human`、`via: dsh:user-questions` 调用 M3 确认。原生选择是“确认候选归因 / 修改后确认 / 驳回候选”。core 没有独立驳回状态，因此驳回只记人工审计并保留候选，不写 `confirmed`，也不伪造 `rejected` 状态。归因完成、确认和评测完成接入现有通知器；职责 Agent 追溯关联 M3 `node.recipe`。
+
+技术方案 v2.1 旧章节把配方指纹和归因列为 P2；本次 M-K 简报指定复用已经实现的 M3，以该增量要求接入宿主。保留旧设计记录，未另造归因协议或修改 vendor。`types.ts` 仅增加三个可选字段：`TaktflowService.m3?`、`AgentTrace.recipeKey?`、`AgentTrace.recipeEventSeq?`。旧记录没有 recipe 字段、旧组装没有 m3 服务均保持兼容；服务缺失时执行入口明确不可用，不能表现为成功。
+
+### 本地验证
+
+| 命令或范围 | 本次结果 |
+| --- | --- |
+| `npm run build && npm run typecheck && npm test` | 通过，37 个测试文件、587 项测试；不是模型或业务 e2e 通过数 |
+| 三个 `e2e/defect*.mjs` 的 `node --check` | 通过 |
+| 脚本离线检查 | 18 项：fixture 测试程序正反分支、M3 AC 解析和确定性门禁、候选哈希、回答边界、通知配对及脱敏；另有 4 项真实 core 输入解析检查通过 |
+| 用量完整度修正 | 6 项离线校验通过，包含第二批原始报告回归、缺 auditor 不完整、缺 usage 不完整和原始报告不变 |
+
+既有客户端 CSS 构建警告仍在，本模块未改相关样式。离线正例使用临时实现检验测试驱动，不能计为真实子 Agent 实现或产品验收通过。
+
+### 两批真实结果
+
+执行命令为 `node e2e/defect.mjs`，使用 dsh `0.2.2-rc.1`、隔离 `DSH_HOME` 与真实模型；模型配置仅从进程环境读取。两批都是 20 项验收检查，不是 20 条业务用例。
+
+| 批次 | 账本与耗时 | 真实进展及限制 |
+| --- | --- | --- |
+| 第 1 批 | 5 pass / 1 fail / 14 not-run；23.958 秒；`ok=false` | 安装、会话、Lead init/create 和 fixture 准备通过。core 运行 82 ms，implement 为 blocked，没有子 Agent 会话。原始 node.error 未保留，不能把后续离线复现当作本批错误原文 |
+| 第 2 批 | 5 pass / 1 fail / 14 not-run；238.521 秒；`ok=false` | 四项版本化输入均已读入，implement 实际尝试 2 次；同一 `completion.unmet` 失败后进入 waiting_human，delivery-check 未执行。完整节点错误、完成标准证据和运行事件已保留 |
+
+首批后检查发现 fixture 漏了原样 quick-fix implement 的必需 `inputs/**`。用真实 core `resolveInputs` 离线复现缺输入时的 `BlockedError`，补入本次用户原始需求 `inputs/request.md` 后，`inputs/request.md`、`spec/spec.md` 和两条 `cases/TC-*.json` 均匹配并冻结版本；第二批也从 runDetail 读回了这四个输入。模板、门禁及 vendor 没有修改。
+
+第二批需求为 `REQ-5AABB9011026`，运行为 `run-20261107-110033-5a20`。`runDetail.run.nodes.implement.checks[0]` 的判据是“改动符合验收标准且自测结果有证据”，结果 `pass=false`。证据明确说明：实现已写入且仅做静态验算，未执行测试；当前角色没有 shell 或测试执行工具，要求后续 script 在实现工作树执行 `npm test`。因此不能把代码存在、静态验算或等待后续门禁当成已自测通过。
+
+两批都没有到达交付后缺陷复现、Lead report/attribute、auditor、归因通知、原生归因卡片、human 确认、确认后 why、M3 面板读取及双事件链验收；这些本次均为 **NOT_RUN**。第二批会话中存在一个待回答的 `takt_ask_human` 调用，来自实现节点升级，不能冒充归因确认卡片。两批都已结束并清理本次隔离资源；第二批结果 `cleanupError=null`。
+
+### 用量和证据记录
+
+| 批次 | 已观测输入 token | 已观测输出 token | 覆盖 |
+| --- | --- | --- | --- |
+| 第 1 批 | 18,847 | 217 | 仅 Lead；auditor 未执行 |
+| 第 2 批 | 30,573 | 3,610 | Lead 为 12,775 / 318；两个子会话为 10,982 / 1,701 和 6,816 / 1,591；合计 34,183，auditor 未执行 |
+
+以上只汇总会话 `assistant/message` 中实际观测到的 usage，不换算费用；节点汇总不再重复相加。第二批原始报告的 `metrics.partial=true`，但 `metrics.token.complete=true` 错把已发生会话的完整观测扩展成整条归因流程完整。脚本已修正：既定流程要求 auditor，未执行或未观测该阶段时 complete 必须为 false，并注明 `completionScope`、`auditorRequired` 和 `expectedAuditorExecuted`。
+
+原始 `e2e/out/defect-result-batch1.json`、`defect-result-batch2.json` 保持不变；`defect-result-batch2-reviewed.json` 只更正覆盖元数据，包含 `reviewedAt`、原始报告摘要及 `runtimeReran:false`，没有改运行结论、检查计数或观测 token。没有第三批真实执行。失败诊断现会在清理前保存完整 runDetail 和事件，避免只剩 failed/blocked 状态。
+
+### 对话样例及未验证部分
+
+本批真实 Lead 可读回答只有创建需求后返回的 `REQ-5AABB9011026` 和启动后返回的 `run-20261107-110033-5a20`。尚无真实归因候选或人工确认后的回答，不能提供虚构的归因对话样例。
+
+实现中的工具返回文案示意为“有 auditor 候选归因（尚未人工确认，不能当结论）”与“归因已由人确认（按候选确认）”；这是静态行为示意，**不是真实模型对话或本批通过证据**。工具数量检查也仅标为静态合同校验，不宣称真实会话的完整工具 schema 已核验。浏览器页面、真实 `eval.run`、多源评测归属及失租窗口均未纳入本轮真实通过项；`src/client/**` 留给前端模块。
+
+### 整合请求和已知边界
+
+1. **quick-fix 自测能力与节点顺序**：当前 implement 的完成标准要求实际自测证据，dsh 职责角色默认无 shell，真实测试却在后续 delivery-check。需要模板与宿主共同约定受控测试执行能力，或调整节点依赖使证据在完成判定前可用；不能把静态验算替代运行证据。本次不改 vendor、不放宽门禁，这一缺口阻塞了真实归因闭环的前置交付。
+2. **评测失租收尾写入**：M3 core 的评测报告收尾部分直接使用 `jsonWrite`，没有全部经过宿主包装的 stores。宿主会检查租约、取消并等待收尾，但失租窗口内这些直接文件写入不能由现有 stores 守卫完全拦截。需要 core 提供统一写入守卫或租约感知的收尾协议；不能承诺所有评测收尾写入均已覆盖。
+3. **评测归属**：选中评测用例的 `source.runId` 必须唯一归属一个需求，才能使用其在线绑定 Lead。无来源、来源不存在或跨多个需求会明确拒绝，不广播、不按第一个需求猜归属；目前应按来源需求分开运行。支持多源或无源用例需要明确的需求/Lead 归属协议。
+
+### 给 Claude 的前端注意事项
+
+- 沿用 `/api/taktflow` 的 M3 读操作与 `/api/taktflow.op` 的写操作，数据模型继续使用现有 `defects`、`defect`、`defect.report`、`defect.attribute`、`defect.confirm` 和 `eval.*` 协议。缺服务时展示明确不可用，不当空数据成功。
+- `/api/taktflow.agents` 中 `recipeKey`、`recipeEventSeq` 可选；历史记录没有值时显示未记录，不推导或补造。同一 node/attempt 可有多条执行记录，继续按 sessionId 区分。
+- scorecard 是空间级汇总，可按 node/recipe/skill 及可选 workflowId 筛选，不能标成当前需求专属成绩。空成绩单不能证明无缺陷或已修复；修复验证仍需面板发起回放并查看证据。
+- 只有持久化 `attribution.confirmed` 带 human 确认身份时展示“已人工确认”，同时展示确认人、时间及是否修改；auditor 候选、工具调用接受或通知到达均不等于已确认。
+- 原生“修改后确认”的自定义 JSON 顶层仅允许 `note`、`introducedAt`、`missedBy`、`suggestions`；必须有非空 note 且至少修改一项归因字段。不要额外包一层 attribution，不允许修改确认者、by、时间或置信度。例如 `{"note":"补充边界","suggestions":[{"target":{"kind":"prompt","ref":"design"},"change":"补充负数输入约束"}]}`。
+- 卡片冻结候选哈希；提交前候选变化需重开卡片。驳回只留审计并保留候选；取消、空回答、多选都未确认。归因事件使用独立 `defect-<requirementId>` 事件流，普通 run 审计通过不能替代该流的校验。
+
+## M-K 后续：受控自测与完整归因闭环（第 3–7 批）
+
+状态：**第 7 批真实 dsh + 模型验收 PASS，25/25，退出码 0**。本节承接上节第 1、2 批的历史记录。用户追加受控 `takt_selftest` 后，采用原样 `quick-fix` 的 `tier=T1`，实际执行 spec、implement、review-code、delivery-check；没有删节点、修改模板或放宽门禁。闭环终点是缺陷归因经人工入口确认，示例负数解析缺陷没有修复。
+
+实现和配置见[受控自测说明](controlled-selftest.md)，完整交付与文件清单见[M-K 交付说明](m-k-delivery.md)。最终 `npm run build && npm run typecheck && npm test` 通过，39 个测试文件、665 项测试；随后脚本诊断调整的语法检查也通过。
+
+### 后续批次账本
+
+第 3 批开始的 25 项是在 T1 下增加 PM 产物来源、自测证据、独立评审、正式 gate 和真实工具 schema 检查后的验收分母。上节 T0 的 20 项与本节 25 项不能相加当成业务用例数；每批失败及未执行项均保留。
+
+| 批次 | pass / fail / not-run | 总耗时 | 已观测 token 输入 / 输出 | 结论与修复 |
+| --- | --- | --- | --- | --- |
+| 3 | 8 / 2 / 15 | 201.771 秒 | 57,497 / 6,139 | 四个业务节点真实 succeeded；脚本把 reviewer 的合法 `structured_output` 当成没有回答，gate 检查又被前项连带误报。修复工具调用与结果的配对、内容核对和独立 gate 判定；不是 gate 产品失败 |
+| 4 | 8 / 2 / 15 | 213.528 秒 | 55,561 / 6,546 | 实现自测和评审通过，真实 acceptance 拒绝：spec 要求既有行为回归，但只有新增含税用例。补充原始需求中的四项合法 baseline，由 PM 生成并执行用例；不预置结果、不改 runner、不放宽门禁 |
+| 5 | 13 / 1 / 11 | 214.893 秒 | 66,619 / 6,738 | T1 交付及缺陷录入通过；auditor 已启动但未观测到模型 usage，后续最小 smoke 确认默认外部 CLI 档案的 high effort 被错误映射到 App，触发 `UNSUPPORTED_REASONING_EFFORT`。修复默认继承与失败诊断 |
+| 6 | 13 / 1 / 11 | 246.593 秒 | 63,579 / 8,012 | auditor 真实完成并返回结构化归因，core 规范化时向深冻结对象补 runId 抛 TypeError。普通节点和 M3 两个适配器先 `structuredClone`，再交 core 处理，新增 3 项回归 |
+| 7 | **25 / 0 / 0** | **295.606 秒** | **74,086 / 9,055** | **完整闭环通过**；缺陷为 confirmed，确认人身份和原生卡片来源、双事件链及配方关联均读回核验 |
+
+历史结果分别保留在 `e2e/out/defect-result-batch3.json` 至 `defect-result-batch7.json`，没有改写原始失败账本。第 5 批旧指标把 auditor 记成 null，是按 cwd 猜角色的采集错误：探针已记录该 auditor 的真实角色和父会话，它确实启动、约 40 ms 后失败，只是没有 usage。新采集按真实 probe 的 sessionId、parentSessionId 和角色关联；无 usage 留 null，不称“未执行”，也不补零。
+
+模型映射最小 smoke 的正例用默认外部档案继承 App 设置，13.689 秒完成 attributed，观测输入 6,178 / 输出 462；显式 `dsh-host` high 的负例继续明确失败并保留错误码。这只验证模型选项映射，不替代完整 e2e。错误捕获覆盖原生 `agent/error` 与 `turn/end.reason.error`；子会话尚未产生 assistant 时也保留诊断。
+
+### 第 7 批真实读回
+
+本批从北京时间 2026-11-07 13:03:23.897 至 13:08:19.503，dsh `0.2.2-rc.1`，需求 `REQ-2A2BDEF7033D`，运行 `run-20261107-130349-f14b`。模型、安装及业务执行均发生在隔离 home。
+
+| 环节 | 证据 |
+| --- | --- |
+| 需求与用例 | PM 实际生成 `spec/quick.md` v1 和 6 条用例，覆盖含税计算两项及既有格式化/解析四项；产物来源与 PM 子会话写入相符 |
+| 实现自测 | dev 实际调用 `takt_selftest`，`npm test` 退出 0，`succeeded=true`，6 passed / 0 failed，用时 176 ms；完整 callId 配对，精确 `tasks/selftest-…json@1` 可读，命令及 scripts 指纹相符，自测后没有未测产品修改 |
+| 独立评审 | reviewer 单独会话，1 轮 approve；真实 `structured_output` 调用及成功回执与 `reviews/review-code/r1-round-1.json@1` 的 verdict、summary、issues 一致 |
+| 正式交付 gate | tests 与 acceptance 均 pass，6 条实际结果和逐例证据齐全；gate 发生在独立评审之后 |
+| 缺陷复现和录入 | 交付后的实际 `parsePrice('-¥12.34')` 为 1234，期望 -1234；Lead report 的 actor 为 agent/lead，onBehalfOf 为绑定人，原因审计一致 |
+| auditor 候选 | introducedAt.origin 为 unknown；证据支持缺陷在本轮前已存在，不能归咎本轮 implement。missedBy 为 delivery-check 的覆盖盲区与 review-code 的遗留风险跟踪不足 |
+| 通知与候选回答 | queued=1、admitted=1，target 为 next-turn；消息 ID 配对后 Lead 自然调用 why，明确“auditor 候选、尚未人工确认”，未靠额外候选查询消息唤醒 |
+| 原生确认 | 通过 Remote Event RPC 模拟人在原生卡片选择“确认候选归因”；候选哈希一致，落盘 `confirmed.by.type=human`、`via=dsh:user-questions`、`edited=false`，绑定人一致 |
+| 确认后 why | Lead 明确已人工确认、引入来源未知，并引用实际 evidence/summary.json v1 的证据原文；真实回答摘录见交付说明 |
+| 面板与审计 | defects 返回 1 条 confirmed；空间级 scorecards 返回 4 项；业务 run 的面板 audit 与独立 defect-REQ 事件流的 core verify 均 ok |
+| 实际工具 schema | Lead 仍有六个 takt 工具且没有 selftest；dev 有 selftest，readonly reviewer/auditor 没有。由存活 Agent 的真实 schemas 观察，不以调用子集代替完整工具清单 |
+| 清理 | 本次宿主、卡片辅助进程和隔离 home 已清理，`cleanupError=null`；用户个人 profile 未动 |
+
+四条流程职责 trace 与同一运行的 `node.recipe` 逐项对应，核对了节点、角色、recipeKey 和事件序号；auditor 是独立 M3 子会话，不冒充第五个普通流程节点。
+
+| 节点 / 角色 | recipeKey | recipeEventSeq |
+| --- | --- | --- |
+| spec / pm | `9ec19e996fad0b7a` | 6 |
+| implement / dev | `7504878228dfb017` | 23 |
+| review-code / reviewer | `9a9e26b199620677` | 37 |
+| delivery-check / verifier | `e688a09610e6a72d` | 50 |
+
+最终 metrics 观测到 Lead 输入 19,590 / 输出 1,370；五个子会话（PM、dev、reviewer、verifier、auditor）均有 usage，合计最终输入 74,086 / 输出 9,055。使用结果文件最终 metrics，不把较早检查快照再次相加，也不把节点估算用量重复加到会话用量；不换算费用。token 覆盖完整不等于业务成功：第 6 批可观测到全部已发生会话 usage，业务仍是 FAIL；第 7 批业务成功由独立的 25 项证据判定。
+
+### 本轮形成的验证口径
+
+- 实现自测与正式 gate 分开取证。fixture runner 在 `TAKT_SELFTEST=1` 时真实执行全部动态用例，只向 stdout 输出结果；正式 gate 才写公共 evidence。宿主自测证据保存在允许的 tasks 路径，不能拿 gate 后来的 summary 冒充早先自测。
+- T1 只预置原始需求和 runner 输入合同，spec/cases 由真实 PM 生成。四项既有行为 baseline 明确来自初始代码：正/负金额格式化、正金额/零金额解析；不声称负数解析正确。
+- 原生结构化回答以 `structured_output` 参数和对应成功结果为准，同时与精确产物内容核对；没有 assistant 纯文本不代表没有模型回答。
+- 归因候选与人工确认必须读回持久化状态。示例旧缺陷的引入来源保持 unknown；“六项验收通过”没有扩展成所有解析行为正确，也没有被当成缺陷修复证明。
+- 清理前保留所有本批子会话的错误、终态、结构化提交及无 usage 记录。宿主输出只在内存收集，stdout/stderr 各自完整合并、脱敏后再截尾，避免跨 chunk 的凭证泄露；不写 raw 日志文件。
+
+### 仍然保留的边界
+
+受控命令和项目测试代码在 worktree 运行，沿用 script 的信任边界；文件写入由 core `WriteGuard` 执行后检查，没有 OS 级隔离，未开放通用 bash 工具。命令准入、脚本基线、过滤和超时详见[自测配置说明](controlled-selftest.md)。
+
+core 评测收尾的直接 `jsonWrite` 仍不能完全由宿主 stores 失租守卫覆盖；多源或无来源评测用例仍需明确需求/Lead 归属协议。真实 `eval.run`、新版 standard 全链和前端页面不在本次通过范围。缺陷状态 confirmed 表示归因经人工入口确认，示例 parsePrice 负号缺陷仍待另立修复需求及回放验收。

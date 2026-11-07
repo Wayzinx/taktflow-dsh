@@ -201,6 +201,18 @@ export interface SubagentResult {
   readonly stopReason: string
 }
 
+/**
+ * 来源：@deepseek-ai/dsh-agent@0.2.1-rc.3/lib/types/runtime-types.d.ts:402-407；
+ * 桌面随附 dsh-agent-loop 的 agent/error 与官方 API 目录保持同形。
+ * 失败可能发生在 turn 建立前，因此不能只读会话 turn/end。
+ */
+export interface AgentErrorEvent {
+  readonly agent: Agent
+  readonly turn: number
+  readonly step: number
+  readonly error: unknown
+}
+
 /** 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/types/index.d.ts:216-241。 */
 export interface ToolExecutionInput {
   readonly callId: string

@@ -8,7 +8,7 @@ import { TaktToolError, type RolePresetHandle, type RolePresets, type SpaceHandl
 /** Lead preset 的固定 id；cordis.patch.yml 与客户端选择器共用。 */
 export const LEAD_PRESET_ID = 'taktflow'
 
-type Variant = { readOnly: boolean; allowBash: boolean }
+type Variant = { readOnly: boolean; allowBash: boolean; writeScope?: string[] }
 type Registry = HostContext['agentPresets']
 interface Entry { references: number; dispose?: AgentPresetDisposer }
 interface SharedState { entries: Map<string, Entry>; tail: Promise<void> }
@@ -96,6 +96,9 @@ export class DshRolePresets implements RolePresets {
       throw new TaktToolError('TAKT_FORBIDDEN_FOR_LEAD', `空间没有可用的角色档案：${role}`)
     }
     if (profile.allowBash) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `P0 角色 ${role} 的 allowBash 必须为 false`)
+    // M-K：preset 按本次实际生效范围决定是否挂受控自测；只读或空范围不挂。
+    const effectiveWriteScope = [...(variant.writeScope ?? profile.writeScope)]
+    const selftest = !variant.readOnly && effectiveWriteScope.length > 0
     const declared = [...new Set(profile.skills)]
     const roleSkills = this.skills?.[role] ?? []
     // 生产必须带运行开始时的冻结快照；缺任何声明技能都明确失败，不能退化成只写 prompt。
@@ -125,7 +128,7 @@ export class DshRolePresets implements RolePresets {
       { id: 'taktflow-role', name: 'taktflow/role', config: {
         role, spaceRoot: space.root, title: profile.title, description: profile.description,
         instructions: profile.instructions, skills: this.skills === undefined ? declared : registeredSkills,
-        readOnly: variant.readOnly,
+        readOnly: variant.readOnly, writeScope: effectiveWriteScope, selftest,
         ...(this.skills === undefined ? {} : {
           skillSnapshot: roleSkills.map((skill) => ({
             name: skill.name, description: skill.description, content: skill.content, path: skill.path,

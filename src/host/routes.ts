@@ -168,6 +168,8 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
   const core = (config.createCore ?? createApiCore)({
     withWriteLease,
     catalog: routesCatalog(service),
+    // M-K：把评测/归因命令注册表接到 api-core；没有 m3 的旧服务保持 501。
+    ...(service.m3 === undefined ? {} : { getCommands: (stores: ProjectStores) => service.m3!.getCommands(stores) }),
   })
   const active = new Set<ActiveStream>()
   // 宿主卸载信号：让还在读取空间/运行的 SSE 请求也能立刻结束，而不是挂在磁盘 IO 上。

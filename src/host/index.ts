@@ -4,6 +4,7 @@ import { BUNDLED_ROLE_NAMES } from '../roles/defaults.js'
 import type { HostContext } from './dsh-types.js'
 import { PlaceholderApprovals } from './approvals.js'
 import { createLeadServices, type LeadServices } from './lead/services.js'
+import { createM3Service } from './m3.js'
 import { PlaceholderNotifier } from './notify.js'
 import { FsOwnership } from './ownership.js'
 import { PlaceholderBindings } from './bindings.js'
@@ -11,6 +12,7 @@ import { InMemoryPermissionRegistry, createWriteGuard } from './permissions.js'
 import { DshRolePresets } from './presets.js'
 import { DshRunManager, type RunManagerDeps } from './runs.js'
 import { registerRoutes, type RoutesCatalog } from './routes.js'
+import { InMemorySelftestService } from './selftest.js'
 import { FsSpaceRegistry } from './space.js'
 import { createWorkflowCatalog } from '../workflows/index.js'
 import type { Autonomy, Notifier, RoleHarness, SpaceHandle, SpaceRegistry, TaktflowService, WorkflowCatalog } from './types.js'
@@ -51,11 +53,13 @@ export interface ServiceDeps {
 export function createService(config: Config = {}, ctx?: HostContext, deps: ServiceDeps = {}): TaktflowService & { catalog: RoutesCatalog } {
   const registry = new FsSpaceRegistry({ spaces: config.spaces })
   let runs: DshRunManager
-  const ownership = new FsOwnership({ ctx, onLeaseLost: (space) => runs.cancelOwnedSpace(space) })
+  let m3: ReturnType<typeof createM3Service> | undefined
+  const ownership = new FsOwnership({ ctx, onLeaseLost: async (space) => { await Promise.all([runs.cancelOwnedSpace(space), m3?.cancelSpace(space)]) } })
   const permissions = new InMemoryPermissionRegistry()
   const presets = new DshRolePresets(ctx)
+  const selftests = new InMemorySelftestService({ permissions, ownership, agents: ctx?.agents })
   const workflows = deps.workflows ?? createWorkflowCatalog(registry)
-  runs = new DshRunManager({ ...deps, config, ctx, spaces: registry, ownership, permissions, presets, workflows })
+  runs = new DshRunManager({ ...deps, config, ctx, spaces: registry, ownership, permissions, presets, workflows, selftests })
   const lead: LeadServices = ctx
     ? createLeadServices({
         spaces: registry,
@@ -65,11 +69,33 @@ export function createService(config: Config = {}, ctx?: HostContext, deps: Serv
         config,
       })
     : { bindings: new PlaceholderBindings(), approvals: new PlaceholderApprovals(), notifier: new PlaceholderNotifier() }
+  // M-K：评测/归因运行时与命令注册表；没有 ctx 时保持缺失，面板明确 501。
+  m3 = ctx
+    ? createM3Service({
+        ctx,
+        spaces: registry,
+        ownership,
+        presets,
+        permissions,
+        bindings: lead.bindings,
+      })
+    : undefined
   // 自主代答与升级通知在 Lead 层创建后才能用；运行启动前接线，后续 drive 读最新实例。
   runs.setCollaborators({ approvals: lead.approvals, notifier: lead.notifier })
   const spaces = ctx ? attachOnOpen(registry, lead.notifier) : registry
   const catalog = createRuntimeCatalog(ctx)
-  return { spaces, ownership, runs, permissions, presets, workflows, ...lead, catalog }
+  return {
+    spaces,
+    ownership,
+    runs,
+    permissions,
+    presets,
+    workflows,
+    selftests,
+    ...lead,
+    ...(m3 === undefined ? {} : { m3 }),
+    catalog,
+  }
 }
 
 /**
@@ -180,7 +206,10 @@ export function apply(ctx: HostContext, config: Config = {}): void {
     registerRoutes(ctx, service, config)
     ctx.tools.guard(createWriteGuard(service.permissions))
     return async () => {
-      await service.runs.disposeAll()
+      // 同时停止入场和进程，再等待引擎收尾；不能先等可能正等待工具的 Agent。
+      const stopped = await Promise.allSettled([service.selftests?.dispose(), service.runs.disposeAll(), service.m3?.dispose()])
+      const failures = stopped.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      if (failures.length) throw new AggregateError(failures.map((result) => result.reason), '宿主执行清理失败，保留租约')
       for (const root of await service.spaces.roots()) {
         await service.notifier.detach(await service.spaces.open(root)).catch(() => undefined)
       }

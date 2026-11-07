@@ -1,5 +1,6 @@
 import type { HostContext, SystemPromptSection } from '../dsh-types.js'
 import { createRoleSkillTool, roleSkillRegistration, type RoleSkillSnapshot } from '../role-skills.js'
+import { createSelftestTool } from './selftest.js'
 import type { TaktflowService } from '../types.js'
 
 export const name = 'taktflow/role'
@@ -22,6 +23,10 @@ export interface RoleConfig {
   skills?: string[]
   /** 运行开始时冻结的角色技能；提供时按内容注册，并挂载角色局部 skill 工具。 */
   skillSnapshot?: RoleSkillSnapshot[]
+  /** M-K 增量：本次节点实际生效的写入范围；空数组表示只读。 */
+  writeScope?: string[]
+  /** M-K 增量：是否挂载受控自测工具；只读或无写入范围时由 preset 置 false。 */
+  selftest?: boolean
   readOnly?: boolean
 }
 
@@ -41,8 +46,8 @@ export const ROLE_PROMPT_SECTION: SystemPromptSection = {
     '- 只在当前工作目录内工作；代码写入范围以宿主提供的 writeScope 为准，越界会被引擎判为违规。',
     '- 公共产物只能写到宿主登记的当前需求产物目录；不要创建其它需求目录或第二份产物。',
     '- 不要修改 `.takt/runs/`、`.takt/attention.jsonl` 等宿主状态。',
-    '- P0 所有角色都没有 shell；不要尝试执行命令，测试由流程里的 script 节点执行。',
-    '- 只读模式（readOnly）下不要修改任何文件。',
+    '- 不要使用 bash 或任意 shell；只有宿主挂载了受控自测工具时，才能用它执行当前节点冻结的测试命令。',
+    '- 只读模式（readOnly）下不要修改任何文件，也不要执行命令。',
     '- 写入范围是 glob 白名单；不在白名单内的文件即使存在也不要改。',
     '- 结果用结构化 JSON 时，字段名与节点 resultSchema 对齐；失败时给出可执行的下一步。',
     '- 无法完成时明确返回 blocked 和原因，不要伪造成功。',
@@ -56,12 +61,16 @@ export const ROLE_PROMPT_SECTION: SystemPromptSection = {
  * 失败语义：重复注册同名段/技能会抛错，由 preset 注册失败暴露。
  */
 export function apply(ctx: RoleContext, config: RoleConfig = {}): void {
+  const selftest = config.selftest === true && config.readOnly !== true && (config.writeScope?.length ?? 0) > 0 && config.role !== 'lead'
   const snapshots = config.skillSnapshot ?? []
   const skillNames = snapshots.length > 0 ? snapshots.map((skill) => skill.name) : config.skills ?? []
   const detail = [
     config.role === undefined ? '' : `当前角色：${config.title ?? config.role}（${config.role}）`,
     config.spaceRoot === undefined ? '' : `空间根：${config.spaceRoot}`,
     config.readOnly === undefined ? '' : `本次权限：${config.readOnly ? '只读' : '仅可写宿主登记的范围'}`,
+    selftest
+      ? '本角色挂载了 takt_selftest：完成前必须调用它，并根据真实 exitCode 与输出写完成说明；非 0、超时或取消都不得写成通过。无适用测试入口时如实记录未执行，按本节点完成标准判断；要求自测证据的实现节点不能放行。'
+      : '当前角色没有受控自测工具；不要执行任何命令，流程级测试由 script/自动化节点负责。',
     config.description ?? '', config.instructions ?? '',
     skillNames.length ? `此角色声明的技能：${skillNames.join('、')}。只可使用 skill 工具实际返回的当前角色技能。` : '',
   ].filter(Boolean).join('\n\n')
@@ -76,4 +85,8 @@ export function apply(ctx: RoleContext, config: RoleConfig = {}): void {
   }
   // 无论快照是否为空都挂局部同名工具：空快照明确拒绝全部，不能继承全局 skill 工具/目录。
   ctx.effect(() => ctx.tools.register(createRoleSkillTool(snapshots)), 'taktflow role skill tool')
+  // 只读角色、无写入范围角色和 Lead 都没有该工具；service 缺失时工具仍明确拒绝。
+  if (selftest) {
+    ctx.effect(() => ctx.tools.register(createSelftestTool(ctx.taktflow.selftests)), 'taktflow role selftest tool')
+  }
 }

@@ -571,3 +571,16 @@ describe('AgentTraceHub：同一节点尝试的多次执行', () => {
     expect((await traces.read(space, 'run-1')).map((trace) => trace.sessionId)).toEqual(['child-1', 'child/with/slash'])
   })
 })
+
+describe('M3 配方追溯落盘',()=>{
+  it('配方字段重启后读回，旧记录仍兼容，非法seq记录不会混入列表',async()=>{
+    const space=await makeSpace(),traces=hub()
+    const handle=await traces.begin(space,start({recipeKey:'recipe-key',recipeEventSeq:12}));await handle.dispose()
+    expect((await hub().read(space,'run-1'))[0]).toMatchObject({recipeKey:'recipe-key',recipeEventSeq:12})
+    const file=agentTraceFile(space,'run-1','design',1),record=await readRecord(space,'run-1','design',1)
+    await writeFile(file,JSON.stringify({...record,recipeEventSeq:0}))
+    expect(await hub().read(space,'run-1')).toEqual([])
+    delete record.recipeKey;delete record.recipeEventSeq
+    await writeFile(file,JSON.stringify(record));expect(await hub().read(space,'run-1')).toHaveLength(1)
+  })
+})

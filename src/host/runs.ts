@@ -6,6 +6,7 @@ import { autonomyStep, nodeKindOf } from './autonomy.js'
 import { beginAutonomyAnswer } from './autonomy-state.js'
 import type { HostContext } from './dsh-types.js'
 import { createDshHarness, type DshHarness } from './dsh-harness.js'
+import type { SelftestService } from './selftest.js'
 import { assertRuntimeIdentity, loadRunRuntime, prepareRunArgs, recordRuntimeIdentity, repoBindingsForRun, type RunRuntime } from './run-runtime.js'
 import { TaktToolError, type Approvals, type Autonomy, type EndReason, type Notifier, type Ownership, type PermissionRegistry, type RoleHarness, type RolePresets, type RunManager, type RunOwnerMeta, type SpaceHandle, type SpaceRegistry, type StartRunInput, type WorkflowCatalog } from './types.js'
 
@@ -23,6 +24,8 @@ export interface RunManagerDeps {
   harnessFactory?: typeof createDshHarness
   /** 子 Agent 追溯中心；缺失时保持原执行语义，不写追溯文件。 */
   traces?: AgentTraceHub
+  /** M-K：受控自测服务；缺失时角色工具执行明确拒绝。 */
+  selftests?: SelftestService
   log?: (message: string) => void
   /** Lead 层创建后由 index 注入；缺失时自主代答与升级通知停用。 */
   approvals?: Approvals
@@ -274,6 +277,8 @@ export class DshRunManager implements RunManager {
       ctx, space: runtime.space, presets, permissions: this.deps.permissions,
       ownership: this.deps.ownership, ownerSessionId: meta.ownerSessionId, profiles: runtime.profiles,
       profileSources: runtime.profileSources, roleSkills: runtime.roleSkills, traces: this.traces,
+      ...(this.deps.selftests === undefined ? {} : { selftests: this.deps.selftests }),
+      workflow: runtime.workflow,
       onLeadOffline: async (nodeRef) => this.leadOffline(managed, nodeRef),
       onPreset: async (role, preset, nodeRef) => {
         if (!managed.runId) throw new Error('运行归属尚未发布')
