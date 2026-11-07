@@ -46,6 +46,6 @@ export async function buildClient(options = {}) {
   // web 页面 import 的样式由 esbuild 合并成一份；面板自己的样式排在最后。
   const bundledCss = result.outputFiles.find((file) => file.path.endsWith('.css'))?.text ?? ''
   const panelCss = await readFile(path.join(packageRoot, 'src/client/styles.css'), 'utf8')
-  const css = transformCss(`${bundledCss}\n${panelCss}`)
+  const css = transformCss(`${bundledCss}\n${panelCss}`, { container: 'takt' })
   return { wrapped: wrapClientBundle(code, css), css, metafile: result.metafile }
 }

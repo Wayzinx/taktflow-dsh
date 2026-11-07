@@ -42,7 +42,7 @@ describe('taktflow/lead 行', () => {
     expect(LEAD_SKILL.content).toContain('同一回合继续 `takt_run start`')
   })
 
-  it('apply 注册一段提示词、一个 skill 和六个工具，dispose 后移除', async () => {
+  it('apply 注册一段提示词、一个 skill 和七个工具，dispose 后移除', async () => {
     const ctx = contextWithService()
     applyLead(ctx as unknown as LeadContext, { defineTool: defineToolStub })
 
@@ -130,7 +130,7 @@ describe('taktflow/lead 行', () => {
     await expect(ctx.dispose()).rejects.toThrow('第二个工具卸载失败')
   })
 
-  it('Lead 工具清单是准确的 6 个，且不暴露审批回答', () => {
+  it('Lead 工具清单是准确的 7 个，且不暴露审批回答', () => {
     expect(LEAD_TOOL_NAMES).toEqual([
       'takt_status',
       'takt_requirement',
@@ -138,6 +138,7 @@ describe('taktflow/lead 行', () => {
       'takt_run',
       'takt_trace',
       'takt_ask_human',
+      'takt_config',
     ])
     expect(LEAD_TOOL_NAMES).not.toContain('taktflow_approval_answer')
   })

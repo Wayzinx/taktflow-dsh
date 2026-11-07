@@ -51,6 +51,17 @@ describe('FsOwnership 租约', () => {
     expect(error.reason.message).toContain(lease.acquiredAt)
     expect(error.reason.hint).toContain('在对方处操作')
   })
+  it('本机旧宿主进程已不存在（App 崩溃后重开）时自动接管；进程还在的同机租约不抢', async () => {
+    const write = (pid: number) => writeFile(path.join(space.stores.taktDir, 'lease.json'), JSON.stringify({
+      owner: 'dsh:crashed', pid, host: hostname(), acquiredAt: '2026-01-01T00:00:00.000Z', heartbeatAt: '2026-01-01T00:00:00.000Z', ttlMs: 100,
+    }))
+    await write(process.ppid)
+    await expect(own().ensureLease(space)).rejects.toMatchObject({ code: 'TAKT_LEASE_HELD' })
+    await write(4_194_303)
+    await own('second').ensureLease(space)
+    expect((await readLease(space.stores.taktDir))?.owner).toBe('dsh:second')
+  })
+
   it('stale 不自动接管，人工 takeover 只允许失效的外部租约', async () => {
     const ownership = own()
     await expect(ownership.takeover(space, actor)).rejects.toMatchObject({ code: 'TAKT_LEASE_HELD' })

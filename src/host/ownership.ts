@@ -36,7 +36,10 @@ export class FsOwnership implements Ownership {
     this.hostOwner = `dsh:${options.hostId ?? `${hostname()}:${process.pid}`}`
   }
 
-  /** 写入口调用；过期的外部租约仍需人明确接管，不自动抢占。 */
+  /**
+   * 写入口调用。过期的外部租约：本机上旧宿主进程已确认不存在（ESRCH）时自动接管——典型是 App
+   * 崩溃或被强制退出后重开；其它情况（跨机器只能看心跳超时）仍需人明确接管，不自动抢占。
+   */
   async ensureLease(space: SpaceHandle): Promise<void> {
     await this.serial(space, async () => {
       await this.checkLeasePath(space)
@@ -45,7 +48,11 @@ export class FsOwnership implements Ownership {
         await renewLease(space.stores.taktDir, this.hostOwner)
       } else {
         const acquired = await acquireLease(space.stores.taktDir, this.hostOwner)
-        if (!acquired.ok) throw heldError(acquired.held, acquired.stale)
+        if (!acquired.ok) {
+          if (!acquired.stale || !deadLocalHost(acquired.held)) throw heldError(acquired.held, acquired.stale)
+          await this.takeoverLocked(space)
+          return
+        }
       }
       this.spaces.set(space.root, space)
       this.startHeartbeat(space)
@@ -89,7 +96,12 @@ export class FsOwnership implements Ownership {
 
   /** 人确认接管后调用；只接管失效的其他宿主，并完整关闭其遗留 running 运行。 */
   async takeover(space: SpaceHandle, _by: Actor): Promise<void> {
-    await this.serial(space, async () => {
+    await this.serial(space, () => this.takeoverLocked(space))
+  }
+
+  /** 接管主体：调用方已在 serial 队列里。 */
+  private async takeoverLocked(space: SpaceHandle): Promise<void> {
+    {
       await this.checkLeasePath(space)
       const previous = await readLease(space.stores.taktDir)
       if (previous?.owner === this.hostOwner && previous.host === hostname()) {
@@ -115,7 +127,7 @@ export class FsOwnership implements Ownership {
         await this.setEndReason(space, run.runId, { reason: 'host_lost', at: new Date().toISOString() })
       }
       await this.repairAbandonedRuns(space)
-    })
+    }
   }
 
   /** 只补偿已经人工标记的外部 running；不据此接管新租约或改动 waiting_human。 */
@@ -259,6 +271,14 @@ export class FsOwnership implements Ownership {
 /** 旧骨架的兼容入口；新接线直接使用 FsOwnership。 */
 export class PlaceholderOwnership extends FsOwnership {
   constructor(hostId?: string) { super({ hostId }) }
+}
+
+/** 租约来自本机且那个进程已不存在（ESRCH）：可以确定旧宿主没了。 */
+function deadLocalHost(lease: Lease): boolean {
+  if (lease.host !== hostname()) return false
+  try { process.kill(lease.pid, 0); return false } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
+  }
 }
 
 // 和 core 一样：同机仅 ESRCH 证明旧进程消失；最终竞争仍由 core 锁内检查裁定。

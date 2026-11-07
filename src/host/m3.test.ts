@@ -296,12 +296,12 @@ describe('面板M3路由真实接线',()=>{
   })
 })
 
-describe('六个Lead工具的M3闭环',()=>{
+describe('Lead工具的M3闭环',()=>{
   it('report/attribute/why/defects/scorecard真实接线，并把人工修改错误映射为可理解的参数错误',async()=>{
     const f=await fixture()
     const service={m3:f.service,bindings:f.bindings,spaces:{forSession:async()=>f.space}} as unknown as TaktflowService
     const tools=registerLeadTools(((options)=>options as unknown as ToolDefinition) as DefineTool,service,{ctx:{agents:f.ctx.agents},user:'different-config-user'})
-    expect(tools).toHaveLength(6)
+    expect(tools).toHaveLength(7)
     const call=async(name:string,args:Record<string,unknown>)=>await tools.find(t=>t.name===name)!.execute(args,f.exec) as LeadToolResult
     expect(await call('takt_trace',{action:'defects'})).toMatchObject({ok:true,count:0})
     const reported=await call('takt_trace',{action:'report',title:'线上边界bug',description:'输入为空出错',severity:'major',reason:'用户报告',author:{type:'human',id:'forged'}})

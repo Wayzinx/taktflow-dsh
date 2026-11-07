@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -113,23 +113,39 @@ describe('FsSpaceRegistry', () => {
     expect(viaLink).toBe(viaRoot)
   })
 
-  it('配置多个不同根时拒绝', async () => {
+  it('可以配置多个根，roots 按配置顺序返回', async () => {
     const first = await makeSpace()
     const second = await makeSpace()
-    const registry = new FsSpaceRegistry({ spaces: [first, second] })
+    const registry = new FsSpaceRegistry({ spaces: [first, second, first] })
 
-    expect(await errorCode(registry.roots())).toBe('TAKT_SPACE_ROOT_MISMATCH')
-    expect(await errorCode(registry.open(first))).toBe('TAKT_SPACE_ROOT_MISMATCH')
+    expect(await registry.roots()).toEqual([first, second])
+    expect((await registry.open(second)).root).toBe(second)
   })
 
-  it('未配置 spaces 时也不能先后打开两个不同根', async () => {
+  it('未配置 spaces 时可以先后打开多个空间，各自独立', async () => {
     const first = await makeSpace()
     const second = await makeSpace()
     const registry = new FsSpaceRegistry()
 
-    expect((await registry.open(first)).root).toBe(first)
-    expect(await errorCode(registry.open(second))).toBe('TAKT_SPACE_ROOT_MISMATCH')
-    expect(await registry.roots()).toEqual([first])
+    const a = await registry.open(first)
+    const b = await registry.open(second)
+    expect(a.root).toBe(first)
+    expect(b.root).toBe(second)
+    expect(a.stores).not.toBe(b.stores)
+    expect(await registry.roots()).toEqual([first, second])
+    expect((await registry.forSession(second)).root).toBe(second)
+  })
+
+  it('空间不能嵌套：已打开空间里的子目录空间和包含它的父目录都拒绝', async () => {
+    const outer = await makeSpace()
+    const inner = path.join(outer, 'nested')
+    await mkdir(inner)
+    await writeFile(path.join(inner, 'takt.config.json'), JSON.stringify({ project: { name: 'inner' }, workflows: [] }))
+    const registry = new FsSpaceRegistry()
+
+    await registry.open(outer)
+    expect(await errorCode(registry.open(inner))).toBe('TAKT_SPACE_ROOT_MISMATCH')
+    expect(await errorCode(registry.forSession(inner))).toBe('TAKT_SPACE_ROOT_MISMATCH')
   })
 
   it('配置了根时 open 拒绝配置外的根', async () => {
@@ -149,17 +165,14 @@ describe('FsSpaceRegistry', () => {
     expect(await registry.roots()).toEqual([root])
   })
 
-  it('未配置时异根并发只有一个成功，失败不占用根', async () => {
+  it('未配置时异根并发都能打开', async () => {
     const first = await makeSpace()
     const second = await makeSpace()
     const registry = new FsSpaceRegistry()
 
-    const results = await Promise.allSettled([registry.open(first), registry.open(second)])
-    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
-    const rejected = results.find((result) => result.status === 'rejected')
-    expect(rejected?.status).toBe('rejected')
-    if (rejected?.status === 'rejected') expect(rejected.reason).toBeInstanceOf(TaktToolError)
-    expect(await registry.roots()).toHaveLength(1)
+    const results = await Promise.all([registry.open(first), registry.open(second)])
+    expect(results.map((item) => item.root).sort()).toEqual([first, second].sort())
+    expect(await registry.roots()).toHaveLength(2)
   })
 
   it('打开失败后可以重试另一个根', async () => {

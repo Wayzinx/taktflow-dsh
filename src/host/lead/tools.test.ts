@@ -309,7 +309,7 @@ async function seedAttention(
 }
 
 describe('registerLeadTools', () => {
-  it('按固定顺序注册 6 个工具，描述含使用时机和示例', async () => {
+  it('按固定顺序注册 7 个工具，描述含使用时机和示例', async () => {
     const h = await makeHarness()
     expect([...h.tools.keys()]).toEqual([...LEAD_TOOL_NAMES])
     for (const tool of h.tools.values()) {

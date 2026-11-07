@@ -7,6 +7,8 @@
  * - 选择器列表按顶层逗号拆分（括号/引号里的逗号不拆）
  * - 嵌套 `@media` / `@supports` / `@layer` / `@container` / `@scope`
  * - `@keyframes` 名字加前缀，并重写 `animation` / `animation-name` 引用
+ * - 可选 `container`：只含宽度条件的 `@media` 改写成 `@container <name>`。嵌入 dsh 时面板比窗口窄
+ *   （左侧还有 App 的侧栏），按视口算的断点永远不触发；改成按嵌入根（size 容器）的宽度算。
  */
 
 const NESTED_AT_RULES = new Set([
@@ -22,9 +24,19 @@ const NESTED_AT_RULES = new Set([
 export function transformCss(css, options = {}) {
   const scope = options.scope ?? '.takt-root'
   const prefix = options.prefix ?? 'takt-'
+  const container = options.container
   const renamed = new Map()
   for (const name of collectKeyframeNames(css)) renamed.set(name, prefix + name)
-  return processRules(css, { scope, prefix, renamed })
+  return processRules(css, { scope, prefix, renamed, container })
+}
+
+const WIDTH_FEATURE = String.raw`\(\s*(?:max|min)-width\s*:\s*[\d.]+(?:px|rem|em)\s*\)`
+const WIDTH_ONLY_MEDIA = new RegExp(`^${WIDTH_FEATURE}(?:\\s+and\\s+${WIDTH_FEATURE})*$`, 'i')
+
+/** `@media (max-width: 900px)` → `@container takt (max-width: 900px)`；带其它条件（hover、prefers-*、媒体类型）的保持原样。 */
+export function mediaToContainer(condition, container) {
+  const value = condition.trim()
+  return WIDTH_ONLY_MEDIA.test(value) ? `@container ${container} ${value}` : undefined
 }
 
 export function collectKeyframeNames(css) {
@@ -98,7 +110,9 @@ function transformAtRule(prelude, body, state) {
   }
 
   if (NESTED_AT_RULES.has(name)) {
-    return `${prelude}{${processRules(body, state)}}`
+    const rewritten = name === 'media' && state.container !== undefined ? mediaToContainer(rest, state.container) : undefined
+    const head = rewritten === undefined ? prelude : rewritten + /\s*$/.exec(prelude)[0]
+    return `${head}{${processRules(body, state)}}`
   }
 
   // @font-face / @page / @property 等：内部是声明或不可作用域化的内容，原样保留。

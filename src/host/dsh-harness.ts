@@ -9,6 +9,7 @@ import type { RoleSkillSnapshots } from './role-skills.js'
 import type { SelftestRegistration, SelftestService } from './selftest.js'
 import { supportsDshOutputSchema } from './dsh-schema.js'
 import { TaktToolError, type Ownership, type PermissionRegistry, type RolePresetHandle, type RolePresets, type SpaceHandle } from './types.js'
+import { dshModelOption } from './lead-ask.js'
 
 export interface DshHarnessDeps {
   ctx: HostContext
@@ -278,6 +279,8 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
           }) as (...args: never[]) => void
           unsubscribeSession = ctx.on('session/event', listener)
         }
+        // 角色档案选了 App 里的模型（<provider>/<model>）时用它；模板里的别名等其它写法跟随 App 当前模型。
+        const modelOption = await dshModelOption(ctx, req.model)
         while (activation === undefined) {
           signal.throwIfAborted()
           const parent = await requireParent()
@@ -287,7 +290,8 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
               request: {
                 prompt: [{ type: 'text', text: prompt }], agentPreset: preset.id,
                 ...(outputSchema === undefined ? {} : { outputSchema }), parent, cwd: requestedCwd,
-                // 不传 agentOptions：dsh 子 Agent 使用 App 模型，req.model/effort 不能谎报为实际模型。
+                // 只在角色明确选了 App 模型时传 agentOptions；否则子 Agent 用 App 模型，req.model 不能谎报为实际模型。
+                ...(modelOption === undefined ? {} : { agentOptions: modelOption }),
               },
             })
           } catch (error) {

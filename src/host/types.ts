@@ -78,15 +78,18 @@ export interface SpaceHandle {
  * symlink 在 realpath 后去重。open 串行化，失败不绑定根，可重试。
  *
  * - open(root)：root 目录必须直接包含 takt.config.json，否则 TAKT_NO_SPACE；
- *   配置了 spaces 时只接受该根，第二个不同根抛 TAKT_SPACE_ROOT_MISMATCH。
+ *   配置了 spaces 时只接受这些根，其它根和互相嵌套的根抛 TAKT_SPACE_ROOT_MISMATCH。
  * - forSession(cwd)：cwd 必须正好是空间根；子目录抛 ROOT_MISMATCH，空间外抛
  *   NO_SPACE。不隐式创建空间，也不接受 core.openProject 的向上查找结果。
- * - roots()：已解析的 realpath 根列表，P0 最多一个；未配置且尚未 open 时为 []。
+ * - roots()：已解析的 realpath 根列表（多空间，设计 21）：配置的根在前，然后是运行中打开过的根。
+ * - assertOpenable(root)（增量，可选）：init 写盘前确认这个根将来能打开（在配置的 spaces 里、
+ *   不与已打开空间嵌套），不能时抛 ROOT_MISMATCH。
  */
 export interface SpaceRegistry {
   open(root: string): Promise<SpaceHandle>
   forSession(cwd: string | undefined): Promise<SpaceHandle>
   roots(): Promise<string[]>
+  assertOpenable?(root: string): Promise<void>
 }
 
 /**

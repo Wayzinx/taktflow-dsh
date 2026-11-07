@@ -24,6 +24,8 @@ import {
   type WriteOp,
 } from '@taktflow/server'
 import { VERSION } from '../version.js'
+import { BUNDLED_AGENT_FILES, BUNDLED_WORKFLOW_FILES } from '../templates/bundled.js'
+import { askLead, hostModels } from './lead-ask.js'
 import { agentTraceHubFor, type AgentTraceReader } from './agent-trace.js'
 import { ApprovalInputError } from './approvals.js'
 import type { HostContext } from './dsh-types.js'
@@ -67,7 +69,7 @@ export interface RoutesConfig {
 }
 
 /** 插件自己的写操作：字段平铺在 POST body 里。 */
-export const PLUGIN_WRITE_OPS = ['attention.answer', 'run.start', 'run.cancel', 'lease.release'] as const
+export const PLUGIN_WRITE_OPS = ['attention.answer', 'run.start', 'run.cancel', 'lease.release', 'lead.ask'] as const
 
 /**
  * api-core 的写操作白名单：body 为 `{ space, p, params, body }`，全部走租约。
@@ -97,6 +99,17 @@ export const CORE_WRITE_OPS = [
   'defect.report',
   'defect.attribute',
   'defect.confirm',
+  // 可视化配置（docs/design/21）：设置页表单、流程增删改、修订恢复、旧空间升级。
+  'space.config.update',
+  'space.agent.save',
+  'space.agent.delete',
+  'space.skill.save',
+  'space.skill.delete',
+  'space.file.rollback',
+  'workflow.create',
+  'workflow.meta',
+  'workflow.delete',
+  'space.upgrade',
 ] as const
 
 /**
@@ -170,6 +183,11 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
     catalog: routesCatalog(service),
     // M-K：把评测/归因命令注册表接到 api-core；没有 m3 的旧服务保持 501。
     ...(service.m3 === undefined ? {} : { getCommands: (stores: ProjectStores) => service.m3!.getCommands(stores) }),
+    // 新建流程与空间升级用插件随包的模板（与 init 同一份）。
+    templates: () => ({
+      workflows: BUNDLED_WORKFLOW_FILES.map((file) => ({ name: file.fileName, content: file.content })),
+      agents: BUNDLED_AGENT_FILES.map((file) => ({ name: file.fileName, content: file.content })),
+    }),
   })
   const active = new Set<ActiveStream>()
   // 宿主卸载信号：让还在读取空间/运行的 SSE 请求也能立刻结束，而不是挂在磁盘 IO 上。
@@ -214,7 +232,7 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
         path: '/api/taktflow.op',
         methods: ['POST'],
         requestBody: 'buffered',
-        fetch: (request) => handleWrite(request, service, core, user, withWriteLease),
+        fetch: (request) => handleWrite(request, service, core, user, withWriteLease, ctx),
       }),
     'taktflow write route',
   )
@@ -251,6 +269,20 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
       }),
     'taktflow agents route',
   )
+
+  // 角色表单的模型下拉：App 里可用的模型（宿主没有会话服务时 501，面板只显示“跟随 App”）。
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/taktflow.models',
+        methods: ['GET'],
+        requestBody: 'buffered',
+        async fetch(): Promise<Response> {
+          try { return json({ ok: true, data: await hostModels(ctx) }) } catch (error) { return errorResponse(error) }
+        },
+      }),
+    'taktflow models route',
+  )
 }
 
 async function handleRead(request: Request, service: TaktflowService, core: ApiCore): Promise<Response> {
@@ -281,6 +313,7 @@ async function handleWrite(
   core: ApiCore,
   user: string,
   withWriteLease: WriteLease,
+  ctx: HostContext,
 ): Promise<Response> {
   // 写入口自身也检查方法：即使有人绕过注册元数据直接 dispatch，GET/HEAD 也永远不写。
   if (request.method !== 'POST') {
@@ -296,6 +329,8 @@ async function handleWrite(
 
     const requestedSpace = optionalText(body.space, 'space') ?? url.searchParams.get('space')
     const space = await resolveSpace(service, requestedSpace)
+    // 告诉 Lead：只是往会话里投递一句话，不写空间，不需要租约。
+    if (op === 'lead.ask') return json({ ok: true, data: await askLead(ctx, space, { text: body.text, page: body.page, target: body.target }) })
     if (isPluginWriteOp(op)) {
       const data = await dispatchPluginWrite(service, user, space, op, body, withWriteLease)
       return json({ ok: true, data })

@@ -53,6 +53,9 @@ import {
   type CreateLedger,
   type CreateRequestRecord,
 } from './ledger.js'
+import { taktConfigTool } from './config-tool.js'
+
+const QUICK_WORKFLOW_FILE = 'quick-fix.workflow.ts'
 
 /** Lead 行对外承诺的工具清单；顺序与注册顺序一致，便于宿主与测试核对。 */
 export const LEAD_TOOL_NAMES = [
@@ -62,10 +65,11 @@ export const LEAD_TOOL_NAMES = [
   'takt_run',
   'takt_trace',
   'takt_ask_human',
+  'takt_config',
 ] as const
 
 /**
- * Lead 的 6 个工具（技术方案 5.8）。
+ * Lead 的 7 个工具（技术方案 5.8；takt_config 见设计 21）。
  *
  * 设计约束：
  * - 身份只从 dsh 可信上下文拿：exec.agent + ctx.agents.get/roots；绝不信任模型
@@ -102,7 +106,7 @@ export interface LeadToolOptions {
   user?: string
 }
 
-interface ToolDeps {
+export interface ToolDeps {
   service: TaktflowService
   agents: HostContext['agents'] | undefined
   human: string
@@ -126,7 +130,7 @@ export const LEAD_DECISION_PATH = 'decisions/lead-notes.md'
 const CONTROL_OR_SPACE = /[\u0000-\u001f\u007f\s]/
 
 /** 工具输出 schema：结构化 JSON 的公共骨架，具体字段按工具追加。 */
-const OUTPUT_SCHEMA: ValueSchemaSpec = {
+export const OUTPUT_SCHEMA: ValueSchemaSpec = {
   type: 'object',
   additionalProperties: true,
   properties: {
@@ -162,6 +166,7 @@ export function registerLeadTools(
     defineTool(taktRunTool(deps)),
     defineTool(taktTraceTool(deps)),
     defineTool(taktAskHumanTool(deps)),
+    defineTool(taktConfigTool(deps)),
   ]
 }
 
@@ -175,7 +180,7 @@ function defaultUser(): string {
   }
 }
 
-function requireRootAgent(exec: ToolExecutionContext, deps: ToolDeps): Agent {
+export function requireRootAgent(exec: ToolExecutionContext, deps: ToolDeps): Agent {
   const caller = exec.agent
   if (caller === undefined) {
     throw new TaktToolError(
@@ -502,14 +507,9 @@ async function initSpace(deps: ToolDeps, agent: Agent): Promise<LeadToolResult> 
       // 已经是空间：幂等打开；仍补齐缺失的默认角色与流程模板，但绝不覆盖用户档案。
       if (await exists(configFile)) return await initExistingSpace(deps, resolved)
 
-      // 与宿主配置/已绑定的单根冲突：必须在 initProject 写盘前拒绝。
+      // 多空间：可以在新目录初始化另一个空间，但必须在宿主配置的 spaces 里、不能和已有空间嵌套。写盘前拒绝。
+      await deps.service.spaces.assertOpenable?.(resolved)
       const roots = await deps.service.spaces.roots()
-      if (roots.length > 0 && !roots.includes(resolved)) {
-        throw spaceConflict(
-          `P0 只支持一个空间根，宿主已配置/已绑定 ${roots[0]}，不能初始化 ${resolved}`,
-          `把会话工作目录切到 ${roots[0]}，或换一个使用独立宿主进程的项目。`,
-        )
-      }
       for (const root of roots) {
         if (root === resolved) continue
         if (isInside(resolved, root)) {
@@ -588,7 +588,7 @@ interface InitCopyResult {
 }
 
 /**
- * 新空间默认流程顺序：标准流水线在前，精简 sdlc 在后。
+ * 新空间默认流程顺序：标准流水线、轻量改动、精简 sdlc。
  *
  * 只由 initSpace 在“本次新建空间”时调用；已有空间的 config 一律不改，避免覆盖
  * 用户调整过的流程顺序。返回写入后的配置对象，供随后的 SpaceHandle 使用。
@@ -596,11 +596,12 @@ interface InitCopyResult {
 async function ensureDefaultWorkflowOrder(stores: Awaited<ReturnType<typeof initProject>>) {
   const relative = (fileName: string): string =>
     path.relative(stores.projectDir, path.join(stores.paths.workflows, fileName)).split(path.sep).join('/')
-  const wanted = [relative(DEFAULT_WORKFLOW_FILE), relative(LITE_WORKFLOW_FILE)]
+  // 三个模板都登记（标准、轻量、精简）；默认流程写进 route.defaultWorkflow，设置页可改。
+  const wanted = [relative(DEFAULT_WORKFLOW_FILE), relative(QUICK_WORKFLOW_FILE), relative(LITE_WORKFLOW_FILE)]
   const current = stores.config.workflows ?? []
-  const same = current.length === wanted.length && current.every((item, index) => item === wanted[index])
+  const same = current.length === wanted.length && current.every((item, index) => item === wanted[index]) && stores.config.route?.defaultWorkflow !== undefined
   if (same) return stores.config
-  const config = { ...stores.config, workflows: wanted }
+  const config = { ...stores.config, workflows: wanted, route: { ...stores.config.route, defaultWorkflow: DEFAULT_WORKFLOW_FILE.replace(/\.workflow\.ts$/, '') } }
   await writeFileAtomic(path.join(stores.projectDir, 'takt.config.json'), toJsonText(config))
   return config
 }
@@ -1872,7 +1873,7 @@ async function confirmDefectCard(
 
 // ---------------------------------------------------------------- 结果与工具函数
 
-function success(
+export function success(
   summary: string,
   fields: Record<string, unknown>,
   nextActions: string[],
@@ -1886,7 +1887,7 @@ function success(
   }
 }
 
-function failure(code: LeadErrorCode, message: string, hint?: string): LeadToolResult {
+export function failure(code: LeadErrorCode, message: string, hint?: string): LeadToolResult {
   const cleanMessage = oneLine(message) || '操作失败'
   const cleanHint = oneLine(hint ?? '') || defaultHint(code)
   return {
@@ -1933,7 +1934,7 @@ function taktErrorOf(error: unknown): { code: LeadErrorCode; message?: string; h
   }
 }
 
-function toFailure(error: unknown): LeadToolResult {
+export function toFailure(error: unknown): LeadToolResult {
   const known = taktErrorOf(error)
   if (known !== undefined) return failure(known.code, known.message ?? '', known.hint)
   // 未知异常不把原始 message/stack 交给模型：可能包含路径、密钥或内部实现。
@@ -2044,7 +2045,7 @@ function invalidAction(tool: string, action: string, supported: readonly string[
  * value；只给摘要会让模型拿不到 requestId / next_actions / error.hint。JSON 放在
  * 独立的 text block，模型与验收脚本都能直接解析。
  */
-function renderResult(_args: unknown, value: JsonValue): ContentBlock[] {
+export function renderResult(_args: unknown, value: JsonValue): ContentBlock[] {
   const summary = isRecord(value) && typeof value.summary === 'string'
     ? value.summary
     : 'taktflow 工具已完成'
@@ -2059,14 +2060,14 @@ function renderResult(_args: unknown, value: JsonValue): ContentBlock[] {
 
 // ---------------------------------------------------------------- 参数与数据
 
-function asRecord(raw: unknown): Record<string, unknown> {
+export function asRecord(raw: unknown): Record<string, unknown> {
   if (!isRecord(raw)) {
     throw new LeadToolFailure('TAKT_INVALID_INPUT', '参数必须是对象', '按工具 description 里的示例传参。')
   }
   return raw
 }
 
-function requiredString(args: Record<string, unknown>, key: string): string {
+export function requiredString(args: Record<string, unknown>, key: string): string {
   const value = args[key]
   if (typeof value !== 'string' || value.trim() === '') {
     throw new LeadToolFailure('TAKT_INVALID_INPUT', `参数 ${key} 必须是非空字符串`, '按工具 description 里的示例传参。')
@@ -2082,7 +2083,7 @@ function requiredStringAllowEmpty(args: Record<string, unknown>, key: string): s
   return value
 }
 
-function optionalString(args: Record<string, unknown>, key: string): string | undefined {
+export function optionalString(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key]
   if (value === undefined) return undefined
   if (typeof value !== 'string' || value.trim() === '') {

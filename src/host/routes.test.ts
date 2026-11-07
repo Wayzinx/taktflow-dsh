@@ -648,13 +648,15 @@ describe('registerRoutes：写操作白名单', () => {
     expect(runs.start).not.toHaveBeenCalled()
   })
 
-  it('白名单固定为 24 项：4 个插件操作 + 20 个 api-core 操作（含 M3 评测与缺陷），且不含群聊写', () => {
+  it('白名单固定为 35 项：5 个插件操作 + 30 个 api-core 操作（含 M3 评测与缺陷、可视化配置），且不含群聊写', () => {
     expect([...WRITE_OPS]).toEqual([
-      'attention.answer', 'run.start', 'run.cancel', 'lease.release',
+      'attention.answer', 'run.start', 'run.cancel', 'lease.release', 'lead.ask',
       'artifact.edit', 'comment.add', 'space.members', 'space.repo.add', 'space.repo.sync', 'space.file.edit',
       'workflow.edit', 'workflow.source.replace', 'workflow.layout', 'workflow.rollback',
       'space.repo.update', 'review.dispose', 'route.preview', 'command.run', 'lesson.update',
       'eval.collect', 'eval.run', 'defect.report', 'defect.attribute', 'defect.confirm',
+      'space.config.update', 'space.agent.save', 'space.agent.delete', 'space.skill.save', 'space.skill.delete',
+      'space.file.rollback', 'workflow.create', 'workflow.meta', 'workflow.delete', 'space.upgrade',
     ])
     expect(WRITE_OPS as readonly string[]).not.toContain('room.members')
     expect(WRITE_OPS as readonly string[]).not.toContain('chat.send')

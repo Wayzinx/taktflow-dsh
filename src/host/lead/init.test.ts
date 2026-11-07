@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -178,7 +178,7 @@ describe('takt_requirement init', () => {
     expect(await exists(path.join(project, '.takt'))).toBe(false)
   })
 
-  it('已绑定一个根后，另一个目录 init 在写盘前拒绝', async () => {
+  it('已打开一个空间后，另一个目录也能 init（多空间）', async () => {
     const first = await tempDir()
     await initProject(first)
     const registry = new FsSpaceRegistry()
@@ -193,9 +193,9 @@ describe('takt_requirement init', () => {
     const tool = registerLeadTools(defineToolStub, service, { ctx: { agents } })
       .find((item) => item.name === 'takt_requirement')!
     const result = await tool.execute({ action: 'init' }, execFor(agent)) as LeadToolResult
-    expect(result.ok).toBe(false)
-    expect(result.error?.code).toBe('TAKT_SPACE_ROOT_MISMATCH')
-    expect(await exists(path.join(second, 'takt.config.json'))).toBe(false)
+    expect(result.ok).toBe(true)
+    expect(await exists(path.join(second, 'takt.config.json'))).toBe(true)
+    expect(await registry.roots()).toEqual([await realpath(first), await realpath(second)])
   })
 
   it('.takt 是符号链接时在写盘前拒绝', async () => {
@@ -223,7 +223,7 @@ describe('takt_requirement init', () => {
     expect(await exists(path.join(project, 'takt.config.json'))).toBe(false)
   })
 
-  it('并发 init 同一个注册表时只有一个根成功，另一个在写盘前拒绝', async () => {
+  it('并发 init 两个不同目录都成功，各自独立', async () => {
     const first = await tempDir()
     const second = await tempDir()
     const registry = new FsSpaceRegistry()
@@ -240,10 +240,9 @@ describe('takt_requirement init', () => {
       tool.execute({ action: 'init' }, execFor(a)) as Promise<LeadToolResult>,
       tool.execute({ action: 'init' }, execFor(b)) as Promise<LeadToolResult>,
     ])
-    expect([ra, rb].filter((result) => result.ok)).toHaveLength(1)
-    const loser = ra.ok ? second : first
-    expect(await exists(path.join(loser, 'takt.config.json'))).toBe(false)
-    expect(await exists(path.join(loser, '.takt'))).toBe(false)
+    expect(ra.ok && rb.ok).toBe(true)
+    expect(await exists(path.join(first, 'takt.config.json'))).toBe(true)
+    expect(await exists(path.join(second, 'takt.config.json'))).toBe(true)
   })
 
   it('非根 Agent 或非 taktflow preset 不能初始化', async () => {

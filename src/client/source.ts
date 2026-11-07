@@ -162,6 +162,33 @@ export function createDshSource(space: string, options: DshSourceOptions = {}): 
     rollbackWorkflow: (id, body) => write('workflow.rollback', { id }, body),
     subscribeWorkflow: (id, onChange) => sse('taktflow.workflow-stream', { id }, onChange),
 
+    // 可视化配置（docs/design/21）：dsh 用 App 的模型与执行器、本机只有一个用户，不管理这两类设置
+    host: {
+      kind: 'dsh',
+      manageRuntime: false,
+      manageMembers: false,
+      models: async () => {
+        const res = await fetch(`${base}/taktflow.models`, { credentials: 'same-origin' })
+        // 宿主没有会话服务时（501）角色表单只显示“跟随 App”，不当成错误
+        if (res.status === 501) return []
+        return parse<Array<{ id: string; label: string }>>(res, 'models')
+      },
+      askLead: (text, context) => post('lead.ask', { text, page: context?.page, target: context?.target }),
+      ...(options.openSession ? { openSession: options.openSession } : {}),
+    },
+    settings: () => read('space.settings'),
+    updateConfig: (patch, reason) => write('space.config.update', {}, { patch, reason }),
+    saveRole: (role, body) => write('space.agent.save', { role }, body),
+    deleteRole: (role, reason) => write('space.agent.delete', { role }, { reason }),
+    saveSkill: (name, body) => write('space.skill.save', { name }, body),
+    deleteSkill: (name, reason) => write('space.skill.delete', { name }, { reason }),
+    fileRevisions: (kind, name) => read('space.file.revisions', { kind, name }),
+    rollbackFile: (kind, name, rev, reason) => write('space.file.rollback', { kind, ...(name === undefined ? {} : { name }) }, { rev, reason }),
+    createWorkflow: (body) => write('workflow.create', {}, body),
+    updateWorkflowMeta: (id, body) => write('workflow.meta', { id }, body),
+    deleteWorkflow: (id, reason) => write('workflow.delete', { id }, { reason }),
+    upgradeSpace: (dryRun, reason) => write('space.upgrade', {}, { dryRun, reason }),
+
     agents: async (runId, nodeId) => {
       const res = await fetch(`${base}/taktflow.agents?${query({ run: runId, node: nodeId })}`, { credentials: 'same-origin' })
       return parse<AgentTraceView[]>(res, 'agents')

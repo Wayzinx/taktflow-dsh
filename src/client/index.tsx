@@ -43,7 +43,7 @@ function TaktflowIcon(): ReactElement {
   )
 }
 
-/** 宿主 ping：确认宿主半已加载，并拿到已打开的空间根（P0 最多一个）。 */
+/** 宿主 ping：确认宿主半已加载，并拿到已打开的空间根（可以有多个）。 */
 interface PingPayload {
   ok?: boolean
   version?: string
@@ -52,8 +52,18 @@ interface PingPayload {
 
 type PanelState =
   | { status: 'checking' }
-  | { status: 'ready'; version?: string; space?: string }
+  | { status: 'ready'; version?: string; spaces: string[] }
   | { status: 'failed'; detail: string }
+
+const SPACE_KEY = 'taktflow.panel.space'
+/** 记住上次在全局面板里看的空间；存储不可用（隐私模式等）时退回第一个空间。 */
+function rememberedSpace(): string | undefined {
+  try { return localStorage.getItem(SPACE_KEY) ?? undefined } catch { return undefined }
+}
+function rememberSpace(space: string): void {
+  try { localStorage.setItem(SPACE_KEY, space) } catch { /* 记不住就下次再选 */ }
+}
+const spaceLabel = (root: string): string => root.split(/[\\/]/).filter(Boolean).at(-1) ?? root
 
 /** dsh 把深色主题投影为 body[data-ds-dark-theme]；只读，不写任何全局属性。 */
 const dshTheme: ThemeHost = {
@@ -101,8 +111,9 @@ function Notice({ title, children }: { title: string; children?: ReactNode }): R
 function TaktflowPanel(): ReactElement {
   useScopedStyle()
   const [state, setState] = useState<PanelState>({ status: 'checking' })
+  const [picked, setPicked] = useState<string | undefined>(rememberedSpace)
 
-  // 还没有空间时每 5 秒再探测一次：Lead 在需求群里打开空间后，面板自动切到总览。
+  // 还没有空间时每 5 秒、有空间后每 15 秒再探测一次：Lead 在别的目录新建空间后，切换器里会出现。
   useEffect(() => {
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -113,9 +124,9 @@ function TaktflowPanel(): ReactElement {
           const body = (await response.json()) as PingPayload
           if (body.ok !== true) throw new Error('宿主返回 ok=false')
           if (controller.signal.aborted) return
-          const space = body.spaces?.[0]
-          setState({ status: 'ready', version: body.version, space })
-          if (space === undefined) timer = setTimeout(probe, 5000)
+          const spaces = body.spaces ?? []
+          setState({ status: 'ready', version: body.version, spaces })
+          timer = setTimeout(probe, spaces.length === 0 ? 5000 : 15000)
         })
         .catch((error: unknown) => {
           if (!controller.signal.aborted) setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
@@ -128,10 +139,29 @@ function TaktflowPanel(): ReactElement {
     }
   }, [])
 
-  const source = useMemo(() => (state.status === 'ready' && state.space ? createDshSource(state.space, { openSession: hostOpenSession() }) : undefined), [state])
+  const spaces = state.status === 'ready' ? state.spaces : []
+  const space = picked !== undefined && spaces.includes(picked) ? picked : spaces[0]
+  const source = useMemo(() => (space ? createDshSource(space, { openSession: hostOpenSession() }) : undefined), [space])
 
-  if (state.status === 'ready' && source) {
-    return <TaktflowEmbed source={source} theme={dshTheme} />
+  if (state.status === 'ready' && source && space) {
+    if (spaces.length < 2) return <TaktflowEmbed source={source} theme={dshTheme} />
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+        {/* 作用域样式会给 .takt-root 设 100% 高度；切换条只占自身高度 */}
+        <div className="takt-root" style={{ flex: 'none', height: 'auto', minHeight: 0 }}>
+          <label className="takt-spacebar">
+            <span className="takt-spacebar-label">空间</span>
+            <select className="takt-spacebar-select" value={space} onChange={(event) => { setPicked(event.target.value); rememberSpace(event.target.value) }} aria-label="切换空间">
+              {spaces.map((root) => <option key={root} value={root} title={root}>{spaceLabel(root)}</option>)}
+            </select>
+            <span className="takt-spacebar-path" title={space}>{space}</span>
+          </label>
+        </div>
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <TaktflowEmbed key={space} source={source} theme={dshTheme} />
+        </div>
+      </div>
+    )
   }
   return (
     <div className="takt-root">

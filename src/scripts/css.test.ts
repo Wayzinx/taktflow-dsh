@@ -41,4 +41,19 @@ describe('CSS 作用域转换', () => {
     const result = transformCss('/* keep */\n.takt-root .a { color: red; }')
     expect(result).toBe('/* keep */\n.takt-root .a { color: red; }')
   })
+
+  it('container 选项：只含宽度条件的 @media 改成按嵌入根宽度的 @container，其它媒体查询不动', () => {
+    const css = [
+      '@media (max-width: 900px) { .a { color: red; } }',
+      '@media (min-width: 600px) and (max-width: 900px) { .b { color: red; } }',
+      '@media (hover: hover) and (pointer: fine) { .c { color: red; } }',
+      '@media (prefers-reduced-motion: reduce) { .d { color: red; } }',
+    ].join('\n')
+    const result = transformCss(css, { container: 'takt' })
+    expect(result).toContain('@container takt (max-width: 900px) { .takt-root .a { color: red; } }')
+    expect(result).toContain('@container takt (min-width: 600px) and (max-width: 900px) { .takt-root .b')
+    expect(result).toContain('@media (hover: hover) and (pointer: fine) { .takt-root .c')
+    expect(result).toContain('@media (prefers-reduced-motion: reduce) { .takt-root .d')
+    expect(transformCss('@media (max-width: 900px) { .a { color: red; } }')).toContain('@media (max-width: 900px)')
+  })
 })

@@ -96,6 +96,9 @@ export function createWorkflowCatalog(
       for (const root of roots) {
         // 配置损坏或流程导入失败必须上抛：静默回退演示流程会让用户以为跑了空间流程。
         const files = await ensureLoaded(root)
+        // 设置页 / Lead 设的默认流程优先（route.defaultWorkflow），否则取登记的第一个。
+        const preferred = (await openProject(root)).config.route?.defaultWorkflow
+        if (preferred !== undefined && files.some((item) => item.workflow.id === preferred)) return preferred
         if (files.length > 0) return files[0]!.workflow.id
       }
       return P0_DELIVERY_ID

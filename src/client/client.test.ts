@@ -161,12 +161,12 @@ describe('真实客户端构建产物', () => {
     expect(client.updateState).not.toHaveBeenCalled()
   })
 
-  it('ping 返回空间根时进入就绪状态，带上第一个空间', async () => {
+  it('ping 返回空间根时进入就绪状态，带上全部空间', async () => {
     const client = loadClient()
     client.fetch.mockResolvedValueOnce(Response.json({ ok: true, version: '0.0.0', spaces: ['/w/space'] }))
     const [, pingEffect] = mountPanel(client)
     const dispose = pingEffect()
-    await vi.waitFor(() => expect(client.updateState).toHaveBeenCalledWith({ status: 'ready', version: '0.0.0', space: '/w/space' }))
+    await vi.waitFor(() => expect(client.updateState).toHaveBeenCalledWith({ status: 'ready', version: '0.0.0', spaces: ['/w/space'] }))
     if (typeof dispose === 'function') dispose()
   })
 

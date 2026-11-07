@@ -187,6 +187,7 @@ function attachOnOpen(registry: SpaceRegistry, notifier: Notifier): SpaceRegistr
   }
   return {
     roots: () => registry.roots(),
+    ...(registry.assertOpenable === undefined ? {} : { assertOpenable: (root: string) => registry.assertOpenable!(root) }),
     open: (root) => registry.open(root).then(attach),
     forSession: (cwd) => registry.forSession(cwd).then(attach),
   }

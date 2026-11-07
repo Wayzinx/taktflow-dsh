@@ -9,28 +9,27 @@ const CONFIG_FILE = 'takt.config.json'
 /**
  * 真实的空间注册表。
  *
- * P0 单空间：配置里出现多个不同根、或先后打开两个不同根都拒绝；同一个根的
- * symlink 在 realpath 后去重。core 的 openProject 会向上查找 takt.config.json，
- * 所以这里先确认“配置就在给定目录里”，再打开并核对 projectDir。
+ * 多空间：每个会话目录（就是空间根）各自打开，租约、通知、运行都按空间隔离。宿主配置了
+ * spaces 时只允许这些根；同一个根的 symlink 在 realpath 后去重。core 的 openProject 会
+ * 向上查找 takt.config.json，所以这里先确认“配置就在给定目录里”，再打开并核对 projectDir；
+ * 已打开空间的子目录不能再当成空间（嵌套空间会让两份配置争同一批文件）。
  *
- * open 串行化：并发打开同一个根返回同一个 handle；并发打开不同根只有一个成功。
- * 锁与 `takt_requirement init` 共用（space-lock），保证 init 的写盘与 open 的
- * 单根检查不会交错。只有成功打开后才绑定根，失败不会占住空间，可以重试。
+ * open 串行化：并发打开同一个根返回同一个 handle。锁与 `takt_requirement init` 共用
+ * （space-lock），保证 init 的写盘与 open 不会交错。失败不会占住空间，可以重试。
  */
 export class FsSpaceRegistry implements SpaceRegistry {
   private readonly configured: string[]
   private readonly cache = new Map<string, SpaceHandle>()
-  private root: string | undefined
   private configuredResolved: Promise<string[]> | undefined
 
   constructor(config: { spaces?: string[] } = {}) {
     this.configured = (config.spaces ?? []).map((space) => path.resolve(space))
   }
 
+  /** 配置的根在前（按配置顺序），然后是运行中打开过的根（按打开顺序）。 */
   async roots(): Promise<string[]> {
-    const resolved = await this.resolveConfigured()
-    if (resolved.length > 0) return [...resolved]
-    return this.root === undefined ? [] : [this.root]
+    const configured = await this.resolveConfigured()
+    return [...new Set([...configured, ...this.cache.keys()])]
   }
 
   async open(root: string): Promise<SpaceHandle> {
@@ -39,7 +38,7 @@ export class FsSpaceRegistry implements SpaceRegistry {
       await this.assertConfiguredRoot(resolved)
       const cached = this.cache.get(resolved)
       if (cached !== undefined) return cached
-      this.assertSingleRoot(resolved)
+      this.assertNotNested(resolved)
 
       if (!(await exists(path.join(resolved, CONFIG_FILE)))) {
         throw new TaktToolError(
@@ -62,7 +61,6 @@ export class FsSpaceRegistry implements SpaceRegistry {
 
       const handle: SpaceHandle = { root: resolved, stores, insights: createInsights(stores) }
       this.cache.set(resolved, handle)
-      this.root = resolved
       return handle
     })
   }
@@ -77,35 +75,23 @@ export class FsSpaceRegistry implements SpaceRegistry {
     }
     const resolved = await this.realpath(cwd, '会话工作目录不存在或不可访问')
     const configured = await this.resolveConfigured()
-
+    const known = [...new Set([...configured, ...this.cache.keys()])]
+    if (known.includes(resolved)) return this.open(resolved)
+    const parent = known.find((root) => isInside(resolved, root))
+    if (parent !== undefined) {
+      throw new TaktToolError(
+        'TAKT_SPACE_ROOT_MISMATCH',
+        `会话目录必须是空间根，不能是子目录：${resolved}`,
+        `请把会话工作目录切到 ${parent}。`,
+      )
+    }
     if (configured.length > 0) {
-      const root = configured[0]!
-      if (root === resolved) return this.open(root)
-      if (isInside(resolved, root)) {
-        throw new TaktToolError(
-          'TAKT_SPACE_ROOT_MISMATCH',
-          `会话目录必须是空间根，不能是子目录：${resolved}`,
-          `请把会话工作目录切到 ${root}。`,
-        )
-      }
       throw new TaktToolError(
         'TAKT_NO_SPACE',
         `当前目录不在已配置的 Taktflow 空间内：${resolved}`,
         '检查宿主配置的 spaces。',
       )
     }
-
-    if (this.root !== undefined) {
-      if (this.root === resolved) return this.open(this.root)
-      if (isInside(resolved, this.root)) {
-        throw new TaktToolError(
-          'TAKT_SPACE_ROOT_MISMATCH',
-          `会话目录必须是空间根，不能是子目录：${resolved}`,
-          `请把会话工作目录切到 ${this.root}。`,
-        )
-      }
-    }
-
     if (await exists(path.join(resolved, CONFIG_FILE))) return this.open(resolved)
     throw new TaktToolError(
       'TAKT_NO_SPACE',
@@ -114,20 +100,19 @@ export class FsSpaceRegistry implements SpaceRegistry {
     )
   }
 
-  /** 解析配置里的根并去重；多个不同 realpath 是配置错误。 */
+  async assertOpenable(root: string): Promise<void> {
+    const resolved = await this.realpath(root, '空间根不存在或不可访问')
+    await this.assertConfiguredRoot(resolved)
+    if (!this.cache.has(resolved)) this.assertNotNested(resolved)
+  }
+
+  /** 解析配置里的根并去重（同一个根的不同路径 / symlink 合并）。 */
   private async resolveConfigured(): Promise<string[]> {
     if (this.configured.length === 0) return []
     this.configuredResolved ??= (async () => {
       const roots = new Set<string>()
       for (const configured of this.configured) {
         roots.add(await this.realpath(configured, '配置的空间根不存在或不可访问'))
-      }
-      if (roots.size > 1) {
-        throw new TaktToolError(
-          'TAKT_SPACE_ROOT_MISMATCH',
-          `P0 只支持一个空间根，配置里出现了多个：${[...roots].join(', ')}`,
-          'spaces 只能保留一个根；同一个根的不同路径/symlink 可以重复。',
-        )
       }
       return [...roots]
     })().catch((error) => {
@@ -139,22 +124,25 @@ export class FsSpaceRegistry implements SpaceRegistry {
 
   private async assertConfiguredRoot(resolved: string): Promise<void> {
     const configured = await this.resolveConfigured()
-    if (configured.length > 0 && configured[0] !== resolved) {
+    if (configured.length > 0 && !configured.includes(resolved)) {
       throw new TaktToolError(
         'TAKT_SPACE_ROOT_MISMATCH',
         `空间根不在宿主配置的 spaces 里：${resolved}`,
-        `当前配置的根是 ${configured[0]}。`,
+        `当前配置的根：${configured.join('、')}。`,
       )
     }
   }
 
-  private assertSingleRoot(resolved: string): void {
-    if (this.root !== undefined && this.root !== resolved) {
-      throw new TaktToolError(
-        'TAKT_SPACE_ROOT_MISMATCH',
-        `P0 只支持一个空间根，已打开 ${this.root}，不能再打开 ${resolved}`,
-        '一个宿主进程只服务一个空间；需要切换空间时重启宿主。',
-      )
+  /** 已打开空间的子目录不能再当成空间，反过来也一样。 */
+  private assertNotNested(resolved: string): void {
+    for (const root of this.cache.keys()) {
+      if (isInside(resolved, root) || isInside(root, resolved)) {
+        throw new TaktToolError(
+          'TAKT_SPACE_ROOT_MISMATCH',
+          `空间不能嵌套：${resolved} 与已打开的空间 ${root} 互相包含`,
+          '换一个不在任何空间内、也不包含其它空间的目录。',
+        )
+      }
     }
   }
 
