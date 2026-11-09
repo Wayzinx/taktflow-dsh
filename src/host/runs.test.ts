@@ -10,6 +10,7 @@ import type { Agent, AgentPresetDefinition, SubagentActivationSpec, SubagentResu
 import { DshRolePresets } from './presets.js'
 import type { RoleSkillSnapshots } from './role-skills.js'
 import { DshRunManager } from './runs.js'
+import { spaceConfigPatterns } from './config-paths.js'
 import { FsOwnership } from './ownership.js'
 import { InMemoryPermissionRegistry } from './permissions.js'
 import { FsSpaceRegistry } from './space.js'
@@ -439,6 +440,32 @@ describe('RunManager 真实 core 生命周期', () => {
     const violation = events.find((event) => event.type === 'guard.violation')
     if (viaHost) expect(violation).toBeUndefined()
     else expect(violation?.data).toMatchObject({ paths: [relative] })
+  })
+
+  it.each([
+    ['面板 / takt_config 改配置走配置位置窗口：保存流程图布局不算节点越界', true, 'succeeded'],
+    ['同一写入不经窗口仍算越界', false, 'failed'],
+  ] as const)('节点执行期间改空间配置：%s', async (_name, viaHost, expected) => {
+    const f = await fixture()
+    const result = deferred<SubagentResult>()
+    f.ctx.subagents.startActivation = async (spec) => {
+      f.ctx.activations.push(spec)
+      return { childId: spec.childId!, result: result.promise, dispose: async () => {} }
+    }
+    const { runId } = await f.manager.start(f.input)
+    await vi.waitFor(() => expect(f.ctx.activations).toHaveLength(1))
+    // 真实事故：开发节点执行到第 49 分钟，面板保存了 workflows/taktflow-standard.layout.json
+    const layout = join(f.space.stores.paths.workflows, 'taktflow-standard.layout.json')
+    const write = () => writeFile(layout, '{"nodes":{}}\n')
+    const patterns = spaceConfigPatterns(f.space)
+    expect(patterns).toEqual(expect.arrayContaining(['takt.config.json', `${relativePath(f.space.root, f.space.stores.paths.workflows)}/**`]))
+    if (viaHost) await f.manager.withHostWrites(f.space, patterns, write)
+    else await write()
+    result.resolve({ stopReason: 'completed', output: [] })
+    await status(f.space, runId, expected)
+    const violation = (await f.space.stores.events.read(runId)).find((event) => event.type === 'guard.violation')
+    if (viaHost) expect(violation).toBeUndefined()
+    else expect(violation?.data).toMatchObject({ paths: [relativePath(f.space.root, layout)] })
   })
 
   it('提供追溯中心时，真实节点运行落盘 starting→completed，并冻结角色来源', async () => {

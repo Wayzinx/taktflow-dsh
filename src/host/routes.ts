@@ -29,6 +29,7 @@ import { askLead, hostModels } from './lead-ask.js'
 import { agentTraceHubFor, type AgentTraceReader } from './agent-trace.js'
 import { ApprovalInputError } from './approvals.js'
 import type { HostContext } from './dsh-types.js'
+import { spaceConfigPatterns } from './config-paths.js'
 import { TaktToolError, type AgentTrace, type SpaceHandle, type SpaceRegistry, type TaktflowService, type WorkflowCatalog } from './types.js'
 
 /**
@@ -337,7 +338,10 @@ async function handleWrite(
       const data = await dispatchPluginWrite(service, user, space, op, body, withWriteLease)
       return json({ ok: true, data })
     }
-    const data = await dispatchCoreWrite(core, space, op, body, user)
+    // 改配置（流程图布局、角色、技能、空间配置）是宿主写入：在本空间在册运行的守卫上开配置位置的窗口，
+    // 运行中的节点不会因为面板保存布局被判越界。
+    const write = () => dispatchCoreWrite(core, space, op, body, user)
+    const data = await (service.runs?.withHostWrites?.(space, spaceConfigPatterns(space), write) ?? write())
     // workflow 写入可能返回冲突/校验失败对象；必须在 ok:true 包装前识别，
     // 且只认 error 严格等于 'conflict' / 'validation' 的返回值，避免误判文档内容。
     const failure = workflowFailureResponse(data)

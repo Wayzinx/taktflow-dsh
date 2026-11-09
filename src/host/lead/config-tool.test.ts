@@ -8,7 +8,7 @@ import { createInsights, initProject } from '@taktflow/core'
 import type { Agent, DefineTool, HostContext, ToolDefinition, ToolExecutionContext } from '../dsh-types.js'
 import type { SpaceHandle, TaktflowService } from '../types.js'
 import { registerLeadTools, type LeadToolResult } from './tools.js'
-import { checkRoleScopes } from './config-tool.js'
+import { checkRoleScopes, droppedGates } from './config-tool.js'
 
 const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))) })
@@ -154,6 +154,33 @@ describe('takt_config', () => {
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
+  })
+})
+
+describe('去掉质量关口要当场确认', () => {
+  it('droppedGates 按评审、门禁、acceptance 计数；保留或新增不算', () => {
+    const before = "nodes: [review({ id: 'a' }), review({ id: 'b' }), gate({ id: 'g', checks: [{ id: 'acceptance', kind: 'acceptance' }] }), human({ id: 'h' })]"
+    expect(droppedGates(before, before)).toEqual([])
+    expect(droppedGates(before, "nodes: [human({ id: 'h' })]")).toEqual(['2 个评审节点', '1 个门禁 / 交付校验节点', '1 个 acceptance 交付校验'])
+    expect(droppedGates(before, before.replace("{ id: 'acceptance', kind: 'acceptance' }", "{ id: 't', kind: 'function', fn: run }"))).toEqual(['1 个 acceptance 交付校验'])
+    expect(droppedGates("nodes: []", before)).toEqual([])
+  })
+
+  it('workflow_edit 去掉评审 / 交付校验时没有 confirmed 就拒绝且不改文件；确认后放行到源码校验', async () => {
+    const h = await harness()
+    await h.call({ action: 'upgrade', dryRun: false, confirmed: true, reason: '准备' })
+    const file = path.join(h.root, 'workflows', 'taktflow-standard.workflow.ts')
+    const original = await readFile(file, 'utf8')
+    expect(original).toMatch(/\breview\(\{/)
+    // 只留一个人工准出：评审和交付校验都没了（真实事故里的 studio-signoff）
+    const stripped = original.replace(/nodes: \[[\s\S]*\],\s*\}\)\s*$/, "nodes: [human({ id: 'acceptance', title: '准出', ask: '准出？', form: 'approve' })],\n})\n")
+    expect(stripped).not.toBe(original)
+    const refused = await h.call({ action: 'workflow_edit', id: 'taktflow-standard', baseRev: 'x', source: stripped, reason: '用户：可以，按这个开工' })
+    expect(refused).toMatchObject({ ok: false, error: { code: 'TAKT_FORBIDDEN_FOR_LEAD', message: expect.stringContaining('评审节点') } })
+    expect(await readFile(file, 'utf8')).toBe(original)
+    // 带 confirmed 后不再被这道关拦（之后由源码校验 / baseRev 决定）
+    const confirmed = await h.call({ action: 'workflow_edit', id: 'taktflow-standard', baseRev: 'x', source: stripped, confirmed: true, reason: '用户刚确认去掉评审' })
+    expect(confirmed.error?.code).not.toBe('TAKT_FORBIDDEN_FOR_LEAD')
   })
 })
 

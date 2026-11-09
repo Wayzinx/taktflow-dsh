@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { createApiCore, ApiError, type ApiCore, type WriteOp } from '@taktflow/server'
 import type { Actor, ProjectStores, SpaceDetail, SpaceSettings, SpaceUpgradePlan, WorkflowDocument } from '@taktflow/core'
 import { BUNDLED_AGENT_FILES, BUNDLED_WORKFLOW_FILES } from '../../templates/bundled.js'
 import type { DefineToolOptions, ToolExecutionContext } from '../dsh-types.js'
+import { spaceConfigPatterns } from '../config-paths.js'
 import { TaktToolError, type SpaceHandle } from '../types.js'
 import {
   OUTPUT_SCHEMA, asRecord, failure, optionalString, renderResult, requireRootAgent, requiredString, success, toFailure,
@@ -52,7 +54,7 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
     description: [
       '查看和修改空间配置：运行策略（自主程度、默认流程、环境部署、自测、预算、知识源）、角色、技能、流程。',
       '何时用：用户明确要求改配置时（例如“把 PRD 评审最多改成 2 轮”“新建一个安全评审角色”）；先 show 看现状。',
-      '何时不用：用户没要求就不要改；需求产物用 takt_artifact。删除 / 升级 / 回滚先 takt_ask_human 确认，再带 confirmed=true。',
+      '何时不用：用户没要求就不要改；需求产物用 takt_artifact。删除 / 升级 / 回滚、以及去掉评审或交付校验的 workflow_edit，先 takt_ask_human 确认，再带 confirmed=true。不要为了让运行通过而裁掉评审、测分或交付校验。',
       '每次修改都要 reason（引用用户原话）；结果里会给出怎么撤回。流程节点属性（评审轮次、角色、提示词等）用 workflow_read 读源码后 workflow_edit 整文件替换。',
       '自测配置（selftest）只有 timeoutMs（1000..3600000 毫秒）和 allowedCommands（命令白名单）两个字段，没有 selftest.commands；不配置命令时默认用 environment.testCommand，quick-fix 固定 npm test，其它流程回退 package.json 的 test 脚本，不需要先配置命令才能自测。',
       '代码仓库：用户要在某个 git 仓库上开发时，用 repo_add 绑定（id 默认 app，流程里的开发节点用 repo=app），宿主会拉取并在独立工作区里改代码；不要满盘搜文件找项目，问用户要地址。',
@@ -63,7 +65,7 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
     parameters: {
       action: { type: 'string', enum: [...ACTIONS], required: true, description: '要做的事。' },
       reason: { type: 'string', description: '写操作必填：为什么改（引用用户原话）。' },
-      confirmed: { type: 'boolean', description: '删除 / 回滚 / 执行升级时必填 true：表示已经用 takt_ask_human 得到用户确认。' },
+      confirmed: { type: 'boolean', description: '删除 / 回滚 / 执行升级、去掉评审或交付校验的 workflow_edit 时必填 true：表示已经在这次 takt_ask_human 里得到用户确认（不能引用以前的同意）。' },
       patch: { type: 'json', description: 'set_config：要改的字段，可含 autonomy(full|checkpoints|manual)、defaultWorkflow、environment、selftest({timeoutMs, allowedCommands})、budget、knowledge；null 表示恢复默认。selftest 没有 commands 字段。' },
       role: { type: 'string', description: 'save_role / delete_role / history / rollback(kind=agent)：角色 id。' },
       profile: { type: 'json', description: 'save_role：要改的字段 title / description / skills / writeScope / readScope(null 取消限制) / model(null 跟随 App)。' },
@@ -99,7 +101,7 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
         const agent = requireRootAgent(exec, deps)
         const space = await deps.service.spaces.forSession(agent.session.header.cwd)
         const actor: Actor = { type: 'agent', role: 'lead', harness: 'dsh', onBehalfOf: deps.human }
-        return await run(apiCore(deps), space, actor, action, args)
+        return await run(apiCore(deps), space, actor, action, args, deps.service.runs?.withHostWrites?.bind(deps.service.runs))
       } catch (error) {
         if (error instanceof ApiError) return failure(error.status === 409 ? 'TAKT_RUN_BUSY' : 'TAKT_INVALID_INPUT', error.message, '按提示调整后重试；先 show 看现状。')
         return toFailure(error)
@@ -108,9 +110,15 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
   }
 }
 
-async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Action, args: Record<string, unknown>): Promise<LeadToolResult> {
+type HostWrites = <T>(space: SpaceHandle, paths: string[], fn: () => Promise<T>) => Promise<T>
+
+async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Action, args: Record<string, unknown>, hostWrites?: HostWrites): Promise<LeadToolResult> {
   const read = (op: Parameters<ApiCore['read']>[1], params: Record<string, string | undefined> = {}) => api.read(space.stores, op, params, actor)
-  const write = (op: WriteOp, params: Record<string, string>, body: Record<string, unknown>) => api.write(space.stores, op, params, body, actor)
+  // 配置写入是宿主写入：运行中改配置不能算成正在执行节点的越界（同面板写入）。
+  const write = (op: WriteOp, params: Record<string, string>, body: Record<string, unknown>) => {
+    const fn = () => api.write(space.stores, op, params, body, actor)
+    return hostWrites?.(space, spaceConfigPatterns(space), fn) ?? fn()
+  }
   const reason = () => requiredString(args, 'reason')
   if (DESTRUCTIVE.has(action) || (action === 'upgrade' && args.dryRun === false)) {
     if (args.confirmed !== true) {
@@ -194,7 +202,19 @@ async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Actio
     }
     case 'workflow_edit': {
       const id = requiredString(args, 'id')
-      const result = await write('workflow.source.replace', { id }, { baseRev: requiredString(args, 'baseRev'), source: requiredString(args, 'source'), reason: reason() }) as WorkflowDocument | { error: string; diagnostics?: Array<{ severity: string; message: string; line?: number }> }
+      const source = requiredString(args, 'source')
+      if (args.confirmed !== true) {
+        // 评审和交付校验是质量关口：去掉它们必须当场问用户（真实事故：Lead 为了让运行通过，
+        // 先后删掉 PRD 评审、系分评审、测分，最后另建只有人工准出的流程，并引用几小时前另一件事的同意）。
+        const file = (await read('space.settings') as SpaceSettings).workflows.find((w) => w.id === id)?.file
+        const current = file === undefined ? '' : await readFile(path.resolve(space.root, file), 'utf8').catch(() => '')
+        const dropped = droppedGates(current, source)
+        if (dropped.length > 0) {
+          throw new TaktToolError('TAKT_FORBIDDEN_FOR_LEAD', `这次修改会去掉${dropped.join('、')}，需要用户确认`,
+            '先用 takt_ask_human 说明要去掉哪些评审 / 交付校验、为什么、去掉后少了什么保障，用户在这次提问里同意后再带 confirmed=true；reason 引用这次的回答，不能引用以前的同意。')
+        }
+      }
+      const result = await write('workflow.source.replace', { id }, { baseRev: requiredString(args, 'baseRev'), source, reason: reason() }) as WorkflowDocument | { error: string; diagnostics?: Array<{ severity: string; message: string; line?: number }> }
       if ('error' in result) {
         const diagnostics = (result.diagnostics ?? []).filter((d) => d.severity === 'error').slice(0, 5)
         return failure('TAKT_STALE_VERSION', result.error === 'conflict' ? '流程在你读取后被改过' : `源码校验没通过：${diagnostics.map((d) => `${d.line ? `第 ${d.line} 行 ` : ''}${d.message}`).join('；')}`,
@@ -299,6 +319,20 @@ async function topLevelEntries(checkout: string, branch: string): Promise<Array<
     }
   }
   return []
+}
+
+/** 新源码比旧源码少了哪些质量关口：评审节点、门禁节点、acceptance 交付校验（按 DSL 调用计数）。 */
+export function droppedGates(before: string, after: string): string[] {
+  const count = (text: string, pattern: RegExp) => text.match(pattern)?.length ?? 0
+  const kinds: Array<[string, RegExp]> = [
+    ['评审节点', /\breview\(\s*\{/g],
+    ['门禁 / 交付校验节点', /\bgate\(\s*\{/g],
+    ['acceptance 交付校验', /\bkind:\s*['"]acceptance['"]/g],
+  ]
+  return kinds.flatMap(([label, pattern]) => {
+    const removed = count(before, pattern) - count(after, pattern)
+    return removed > 0 ? [`${removed} 个${/^[A-Za-z]/.test(label) ? ' ' : ''}${label}`] : []
+  })
 }
 
 function done(summary: string, kind: 'config' | 'agent' | 'skill', name?: string): LeadToolResult {
