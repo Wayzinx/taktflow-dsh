@@ -55,7 +55,11 @@ export class ApprovalInputError extends Error {
 export interface ApprovalsDeps {
   ctx: Pick<HostContext, 'agents'> & Partial<Pick<HostContext, 'userQuestions'>>
   ownership: Ownership
-  runs: RunManager
+  /**
+   * 运行管理器；恢复预检是宿主实现的可选能力，只在本地依赖类型里声明，
+   * 不扩张冻结的 RunManager 接口。生产工厂直接传入 DshRunManager 实例。
+   */
+  runs: RunManager & { assertResumeReady?(space: SpaceHandle, runId: string): Promise<void> }
   /** 审计里代表的人；默认取 os.userInfo().username。 */
   config?: { user?: string }
 }
@@ -233,8 +237,9 @@ export function createApprovals(deps: ApprovalsDeps): Approvals {
         )
       }
       // 待办必须对应当前仍在等待人工的节点；failed/succeeded/stale 等状态不能靠
-      // 一条历史待办隐式推进，取消也不能被当成批准。
-      if (node.status !== 'waiting_human') {
+      // 一条历史待办隐式推进，取消也不能被当成批准。重复失败时 Core 会把节点
+      // 置为 blocked 并生成 retry 选择待办，只有这一种 blocked 例外。
+      if (!answerableNode(node, item)) {
         throw new TaktToolError(
           'TAKT_RUN_BUSY',
           `节点当前不在等待人工回答（${node.status}），不能回答该待办`,
@@ -265,6 +270,13 @@ export function createApprovals(deps: ApprovalsDeps): Approvals {
         type: 'human',
         id: human.id,
         ...(human.via === undefined ? {} : { via: human.via }),
+      }
+
+      // 冷宿主无法恢复含函数流程时，落账后的 onAnswered 只能失败并把回答留成
+      // 孤儿；先做只读预检，失败时待办保持未回答。终止 retry 只走取消，不需要
+      // 恢复运行，必须跳过预检。
+      if (!terminalRetryAnswer(item, payload)) {
+        await deps.runs.assertResumeReady?.(space, item.runId)
       }
 
       // 全部异步 freshness 读取已经结束；落账前紧邻再确认一次租约。
@@ -349,7 +361,7 @@ export function createApprovals(deps: ApprovalsDeps): Approvals {
       if (run.status !== 'running' && run.status !== 'waiting_human') {
         throw new TaktToolError('TAKT_RUN_BUSY', `运行已结束（${run.status}），不能再回答待办`, '重新发起运行。')
       }
-      if (node.status !== 'waiting_human') {
+      if (!answerableNode(node, item)) {
         throw new TaktToolError(
           'TAKT_RUN_BUSY',
           `节点当前不在等待人工回答（${node.status}），不能回答该待办`,
@@ -1076,7 +1088,44 @@ function staleError(reason: string): TaktToolError {
   )
 }
 
-/** 供测试与诊断复用：节点状态是否仍允许回答。 */
-export function answerableNode(node: NodeState | undefined): node is NodeState {
-  return node !== undefined && node.status === 'waiting_human'
+/** Core 在重复失败待办里固定给出的重试选项；缺了它就不是可回答的 retry 卡片。 */
+const RETRY_CHOICE = '再试一次'
+/** Core retry 语义里的终止选项；它只取消运行，不需要恢复函数流程。 */
+export const TERMINAL_RETRY_CHOICE = '终止运行'
+
+/**
+ * 是否是“终止运行”的 retry 回答。
+ *
+ * 只认 Core 重复失败待办（kind=retry + choice）的终止选择；`decision=cancelled`
+ * 保留给系统取消路径。终止回答落账后由 RunManager 直接取消，不再冷恢复。
+ */
+export function terminalRetryAnswer(
+  item: Pick<AttentionItem, 'kind' | 'form'>,
+  answer: { decision?: string; answer?: string },
+): boolean {
+  return item.kind === 'retry' && item.form === 'choice'
+    && (answer.answer === TERMINAL_RETRY_CHOICE || answer.decision === 'cancelled')
+}
+
+/**
+ * 供测试与诊断复用：节点 + 当前待办是否仍允许回答。
+ *
+ * - waiting_human：保持原语义，直接允许；
+ * - blocked：只放行 Core 自己生成的 retry 选择待办
+ *   （runtime.noteFailure → requestAttention(kind='retry')），且必须仍属于该
+ *   节点、是 choice 表单并带有重试选项；
+ * - failed/succeeded/stale/cancelled，或 blocked 但缺少合法 retry 待办：拒绝。
+ *
+ * 传 item 时只判断“节点状态 + 待办形状”；当前待办、attempt、冻结产物版本与
+ * freshness 仍由 answerPersist/autoOnce 单独核对。不传 item 时行为与旧版完全
+ * 一致，避免已有调用方被无意放宽。
+ */
+export function answerableNode(node: NodeState | undefined, item?: AttentionItem): boolean {
+  if (node === undefined) return false
+  if (node.status === 'waiting_human') return true
+  if (node.status !== 'blocked' || item === undefined) return false
+  return item.nodeId === node.id
+    && item.kind === 'retry'
+    && item.form === 'choice'
+    && (item.choices ?? []).includes(RETRY_CHOICE)
 }

@@ -484,10 +484,43 @@ export function eventOf(record) {
 }
 
 /**
+ * 解码顺序拼接的多个 zstd 帧。
+ *
+ * Node 的 zstdDecompressSync 只解第一帧；原生 DSH 日志按追加批次写成多帧，
+ * 第一帧可能只有 header。用 {info:true} 的 engine.bytesWritten 逐帧前进，
+ * 不按 magic bytes 切分（压缩载荷内部也可能出现 magic）。
+ * 末尾不完整/损坏帧只返回此前完整解码的前缀；第一帧就无效时抛错，由调用方跳过。
+ */
+function decompressZstdFrames(zlib, raw) {
+  const chunks = []
+  let offset = 0
+  while (offset < raw.length) {
+    let frame
+    try {
+      frame = zlib.zstdDecompressSync(raw.subarray(offset), { info: true })
+      const consumed = frame?.engine?.bytesWritten
+      if (!Number.isInteger(consumed) || consumed <= 0 || consumed > raw.length - offset) {
+        if (offset === 0) throw new Error('zstd 解压没有返回有效的已消费字节数')
+        break
+      }
+      chunks.push(frame.buffer)
+      offset += consumed
+    } catch (error) {
+      if (offset === 0) throw error
+      break
+    } finally {
+      frame?.engine?.close?.()
+    }
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/**
  * 从会话日志里读全部事件。
  *
  * 隔离 profile 把 session-persistence-jsonl 的 compression 设为 none，日志是
  * 可直接读的 JSONL；同时兼容 Node 自带 zstd 的 .jsonl.zstd（Node ≥ 22.15）。
+ * 原生 DSH 日志可能是多帧拼接的 zstd，需逐帧解码（见 decompressZstdFrames）。
  * 返回顺序与文件内追加顺序一致；找不到会话时返回空数组。
  */
 export async function readSessionRecords(home, sessionId) {
@@ -506,7 +539,7 @@ export async function readSessionRecords(home, sessionId) {
         if (typeof zlib.zstdDecompressSync !== 'function') {
           throw new Error('当前 Node 不支持 zstd；e2e profile 应设置 compression: none')
         }
-        text = zlib.zstdDecompressSync(raw).toString('utf8')
+        text = decompressZstdFrames(zlib, raw)
       } else {
         text = raw.toString('utf8')
       }

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -962,6 +962,100 @@ describe('takt_artifact', () => {
     expect(log.truncated).toBe(false)
   })
 
+  it('inputs/request.md 是唯一允许的 inputs 路径，按原始输入留档', async () => {
+    const h = await boundHarness()
+    const content = '用户原话：修复 greet 边界。\n\nAC-1 空字符串返回默认问候\nAC-2 超长输入不崩溃'
+    const result = await h.call('takt_artifact', {
+      action: 'write',
+      path: 'inputs/request.md',
+      content,
+      reason: '保存用户原始需求与 AC',
+      baseVersion: 0,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.path).toBe('inputs/request.md')
+    expect(result.version).toBe(1)
+    // 身份仍是 Lead agent 代表绑定人，不能借这个入口提升成人写。
+    expect((result.audit as { actor: Actor }).actor).toMatchObject({
+      type: 'agent',
+      role: 'lead',
+      harness: 'dsh-host',
+      onBehalfOf: expect.any(String),
+    })
+    const records = await h.space.stores.workspaces.listArtifacts('REQ-001')
+    expect(records.find((item) => item.path === 'inputs/request.md')?.kind).toBe('input')
+    const read = await h.call('takt_artifact', { action: 'read', path: 'inputs/request.md' })
+    expect(read.ok).toBe(true)
+    expect(read.content).toBe(content)
+
+    // 版本守卫沿用同一套 CAS：旧 baseVersion 不能覆盖刚写入的原始需求。
+    const stale = await h.call('takt_artifact', {
+      action: 'write',
+      path: 'inputs/request.md',
+      content: '篡改',
+      reason: '旧版本覆盖',
+      baseVersion: 0,
+    })
+    expect(stale.ok).toBe(false)
+    expect(stale.error?.code).toBe('TAKT_STALE_VERSION')
+  })
+
+  it('其它 inputs、嵌套 inputs 与近似路径仍然拒绝', async () => {
+    const h = await boundHarness()
+    for (const target of [
+      'inputs/other.md',
+      'inputs/nested/request.md',
+      'inputs/request.md.bak',
+      'inputs/request.txt',
+      'inputs',
+    ]) {
+      const result = await h.call('takt_artifact', {
+        action: 'write',
+        path: target,
+        content: 'x',
+        reason: '越界',
+        baseVersion: 0,
+      })
+      expect(result.ok).toBe(false)
+      expect(result.error?.code).toBe('TAKT_FORBIDDEN_FOR_LEAD')
+    }
+  })
+
+  it('inputs/request.md 的路径穿越与符号链接不会写到空间外', async () => {
+    const h = await boundHarness()
+    for (const target of [
+      'inputs/../inputs/request.md',
+      'inputs/%2e%2e/request.md',
+      'inputs/request.md/../../evil.md',
+    ]) {
+      const result = await h.call('takt_artifact', {
+        action: 'write',
+        path: target,
+        content: 'x',
+        reason: '越界',
+        baseVersion: 0,
+      })
+      expect(result.ok).toBe(false)
+      expect(result.error?.code).toBe('TAKT_INVALID_INPUT')
+    }
+
+    const outside = path.join(h.root, 'outside-request.md')
+    await writeFile(outside, 'outside', 'utf8')
+    const inputsDir = path.join(h.space.root, 'requirements', 'REQ-001', 'inputs')
+    await mkdir(inputsDir, { recursive: true })
+    await symlink(outside, path.join(inputsDir, 'request.md'))
+    const linked = await h.call('takt_artifact', {
+      action: 'write',
+      path: 'inputs/request.md',
+      content: '覆盖空间外',
+      reason: '符号链接越界',
+      baseVersion: 0,
+    })
+    expect(linked.ok).toBe(false)
+    expect(linked.error?.code).toBe('TAKT_INTERNAL')
+    expect(await readFile(outside, 'utf8')).toBe('outside')
+  })
+
   it('clarifications/** 允许写入', async () => {
     const h = await boundHarness()
     const result = await h.call('takt_artifact', {
@@ -1054,8 +1148,11 @@ describe('takt_artifact', () => {
 
   it('assertLeadWritablePath 直接校验白名单', () => {
     expect(assertLeadWritablePath('decisions/lead-notes.md')).toBe('decisions/lead-notes.md')
+    expect(assertLeadWritablePath('inputs/request.md')).toBe('inputs/request.md')
     expect(assertLeadWritablePath('clarifications/nested/q.md')).toBe('clarifications/nested/q.md')
     expect(() => assertLeadWritablePath('decisions/lead-notes.md.bak')).toThrow()
+    expect(() => assertLeadWritablePath('inputs/request.md.bak')).toThrow()
+    expect(() => assertLeadWritablePath('inputs/other.md')).toThrow()
     expect(() => assertLeadWritablePath('clarifications')).toThrow()
   })
 

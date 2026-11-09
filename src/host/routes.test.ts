@@ -432,6 +432,58 @@ describe('registerRoutes：路由与读操作', () => {
   })
 })
 
+describe('registerRoutes：读操作使用真实用户 actor', () => {
+  it('p=me 返回配置用户，不把第一个 owner 当请求者；伪造查询参数无效', async () => {
+    const { host, space, stores } = await makeFixture()
+    stores.config.members = [{ id: 'demo-owner', name: 'Demo Owner', role: 'owner' }]
+
+    const me = await getJson(host, '/api/taktflow', {
+      space: space.root,
+      p: 'me',
+      // 查询串里的身份字段必须被忽略；身份只来自宿主配置。
+      author: 'demo-owner',
+      user: 'demo-owner',
+      by: 'demo-owner',
+      id: 'demo-owner',
+    })
+    expect(me.status).toBe(200)
+    expect(me.body.data).toMatchObject({ id: '面板用户', name: '面板用户' })
+    expect(me.body.data.member).toBeUndefined()
+  })
+
+  it('读身份与写权限一致：非成员写 403，成员按自己的角色写', async () => {
+    const { host, space, stores } = await makeFixture()
+    stores.config.members = [{ id: 'demo-owner', name: 'Demo Owner', role: 'owner' }]
+    const configBefore = await readFile(join(space.root, 'takt.config.json'), 'utf8')
+
+    const denied = await postJson(host, {
+      space: space.root,
+      p: 'space.config.update',
+      params: {},
+      body: { patch: { autonomy: 'checkpoints' }, reason: '测试' },
+    })
+    expect(denied.status).toBe(403)
+    // 权限拒绝不能靠“换成 owner 身份”绕过，也不能落盘。
+    expect(await readFile(join(space.root, 'takt.config.json'), 'utf8')).toBe(configBefore)
+
+    stores.config.members = [
+      { id: 'demo-owner', name: 'Demo Owner', role: 'owner' },
+      { id: '面板用户', name: '面板用户', role: 'maintainer' },
+    ]
+    const me = await getJson(host, '/api/taktflow', { space: space.root, p: 'me' })
+    expect(me.body.data).toMatchObject({ id: '面板用户', member: { id: '面板用户', role: 'maintainer' } })
+
+    const allowed = await postJson(host, {
+      space: space.root,
+      p: 'space.config.update',
+      params: {},
+      body: { patch: { autonomy: 'checkpoints' }, reason: '测试' },
+    })
+    expect(allowed.status).toBe(200)
+    expect(allowed.body.data.config.autonomy).toBe('checkpoints')
+  })
+})
+
 describe('registerRoutes：M2 读操作与运行时目录', () => {
   const harness: HarnessInfo = {
     id: 'native',

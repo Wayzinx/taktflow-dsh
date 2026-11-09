@@ -86,6 +86,12 @@ package 的允许形式包括 `npm test`、`npm run test` 和冻结的 `scripts.
 
 证据包含运行、节点、尝试次数、子会话身份、命令来源与指纹、package scripts 哈希、时间和实际结果。工具调用通过原生会话事件进入 `AgentTrace.tools`；判断测试是否通过应读取自测结果，不能仅凭“工具调用完成”判断。
 
+## 执行证据归档
+
+每次真实调用都会在当前需求写一份不可变执行证据：`evidence/executions/<runId>/<nodeId>/<executionId>/`（`executionId` 为 `<iteration>-<uuid>`，`nodeId` 中的 `/` 转为 `_`）。目录内含 `prior/`、`current/` 两级用例证据归档（`evidence/summary.json`、summary 引用的逐例证据、`output.log`）和 `receipt.json`；同名文件内容不同会拒绝覆盖，因此后续通过不会抹掉更早的失败或恢复过程。
+
+标准流程的正式 `runCases` 使用同一约定：`receipt.json` 记录配置命令与实际执行命令、执行 cwd（integration 工作树）、Git revision/脏状态与基线来源、入口目录树（含相对 helper）的源资产 digest 与执行前后差异、归档路径与真实 `exitCode`；命令在产出结果前失败时 `exitCode` 为 `null` 且 `status=blocked`，不猜测。执行前后源资产（含 helper）不一致时该轮显式 `blocked` 并标记不可信。`evidence/summary.json` 的 `execution` 字段和 `reports/quality.md` 的“执行证据”小节引用对应 receipt 与失败/恢复轨迹。
+
 ## 项目 runner 的约定与信任边界
 
 命令在节点自己的 cwd／worktree 中执行，宿主设置 `TAKT_SELFTEST=1`，并保留当前需求的 `TAKT_WORKSPACE`。项目 runner 可以据此只向 stdout 输出自测结果，把正式交付证据留给后续 gate，避免向本节点无权写入的目录落文件。这个标志不会自动改变 runner 行为，也不意味着可以跳过测试或断言。例如本次测试的末行可输出：

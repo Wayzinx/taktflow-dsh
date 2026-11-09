@@ -510,6 +510,13 @@ function normalizeConfig(config) {
   const next = repos.filter((repo) => repo?.id !== 'app')
   next.push({ id: 'app', path: 'app', defaultBranch: 'main', purpose: 'app', description: 'e2e 临时 app fixture' })
   config.repos = next
+  // fixture 显式登记标准流程后续在空间根执行的 QA 命令；只登记这一条精确命令，
+  // 不预置 runner、不放宽其它信任校验。仓库/worktree 自测不会使用它。
+  const selftest = config.selftest !== null && typeof config.selftest === 'object' && !Array.isArray(config.selftest)
+    ? config.selftest
+    : {}
+  const allowed = Array.isArray(selftest.allowedCommands) ? selftest.allowedCommands.filter((item) => typeof item === 'string') : []
+  config.selftest = { ...selftest, allowedCommands: [...new Set([...allowed, 'node tests/run-cases.mjs'])] }
   return config
 }
 
@@ -760,6 +767,28 @@ async function main() {
         return { error: error instanceof Error ? error.message : String(error) }
       }
     }
+    // 失败诊断只做证据保留：长文本/深层结构截断，不改变执行、断言或门禁语义。
+    const SNAPSHOT_TEXT_LIMIT = 20_000
+    const SNAPSHOT_ITEM_LIMIT = 12
+    const capText = (value) => {
+      if (typeof value !== 'string' || value.length <= SNAPSHOT_TEXT_LIMIT) return value
+      return `${value.slice(0, SNAPSHOT_TEXT_LIMIT)}\n…[truncated ${value.length - SNAPSHOT_TEXT_LIMIT} chars]`
+    }
+    const compactValue = (value, depth = 0) => {
+      if (typeof value === 'string') return capText(value)
+      if (Array.isArray(value)) {
+        if (depth >= 6) return '[truncated depth]'
+        return value.slice(0, SNAPSHOT_ITEM_LIMIT).map((item) => compactValue(item, depth + 1))
+      }
+      if (value !== null && typeof value === 'object') {
+        if (depth >= 6) return '[truncated depth]'
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, compactValue(item, depth + 1)]))
+      }
+      return value
+    }
+    // 只有 failed/blocked 节点保留完整诊断；正常节点维持原来的精简形状。
+    const failedNodeIds = new Set()
+    const failedNode = (id) => [...failedNodeIds].some((failed) => sameNodeId(id, failed))
     if (pageUrl !== undefined && jar !== undefined && runId !== undefined) {
       snapshot.run = await safe(async () => {
         const detail = await panelReadSafe('run', { runId })
@@ -770,14 +799,30 @@ async function main() {
           status: run.status,
           startedAt: run.startedAt,
           endedAt: run.endedAt,
-          nodes: Object.fromEntries(Object.entries(run.nodes ?? {}).map(([id, node]) => [id, {
-            status: node.status,
-            attempts: node.attempts ?? 0,
-            iteration: node.iteration ?? null,
-            round: node.round ?? null,
-            reworks: node.reworks ?? 0,
-            error: node.error ?? null,
-          }])),
+          nodes: Object.fromEntries(Object.entries(run.nodes ?? {}).map(([id, node]) => {
+            const base = {
+              status: node.status,
+              attempts: node.attempts ?? 0,
+              iteration: node.iteration ?? null,
+              round: node.round ?? null,
+              reworks: node.reworks ?? 0,
+              error: node.error ?? null,
+            }
+            if (node.status !== 'failed' && node.status !== 'blocked') return [id, base]
+            failedNodeIds.add(id)
+            return [id, {
+              ...base,
+              startedAt: node.startedAt ?? null,
+              endedAt: node.endedAt ?? null,
+              summary: capText(node.summary ?? null),
+              checks: compactValue(node.checks ?? null),
+              result: compactValue(node.result ?? null),
+              inputs: compactValue(node.inputs ?? []),
+              outputs: compactValue(node.outputs ?? []),
+              worktree: node.worktree === undefined ? null : compactValue(node.worktree),
+              failures: compactValue(node.failures ?? null),
+            }]
+          })),
         }
       })
       snapshot.events = await safe(async () => {
@@ -788,15 +833,69 @@ async function main() {
           types: [...new Set(list.map((event) => event?.type))].filter(Boolean).sort(),
           reviewRounds: list.filter((event) => event?.runId === runId && event.type === 'review.round').length,
           humanAnswered: list.filter((event) => event?.runId === runId && event.type === 'human.answered').length,
+          // 决策产物每次写入都留事件；两次写入说明先代答后升级（或相反）。
+          decisionArtifacts: list
+            .filter((event) => event?.runId === runId && event.type === 'artifact.written'
+              && String(event?.data?.ref?.path ?? '').startsWith('decisions/auto-answers/'))
+            .map((event) => ({
+              ts: event.ts,
+              actor: event.actor,
+              path: event.data.ref.path,
+              version: event.data.ref.version,
+              reason: event.data.reason ?? null,
+            })),
+          humanRequested: list
+            .filter((event) => event?.runId === runId && event.type === 'human.requested')
+            .map((event) => ({ ts: event.ts, nodeId: event.nodeId, data: event.data })),
+          // 失败节点保留自检与 harness 诊断；长文本截断，count/types 仍按全量列表统计。
+          failedNodeEvents: list
+            .filter((event) => event?.runId === runId && event.nodeId !== undefined && failedNode(event.nodeId))
+            .filter((event) => event.type === 'node.checks' || event.type === 'node.failed'
+              || event.type === 'harness.message'
+              || (event.type === 'harness.tool_call' && /selftest/i.test(JSON.stringify(event.data ?? {}))))
+            .slice(-40)
+            .map((event) => ({
+              seq: event.seq,
+              ts: event.ts,
+              type: event.type,
+              nodeId: event.nodeId,
+              actor: event.actor,
+              data: compactValue(event.data),
+            })),
         }
       })
       snapshot.traces = await safe(async () => {
         const list = await fetchTrace()
+        // 失败节点的 trace 即使 status=completed（例如完成标准 c2 未满足）也保留，
+        // 否则只能看到节点失败、看不到子 Agent 的真实停止原因与最后输出。
+        const failedTraces = list.filter((trace) => trace?.status === 'failed' || trace?.status === 'blocked'
+          || (trace?.nodeId !== undefined && failedNode(trace.nodeId)))
         return {
           count: list.length,
           roles: [...new Set(list.map((trace) => trace?.role))].filter(Boolean).sort(),
           token: traceTokenSummary(list),
           denials: list.reduce((sum, trace) => sum + (Array.isArray(trace.denials) ? trace.denials.length : 0), 0),
+          failed: failedTraces.slice(0, 20).map((trace) => ({
+            role: trace.role,
+            nodeId: trace.nodeId,
+            attempt: trace.attempt,
+            status: trace.status,
+            stopReason: capText(trace.stopReason ?? null),
+            error: capText(trace.error ?? null),
+            finalText: capText(trace.finalText ?? null),
+            tools: (Array.isArray(trace.tools) ? trace.tools : []).slice(-30).map((tool) => ({
+              name: capText(tool.name),
+              summary: capText(tool.summary),
+              ok: tool.ok,
+              durationMs: tool.durationMs,
+            })),
+            denials: (Array.isArray(trace.denials) ? trace.denials : []).slice(0, 20).map((denial) => ({
+              tool: capText(denial.tool),
+              path: capText(denial.path),
+              reason: capText(denial.reason),
+              at: denial.at,
+            })),
+          })),
         }
       })
       snapshot.probe = await safe(async () => {
@@ -840,7 +939,33 @@ async function main() {
       snapshot.autoAnswers = await safe(async () => {
         const dir = path.join(await requirementDir(), 'decisions', 'auto-answers')
         const files = await listFiles(dir, (item) => item.endsWith('.md'))
-        return { count: files.length, files: files.map((file) => `decisions/auto-answers/${path.basename(file)}`) }
+        const entries = []
+        for (const file of files) {
+          // 失败现场必须留下决策正文：只有文件路径无法判断是“代答”还是“升级”。
+          const text = await readFile(file, 'utf8').catch(() => '')
+          entries.push({
+            path: `decisions/auto-answers/${path.basename(file)}`,
+            bytes: text.length,
+            text: text.slice(0, 20_000),
+          })
+        }
+        return {
+          count: files.length,
+          files: entries.map((entry) => entry.path),
+          entries,
+        }
+      })
+      snapshot.workspaceFiles = await safe(async () => {
+        const workspace = await requirementDir()
+        const listed = []
+        for (const rel of ['inputs', 'spec', 'decisions', 'test-plan', 'cases', 'scripts', 'evidence', 'reports', 'reviews', 'tasks']) {
+          const files = await listFiles(path.join(workspace, rel), () => true)
+          for (const file of files) {
+            const relative = path.relative(workspace, file).split(path.sep).join('/')
+            listed.push({ path: relative, bytes: (await stat(file)).size })
+          }
+        }
+        return listed.sort((left, right) => left.path.localeCompare(right.path))
       })
       snapshot.artifacts = await safe(async () => {
         const workspace = await requirementDir()
@@ -853,6 +978,23 @@ async function main() {
         checks['cases/'] = { exists: caseFiles.length > 0, count: caseFiles.length }
         return checks
       })
+      // automate 失败时保留 selftest 账本与 runner 正文；只读快照，不执行脚本，也不据此判 PASS。
+      if (failedNode('automate') && Array.isArray(snapshot.workspaceFiles)) {
+        snapshot.automationFailure = await safe(async () => {
+          const workspace = await requirementDir()
+          const listed = snapshot.workspaceFiles
+          const ledgerPaths = listed.filter((item) => /^evidence\/selftest-.*\.json$/.test(item.path)).slice(0, 10)
+          const runnerPaths = listed.filter((item) => item.path === 'scripts/run-cases.mjs').slice(0, 1)
+          const readEntry = async (item) => {
+            const text = await readFile(path.join(workspace, item.path), 'utf8').catch(() => '')
+            return { path: item.path, bytes: text.length, text: capText(text) }
+          }
+          return {
+            ledger: await Promise.all(ledgerPaths.map(readEntry)),
+            runner: await Promise.all(runnerPaths.map(readEntry)),
+          }
+        })
+      }
     }
     if (home !== undefined && sessionId !== undefined) {
       snapshot.tokens = await safe(async () => {
@@ -1285,6 +1427,10 @@ async function main() {
       if (!Array.isArray(after?.workflows) || !after.workflows.includes(STANDARD_WORKFLOW_FILE)) {
         throw new Error('takt.config.json 没有注册标准 workflow')
       }
+      if (!Array.isArray(after?.selftest?.allowedCommands)
+        || !after.selftest.allowedCommands.includes('node tests/run-cases.mjs')) {
+        throw new Error('takt.config.json 没有登记标准 QA caseCommand 白名单')
+      }
 
       // 启动前必须没有任何最终业务产物；否则无法证明它们由真实节点生成。
       const workspace = await requirementDir()
@@ -1407,6 +1553,12 @@ async function main() {
     ].join('\n')
 
     await step('lead-start', async () => {
+      // 启动前再次确认 QA caseCommand 白名单已冻结在空间配置里；只登记精确命令。
+      const frozenConfig = await readConfig()
+      if (!Array.isArray(frozenConfig?.selftest?.allowedCommands)
+        || !frozenConfig.selftest.allowedCommands.includes('node tests/run-cases.mjs')) {
+        throw new Error('标准 QA caseCommand 白名单未在启动前冻结')
+      }
       // 启动前先冻结历史 runId；后面只认集合外、同 workflow、startedAt 在本次 prompt 之后的新运行。
       const existing = await panelReadSafe('runs', { requirement: requirementId })
       const existingRuns = (Array.isArray(existing) ? existing : [])

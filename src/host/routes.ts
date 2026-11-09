@@ -221,7 +221,7 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
         path: '/api/taktflow',
         methods: ['GET'],
         requestBody: 'buffered',
-        fetch: (request) => handleRead(request, service, core),
+        fetch: (request) => handleRead(request, service, core, user),
       }),
     'taktflow read route',
   )
@@ -254,7 +254,7 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
         path: '/api/taktflow.workflow-stream',
         methods: ['GET'],
         requestBody: 'buffered',
-        fetch: (request) => handleWorkflowStream(request, service, core, active, shutdown.signal),
+        fetch: (request) => handleWorkflowStream(request, service, core, active, shutdown.signal, user),
       }),
     'taktflow workflow stream route',
   )
@@ -285,7 +285,7 @@ export function registerRoutes(ctx: HostContext, service: TaktflowService, confi
   )
 }
 
-async function handleRead(request: Request, service: TaktflowService, core: ApiCore): Promise<Response> {
+async function handleRead(request: Request, service: TaktflowService, core: ApiCore, user: string): Promise<Response> {
   try {
     const url = new URL(request.url)
     const op = url.searchParams.get('p') ?? undefined
@@ -300,7 +300,9 @@ async function handleRead(request: Request, service: TaktflowService, core: ApiC
       if (key !== 'space' && key !== 'p') params[key] = value
     }
 
-    const data = await core.read(space.stores, op as ReadOp, params)
+    // 读也必须带真实用户 actor：api-core 的缺省 actor 是空间第一个 owner，
+    // 会把任何浏览器请求都伪装成 owner（例如 p=me 返回 demo-owner）。
+    const data = await core.read(space.stores, op as ReadOp, params, humanActor(user))
     return json({ ok: true, data })
   } catch (error) {
     return errorResponse(error)
@@ -356,8 +358,12 @@ async function dispatchCoreWrite(
 ): Promise<unknown> {
   const params = coreParams(envelope.params)
   // 忽略客户端可能塞进 body 的 author/by：人的入口固定是 dsh-web。
-  const actor: Actor = { type: 'human', id: user, via: 'dsh-web' }
-  return core.write(space.stores, op as WriteOp, params, envelope.body, actor)
+  return core.write(space.stores, op as WriteOp, params, envelope.body, humanActor(user))
+}
+
+/** 面板读写共用同一个可信人类 actor：身份只来自宿主配置，不读查询参数/请求体。 */
+function humanActor(user: string): Actor {
+  return { type: 'human', id: user, via: 'dsh-web' }
 }
 
 /** api-core 的 params 与查询串同形：键值都必须是字符串。 */
@@ -761,6 +767,7 @@ async function handleWorkflowStream(
   core: ApiCore,
   active: Set<ActiveStream>,
   shutdown: AbortSignal,
+  user: string,
 ): Promise<Response> {
   const signals = [request.signal, shutdown]
   try {
@@ -771,7 +778,8 @@ async function handleWorkflowStream(
     if (id === '') throw new ApiError(400, '缺少 id 参数')
 
     // 校验期间同样可能与 abort/宿主卸载竞速；失败时保持 JSON 400/404 语义。
-    await abortable(core.read(space.stores, 'workflow', { id }), signals)
+    // 读校验也带真实用户 actor，和写入口保持一致。
+    await abortable(core.read(space.stores, 'workflow', { id }, humanActor(user)), signals)
     return await openWorkflowStream(request, core, space, id, active, shutdown)
   } catch (error) {
     if (error instanceof StreamAborted) return new Response(null, { status: 204 })

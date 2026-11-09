@@ -11,6 +11,7 @@ import {
   type ArtifactRef,
   type AttentionItem,
   type Expansion,
+  type NodeState,
   type NodeStatus,
   type ProjectStores,
   type RunState,
@@ -23,8 +24,10 @@ import {
   REJECT_LABEL,
   ApprovalInputError,
   PlaceholderApprovals,
+  answerableNode,
   autoAnswerPath,
   createApprovals,
+  type ApprovalsDeps,
 } from './approvals.js'
 import type {
   Agent,
@@ -39,7 +42,6 @@ import {
   type AnswerInput,
   type Approvals,
   type Ownership,
-  type RunManager,
   type SpaceHandle,
 } from './types.js'
 
@@ -69,6 +71,8 @@ interface PendingOptions {
   nodeStatus?: NodeStatus
   itemAttempt?: number
   nodeAttempts?: number
+  /** 待办类别；retry 是 Core 重复失败时生成的选择待办。 */
+  kind?: AttentionItem['kind']
   /** 动态节点：静态 workflow 快照里没有，只在运行状态 expansions 中出现。 */
   nodeId?: string
   expansions?: Expansion[]
@@ -137,6 +141,7 @@ async function makePending(options: PendingOptions = {}): Promise<PendingFixture
     ask: '请审批规格',
     form: options.form ?? 'approve',
     ...(options.choices === undefined ? {} : { choices: options.choices }),
+    ...(options.kind === undefined ? {} : { kind: options.kind }),
     attempt: options.itemAttempt ?? 1,
     subjects: refs.map((ref) => ({ ...ref })),
   })
@@ -203,17 +208,23 @@ function ownershipStub(): { ownership: Ownership; ensureLease: ReturnType<typeof
   return { ownership, ensureLease }
 }
 
-function runsStub(): { runs: RunManager; onAnswered: ReturnType<typeof vi.fn> } {
+function runsStub(): {
+  runs: ApprovalsDeps['runs']
+  onAnswered: ReturnType<typeof vi.fn>
+  assertResumeReady: ReturnType<typeof vi.fn>
+} {
   const onAnswered = vi.fn(async (_space: SpaceHandle, _item: AttentionItem) => {})
-  const runs: RunManager = {
+  const assertResumeReady = vi.fn(async (_space: SpaceHandle, _runId: string) => {})
+  const runs: ApprovalsDeps['runs'] = {
     async start() { return { runId: 'run-x', deduped: false } },
     async cancel() {},
     async resume() {},
+    assertResumeReady,
     async get() { return undefined },
     onAnswered,
     async disposeAll() {},
   }
-  return { runs, onAnswered }
+  return { runs, onAnswered, assertResumeReady }
 }
 
 function answerInput(fixture: PendingFixture, patch: Partial<AnswerInput> = {}): AnswerInput {
@@ -504,6 +515,270 @@ describe('approvals.answer：落账、幂等与过期', () => {
     ).rejects.toBeInstanceOf(ApprovalInputError)
     const answered = await approvals.answer(fixture.space, answerInput(fixture, { decision: undefined, answer: '同意' }))
     expect(answered.answer).toBe('同意')
+  })
+})
+
+describe('approvals.answer：blocked retry 待办', () => {
+  const RETRY_CHOICES = ['再试一次', '交给人处理', '终止运行']
+
+  it.each(RETRY_CHOICES)('重复失败的 blocked 节点允许回答：%s', async (choice) => {
+    const fixture = await makePending({
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      itemAttempt: 2,
+      nodeAttempts: 2,
+    })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered, assertResumeReady } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    const answered = await approvals.answer(fixture.space, answerInput(fixture, {
+      attempt: 2,
+      decision: 'choice',
+      answer: choice,
+    }))
+
+    expect(answered).toMatchObject({
+      decision: 'choice',
+      answer: choice,
+      answeredBy: { type: 'human', id: '审批人', via: 'dsh-web' },
+    })
+    expect(onAnswered).toHaveBeenCalledTimes(1)
+    // 终止运行只需要取消；其它选择仍要在落账前确认当前宿主能恢复运行。
+    if (choice === '终止运行') expect(assertResumeReady).not.toHaveBeenCalled()
+    else expect(assertResumeReady).toHaveBeenCalledWith(fixture.space, fixture.runId)
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBe(answered.answeredAt)
+  })
+
+  it('非终止回答的恢复预检失败时不落账，待办保持未回答', async () => {
+    const fixture = await makePending()
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered, assertResumeReady } = runsStub()
+    assertResumeReady.mockRejectedValueOnce(new TaktToolError(
+      'TAKT_RUN_BUSY',
+      '当前版本不能在新宿主恢复包含函数的流程',
+      '在原宿主继续等待中的运行；原宿主已退出时，请取消旧运行并重新启动。',
+    ))
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    const error = await expectTaktError(approvals.answer(fixture.space, answerInput(fixture)), 'TAKT_RUN_BUSY')
+
+    expect(error.message).toContain('包含函数')
+    expect(assertResumeReady).toHaveBeenCalledWith(fixture.space, fixture.runId)
+    expect(onAnswered).not.toHaveBeenCalled()
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('blocked 但缺少 retry 待办时仍拒绝', async () => {
+    const fixture = await makePending({ nodeStatus: 'blocked', form: 'choice', choices: RETRY_CHOICES })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answer(fixture.space, answerInput(fixture, { decision: 'choice', answer: '再试一次' })),
+      'TAKT_RUN_BUSY',
+    )
+    expect(onAnswered).not.toHaveBeenCalled()
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('retry 待办不是 choice 表单时仍拒绝', async () => {
+    const fixture = await makePending({ nodeStatus: 'blocked', form: 'approve', kind: 'retry' })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(approvals.answer(fixture.space, answerInput(fixture)), 'TAKT_RUN_BUSY')
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+
+  it('retry choice 待办缺少重试选项时仍拒绝', async () => {
+    const fixture = await makePending({
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: ['批准', '打回'],
+      kind: 'retry',
+    })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answer(fixture.space, answerInput(fixture, { decision: 'choice', answer: '批准' })),
+      'TAKT_RUN_BUSY',
+    )
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+
+  it('blocked retry 的旧 attempt 仍按过期拒绝', async () => {
+    const fixture = await makePending({
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      itemAttempt: 1,
+      nodeAttempts: 2,
+    })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answer(fixture.space, answerInput(fixture, { attempt: 1, decision: 'choice', answer: '再试一次' })),
+      'TAKT_STALE_VERSION',
+    )
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+
+  it('blocked retry 不是节点最新待办时仍按过期拒绝', async () => {
+    const fixture = await makePending({
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      itemAttempt: 2,
+      nodeAttempts: 2,
+    })
+    await fixture.stores.attention.create({
+      requestId: `${fixture.runId}:approve#2`,
+      runId: fixture.runId,
+      nodeId: 'approve',
+      requirementId: fixture.requirementId,
+      ask: '请重新选择',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      attempt: 2,
+      subjects: fixture.refs.map((ref) => ({ ...ref })),
+    })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answer(fixture.space, answerInput(fixture, { attempt: 2, decision: 'choice', answer: '再试一次' })),
+      'TAKT_STALE_VERSION',
+    )
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+
+  it('blocked retry 的冻结产物出现新版本时仍按过期拒绝', async () => {
+    const fixture = await makePending({
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      itemAttempt: 2,
+      nodeAttempts: 2,
+    })
+    await fixture.stores.workspaces.writeArtifact({
+      ref: { workspace: fixture.requirementId, path: 'spec/spec.md' },
+      content: 'spec v2',
+      kind: 'spec',
+      author: { type: 'human', id: '审批人' },
+      reason: '人工更新',
+    })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answer(fixture.space, answerInput(fixture, { attempt: 2, decision: 'choice', answer: '终止运行' })),
+      'TAKT_STALE_VERSION',
+    )
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+
+  it.each(['succeeded', 'failed', 'cancelled'] as const)('终态运行（%s）上的 blocked retry 仍拒绝', async (runStatus) => {
+    const fixture = await makePending({
+      runStatus,
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      itemAttempt: 2,
+      nodeAttempts: 2,
+    })
+    const { ownership } = ownershipStub()
+    const { runs, onAnswered } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(
+      approvals.answer(fixture.space, answerInput(fixture, { attempt: 2, decision: 'choice', answer: '终止运行' })),
+      'TAKT_RUN_BUSY',
+    )
+    expect(onAnswered).not.toHaveBeenCalled()
+  })
+
+  it('AI 代答 blocked retry 仍受 choice 表单与 human 节点规则限制', async () => {
+    const fixture = await makePending({
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      itemAttempt: 2,
+      nodeAttempts: 2,
+    })
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(approvals.answerAsAgent!(fixture.space, agentInput(fixture, {
+      attempt: 2,
+      disposition: 'answer',
+      answer: '终止运行',
+    })), 'TAKT_FORBIDDEN_FOR_LEAD')
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('AI 代答 blocked retry 时 onBehalfOf 不合法仍拒绝', async () => {
+    const fixture = await makePending({
+      nodeStatus: 'blocked',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      itemAttempt: 2,
+      nodeAttempts: 2,
+    })
+    const { ownership } = ownershipStub()
+    const { runs } = runsStub()
+    const approvals = createApprovals({ ctx: ctxFor(rootAgent()), ownership, runs, config: { user: '审批人' } })
+
+    await expectTaktError(approvals.answerAsAgent!(fixture.space, agentInput(fixture, {
+      attempt: 2,
+      disposition: 'answer',
+      answer: '终止运行',
+      by: { type: 'agent', role: 'release-reviewer', harness: 'dsh-host', onBehalfOf: '别人' },
+    })), 'TAKT_FORBIDDEN_FOR_LEAD')
+    expect((await findItem(fixture.stores, fixture.requestId))?.answeredAt).toBeUndefined()
+  })
+
+  it('answerableNode 不传待办时保持旧语义，只放行合法 blocked retry', () => {
+    const waiting: NodeState = { id: 'approve', status: 'waiting_human', attempts: 1, outputs: [] }
+    const blocked: NodeState = { ...waiting, status: 'blocked' }
+    const retry: AttentionItem = {
+      requestId: 'run-approval-1:approve',
+      runId: 'run-approval-1',
+      nodeId: 'approve',
+      requirementId: 'req-1',
+      ask: '重复失败',
+      form: 'choice',
+      choices: RETRY_CHOICES,
+      kind: 'retry',
+      createdAt: new Date().toISOString(),
+    }
+
+    expect(answerableNode(waiting)).toBe(true)
+    expect(answerableNode(blocked)).toBe(false)
+    expect(answerableNode(blocked, retry)).toBe(true)
+    expect(answerableNode(blocked, { ...retry, kind: 'node' })).toBe(false)
+    expect(answerableNode(blocked, { ...retry, form: 'approve' })).toBe(false)
+    expect(answerableNode(blocked, { ...retry, choices: ['批准'] })).toBe(false)
+    expect(answerableNode(blocked, { ...retry, nodeId: 'other' })).toBe(false)
+    expect(answerableNode(undefined)).toBe(false)
   })
 })
 

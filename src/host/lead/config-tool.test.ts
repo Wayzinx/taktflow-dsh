@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { isJsonValue } from '@deepseek-ai/dsh-util-values'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createInsights, initProject } from '@taktflow/core'
 import type { Agent, DefineTool, HostContext, ToolDefinition, ToolExecutionContext } from '../dsh-types.js'
@@ -42,6 +43,32 @@ async function harness() {
 }
 
 describe('takt_config', () => {
+  it('show 输出通过宿主 lossless JSON 契约，嵌套可选字段都有 JSON 缺省', async () => {
+    const h = await harness()
+    const before = await h.call({ action: 'show' })
+    expect(before.ok).toBe(true)
+    expect(isJsonValue(before)).toBe(true)
+    // 旧布局先给出问题清单；没有 legacy 时用显式 null，而不是 undefined。
+    expect(Array.isArray(before.legacy)).toBe(true)
+
+    await h.call({ action: 'upgrade', dryRun: false, confirmed: true, reason: '准备' })
+    const after = await h.call({ action: 'show' })
+    expect(after.ok).toBe(true)
+    expect(isJsonValue(after)).toBe(true)
+    const roles = after.roles as Array<Record<string, unknown>>
+    expect(roles.length).toBeGreaterThan(0)
+    for (const role of roles) {
+      // 这些字段来自 AgentProfile 的可选部分；undefined 会让 dsh 拒绝整个工具结果。
+      expect(Object.prototype.hasOwnProperty.call(role, 'readScope')).toBe(true)
+      expect(Object.prototype.hasOwnProperty.call(role, 'model')).toBe(true)
+      expect(role.readScope === null || Array.isArray(role.readScope)).toBe(true)
+      expect(role.model === null || typeof role.model === 'string').toBe(true)
+      expect(Object.values(role).every((value) => value !== undefined)).toBe(true)
+    }
+    // 升级后不再有旧布局问题；显式 null 而不是 undefined。
+    expect(after.legacy).toBeNull()
+  })
+
   it('旧布局先预览升级，确认后执行；show 能看到流程与角色', async () => {
     const h = await harness()
     const before = await h.call({ action: 'show' })

@@ -11,6 +11,14 @@ const profile: AgentProfile = {
   role: 'dev', title: '开发', description: '实现节点任务', instructions: '遵守已有接口',
   harness: { harness: 'dsh-host' }, skills: ['coding'], writeScope: ['out/**'], allowBash: false,
 }
+const pmProfile: AgentProfile = {
+  role: 'pm', title: '产品', description: '写需求', instructions: '',
+  harness: { harness: 'dsh-host' }, skills: [], writeScope: ['.takt/workspaces/**', 'requirements/**'], allowBash: false,
+}
+const customCodeProfile: AgentProfile = {
+  role: 'custom-code', title: '自定义开发', description: '', instructions: '',
+  harness: { harness: 'dsh-host' }, skills: [], writeScope: ['services/api/src/**'], allowBash: false,
+}
 const space = { root: path.resolve('space-fixture') } as SpaceHandle
 const writable = { readOnly: false, allowBash: false }
 
@@ -219,5 +227,60 @@ describe('动态角色 preset', () => {
     expect(handle.skills).toEqual([])
     await handle.release()
     await ctx.dispose()
+  })
+
+  it('文档型角色不挂自测，代码与自定义代码角色保留，权限范围不变', async () => {
+    const ctx = new FakeHostContext()
+    ctx.setService('agentPresets', ctx.agentPresets)
+    const presets = new DshRolePresets(ctx, {
+      profiles: { pm: pmProfile, dev: profile, 'custom-code': customCodeProfile },
+    })
+    const configOf = () => {
+      const rows = ctx.presets.at(-1)!.plugins as Array<{ id: string; config?: Record<string, unknown> }>
+      return rows.find((row) => row.id === 'taktflow-role')!.config!
+    }
+
+    const pm = await presets.acquire(space, 'pm', writable)
+    expect(configOf()).toMatchObject({ selftest: false, writeScope: pmProfile.writeScope })
+    await pm.release()
+
+    const dev = await presets.acquire(space, 'dev', writable)
+    expect(configOf()).toMatchObject({ selftest: true, writeScope: profile.writeScope })
+    await dev.release()
+
+    const custom = await presets.acquire(space, 'custom-code', writable)
+    expect(configOf()).toMatchObject({ selftest: true, writeScope: customCodeProfile.writeScope })
+    await custom.release()
+  })
+
+  it('自定义产物路径的文档角色不挂自测，只读代码角色也不挂', async () => {
+    const ctx = new FakeHostContext()
+    ctx.setService('agentPresets', ctx.agentPresets)
+    const docs: AgentProfile = {
+      role: 'docs', title: '文档', description: '', instructions: '',
+      harness: { harness: 'dsh-host' }, skills: [], writeScope: ['artifacts/reqs/**'], allowBash: false,
+    }
+    const presets = new DshRolePresets(ctx, { profiles: { docs, dev: profile } })
+    const customSpace = {
+      root: path.resolve('space-fixture'),
+      stores: {
+        paths: {
+          requirements: path.resolve('space-fixture', 'artifacts', 'reqs'),
+          knowledge: path.resolve('space-fixture', 'docs', 'wiki'),
+        },
+      },
+    } as unknown as SpaceHandle
+    const configOf = () => {
+      const rows = ctx.presets.at(-1)!.plugins as Array<{ id: string; config?: Record<string, unknown> }>
+      return rows.find((row) => row.id === 'taktflow-role')!.config!
+    }
+
+    const docsHandle = await presets.acquire(customSpace, 'docs', writable)
+    expect(configOf().selftest).toBe(false)
+    await docsHandle.release()
+
+    const readOnly = await presets.acquire(customSpace, 'dev', { readOnly: true, allowBash: false, writeScope: ['src/**'] })
+    expect(configOf().selftest).toBe(false)
+    await readOnly.release()
   })
 })

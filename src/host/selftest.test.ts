@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } f
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { isJsonValue } from '@deepseek-ai/dsh-util-values'
 import {
   agent,
   initProject,
@@ -130,6 +131,25 @@ async function fixture(options: FixtureOptions = {}) {
 
 const envCommand = (text: string) => ({ deploy: 'true', testCommand: text })
 
+/**
+ * 在空间根下注册一个仓库/worktree 子 Agent，cwd 不等于 space.root。
+ * 生产里 dev 的 .takt/worktrees 工作树就是这种形态；这里只用于验证命令作用域隔离。
+ */
+async function registerRepo(
+  f: Awaited<ReturnType<typeof fixture>>,
+  packageJson: unknown = { scripts: { test: 'node -e "console.log(\'repo-package\')"' } },
+) {
+  const repo = path.join(f.root, 'repo')
+  await mkdir(repo, { recursive: true })
+  await writeFile(path.join(repo, 'package.json'), JSON.stringify(packageJson))
+  const child = fakeAgent('repo-child', repo)
+  f.live.set(child.id, child)
+  f.permissions.register({ ...f.scope, childId: child.id, cwd: repo })
+  await f.service.register({ ...f.registrationInput, childId: child.id, sessionId: child.id, cwd: repo })
+  const exec = fakeExec(f.controller.signal, child)
+  return { repo, child, exec, run: (args: unknown = {}) => f.service.run(child.id, args, exec) }
+}
+
 describe('受控自测命令与过滤', () => {
   it('拒绝 command/cwd/env 和注入字符，且不产生副作用', async () => {
     const marker = 'selftest-pwned'
@@ -183,6 +203,88 @@ describe('受控自测命令与过滤', () => {
 
     const missing = await fixture()
     await expect(missing.service.run(childId, {}, missing.exec)).rejects.toThrow('没有 package.json test 脚本')
+  })
+})
+
+describe('仓库与空间自测命令隔离', () => {
+  it('仓库 worktree 忽略仅用于空间 QA 的 caseCommand，执行仓库 package test', async () => {
+    const runCommand = vi.fn<NonNullable<SelftestServiceOptions['runCommand']>>().mockResolvedValue({ code: 0, output: '' })
+    const f = await fixture({
+      packageJson: { scripts: { test: 'node --test' } },
+      selftest: { allowedCommands: ['node tests/run-cases.mjs'] },
+      args: { caseCommand: 'node tests/run-cases.mjs' },
+      serviceOptions: { runCommand },
+    })
+    const before = JSON.stringify((await f.space.stores.runs.get(nodeRef.runId))!.args)
+    const repo = await registerRepo(f, { scripts: { test: 'node --test' } })
+    const result = await repo.run()
+    expect(result).toMatchObject({ commandSource: 'package-script', command: 'npm test', succeeded: true })
+    expect(runCommand.mock.calls.map((call) => call[0])).toEqual(['npm test'])
+    // 解析和登记不能改写原始 run.args。
+    expect(JSON.stringify((await f.space.stores.runs.get(nodeRef.runId))!.args)).toBe(before)
+  })
+
+  it('仓库 worktree 的显式 testCommand 未受信时拒绝，即使 caseCommand 已受信也不回退', async () => {
+    const caseCommand = 'node tests/run-cases.mjs'
+    const runCommand = vi.fn<NonNullable<SelftestServiceOptions['runCommand']>>()
+    const f = await fixture({
+      selftest: { allowedCommands: [caseCommand] },
+      args: { caseCommand, testCommand: `node -e "console.log('untrusted')"` },
+      serviceOptions: { runCommand },
+    })
+    const repo = await registerRepo(f)
+    await expect(repo.run()).rejects.toThrow('启动参数 testCommand 未受信')
+    expect(runCommand).not.toHaveBeenCalled()
+  })
+
+  it('空间根只执行精确白名单的 QA caseCommand，近似命令拒绝且不回退 package test', async () => {
+    const qa = 'node tests/run-cases.mjs'
+    const runCommand = vi.fn<NonNullable<SelftestServiceOptions['runCommand']>>().mockResolvedValue({ code: 0, output: '' })
+    const f = await fixture({
+      packageJson: { scripts: { test: 'node --test' } },
+      selftest: { allowedCommands: [qa] },
+      args: { caseCommand: qa },
+      serviceOptions: { runCommand },
+    })
+    const result = await f.service.run(childId, {}, f.exec)
+    expect(result).toMatchObject({ commandSource: 'run-args:caseCommand', command: qa, succeeded: true })
+    expect(runCommand.mock.calls.map((call) => call[0])).toEqual([qa])
+
+    const deniedRun = vi.fn<NonNullable<SelftestServiceOptions['runCommand']>>()
+    const denied = await fixture({
+      packageJson: { scripts: { test: 'node --test' } },
+      selftest: { allowedCommands: [qa] },
+      args: { caseCommand: `${qa} --watch` },
+      serviceOptions: { runCommand: deniedRun },
+    })
+    await expect(denied.service.run(childId, {}, denied.exec)).rejects.toThrow('启动参数 caseCommand 未受信')
+    expect(deniedRun).not.toHaveBeenCalled()
+  })
+
+  it('仓库自测仍执行冻结 package scripts 校验', async () => {
+    const runCommand = vi.fn<NonNullable<SelftestServiceOptions['runCommand']>>()
+    const f = await fixture({
+      selftest: { allowedCommands: ['node tests/run-cases.mjs'] },
+      args: { caseCommand: 'node tests/run-cases.mjs' },
+      serviceOptions: { runCommand },
+    })
+    const repo = await registerRepo(f, { scripts: { test: 'node --test' } })
+    await writeFile(path.join(repo.repo, 'package.json'), JSON.stringify({ scripts: { test: 'node --test --watch' } }))
+    await expect(repo.run()).rejects.toThrow('执行前已变化')
+    expect(runCommand).not.toHaveBeenCalled()
+  })
+
+  it('真实执行后的 SelftestResult 通过 DSH lossless JSON 校验', async () => {
+    const f = await fixture({
+      selftest: { allowedCommands: ['node tests/run-cases.mjs'] },
+      args: { caseCommand: 'node tests/run-cases.mjs' },
+    })
+    const repo = await registerRepo(f, {
+      scripts: { test: `node -e "console.log(JSON.stringify({passed:1,failed:0}))"` },
+    })
+    const result = await repo.run()
+    expect(result).toMatchObject({ succeeded: true, passed: 1, failed: 0 })
+    expect(isJsonValue(result)).toBe(true)
   })
 })
 

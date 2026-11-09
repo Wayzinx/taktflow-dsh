@@ -54,6 +54,7 @@ import {
   type CreateRequestRecord,
 } from './ledger.js'
 import { taktConfigTool } from './config-tool.js'
+import { jsonSafeToolValue } from './json-safe.js'
 
 const QUICK_WORKFLOW_FILE = 'quick-fix.workflow.ts'
 
@@ -124,8 +125,10 @@ interface BoundCaller extends BaseCaller {
   requirementId: string
 }
 
-/** Lead 只能写这两个位置；其它路径交给流程或人。 */
+/** Lead 只能写这几个位置；其它路径交给流程或人。 */
 export const LEAD_DECISION_PATH = 'decisions/lead-notes.md'
+/** 原始需求入口：用户原话与 AC 的逐字留档，不是 PRD 创作。 */
+export const LEAD_REQUEST_PATH = 'inputs/request.md'
 /** 路径段不能含控制字符、空白、路径分隔符或百分号；中文等 Unicode 文件名合法。 */
 const CONTROL_OR_SPACE = /[\u0000-\u001f\u007f\s]/
 
@@ -1010,10 +1013,12 @@ function taktArtifactTool(deps: ToolDeps): DefineToolOptions {
     name: 'takt_artifact',
     description: [
       '查看、读取、查看版本历史，或写入公共存放区产物。',
-      '何时用：list/read/log 了解需求产物；write 记录 Lead 的决策或澄清。',
-      '何时不用：Lead 只能写 decisions/lead-notes.md 和 clarifications/**；其它改动用 takt_run 派发。',
+      '何时用：list/read/log 了解需求产物；write 记录 Lead 的决策、澄清，或把用户的原始需求留档。',
+      '何时不用：Lead 只能写 decisions/lead-notes.md、inputs/request.md 和 clarifications/**；其它 inputs、产品代码和报告用 takt_run 派发。',
+      '启动 standard/quick-fix 前：必须先用 write 把用户原话需求和验收标准逐字保存到 inputs/request.md（这是原始需求入口，不是 PRD 创作）；不得臆造需求或人工批准。',
       'write 必须带 reason 和 baseVersion（0 表示新建），版本不匹配会被拒绝。',
       '示例：{"action":"read","path":"design/design.md"}',
+      '示例：{"action":"write","path":"inputs/request.md","content":"用户原话…\\n\\nAC-1 …","reason":"保存用户原始需求与 AC","baseVersion":0}',
       '示例：{"action":"write","path":"clarifications/q1.md","content":"…","reason":"记录澄清结论","baseVersion":0}',
     ].join('\n'),
     parameters: {
@@ -1172,7 +1177,7 @@ async function writeArtifact(
     return caller.space.stores.workspaces.writeArtifact({
       ref: { workspace: caller.requirementId, path: target },
       content,
-      kind: target === LEAD_DECISION_PATH ? 'decision' : 'clarification',
+      kind: target === LEAD_DECISION_PATH ? 'decision' : target === LEAD_REQUEST_PATH ? 'input' : 'clarification',
       author: leadActor(caller.agent, caller.human),
       reason,
     })
@@ -1193,7 +1198,7 @@ async function writeArtifact(
 }
 
 /**
- * Lead 可写路径白名单：decisions/lead-notes.md 或 clarifications/**。
+ * Lead 可写路径白名单：decisions/lead-notes.md、inputs/request.md 或 clarifications/**。
  *
  * 先过 core 的 assertArtifactPath（绝对路径、`..`、反斜杠、空段、元数据文件），
  * 再拒绝控制字符、空白和百分号编码，避免日志注入与 URL 编码绕过。
@@ -1227,12 +1232,13 @@ export function assertLeadWritablePath(raw: string): string {
     }
   }
   const allowed = artifactPath === LEAD_DECISION_PATH
+    || artifactPath === LEAD_REQUEST_PATH
     || (artifactPath.startsWith('clarifications/') && artifactPath.split('/').length >= 2)
   if (!allowed) {
     throw new TaktToolError(
       'TAKT_FORBIDDEN_FOR_LEAD',
       `Lead 不能写 ${artifactPath}`,
-      `Lead 只能写 ${LEAD_DECISION_PATH} 和 clarifications/**；其它改动请用 takt_run start 派发，或请人批准后人工修改。`,
+      `Lead 只能写 ${LEAD_DECISION_PATH}、${LEAD_REQUEST_PATH} 和 clarifications/**；其它 inputs 或产品代码请用 takt_run start 派发，或请人批准后人工修改。`,
     )
   }
   return artifactPath
@@ -1879,23 +1885,25 @@ export function success(
   nextActions: string[],
 ): LeadToolResult {
   // 固定字段放在最后：业务字段即使重名也不能把工具调用结果改成失败。
-  return {
+  // dsh 在 render 前用 lossless JSON 校验工具输出：这里统一把 undefined 等
+  // 不可表达值转成 JSON 缺省，避免原生宿主报 “value is not lossless JSON”。
+  return jsonSafeToolValue({
     ...fields,
     ok: true,
     summary: oneLine(summary),
     next_actions: nextActions.map(oneLine),
-  }
+  }) as unknown as LeadToolResult
 }
 
 export function failure(code: LeadErrorCode, message: string, hint?: string): LeadToolResult {
   const cleanMessage = oneLine(message) || '操作失败'
   const cleanHint = oneLine(hint ?? '') || defaultHint(code)
-  return {
+  return jsonSafeToolValue({
     ok: false,
     summary: `失败：${cleanMessage}`,
     next_actions: [defaultNextAction(code)],
     error: { code, message: cleanMessage, hint: cleanHint },
-  }
+  }) as unknown as LeadToolResult
 }
 
 /** 已知错误码白名单；用于识别其它 bundle 里抛出的 TaktToolError。 */
@@ -1960,7 +1968,7 @@ function defaultHint(code: LeadErrorCode): string {
     case 'TAKT_STALE_VERSION':
       return '先读取最新版本，再用最新的 baseVersion 重试。'
     case 'TAKT_FORBIDDEN_FOR_LEAD':
-      return 'Lead 只能写决策与澄清文件；其它改动走运行或人工。'
+      return 'Lead 只能写决策、澄清和 inputs/request.md；其它改动走运行或人工。'
     case 'TAKT_UNSUPPORTED_NODE':
       return '从 takt_status 返回的可用流程里选择。'
     case 'TAKT_INVALID_INPUT':

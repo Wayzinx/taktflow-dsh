@@ -112,8 +112,10 @@ function TaktflowPanel(): ReactElement {
   useScopedStyle()
   const [state, setState] = useState<PanelState>({ status: 'checking' })
   const [picked, setPicked] = useState<string | undefined>(rememberedSpace)
+  const [attempt, setAttempt] = useState(0)
 
   // 还没有空间时每 5 秒、有空间后每 15 秒再探测一次：Lead 在别的目录新建空间后，切换器里会出现。
+  // 失败时也每 5 秒重试，避免一次瞬时网络错误把面板永久留在错误态。
   useEffect(() => {
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -129,7 +131,9 @@ function TaktflowPanel(): ReactElement {
           timer = setTimeout(probe, spaces.length === 0 ? 5000 : 15000)
         })
         .catch((error: unknown) => {
-          if (!controller.signal.aborted) setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
+          if (controller.signal.aborted) return
+          setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
+          timer = setTimeout(probe, 5000)
         })
     }
     probe()
@@ -137,28 +141,34 @@ function TaktflowPanel(): ReactElement {
       controller.abort()
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [])
+  }, [attempt])
 
+  const retry = (): void => {
+    setState({ status: 'checking' })
+    setAttempt((n) => n + 1)
+  }
   const spaces = state.status === 'ready' ? state.spaces : []
   const space = picked !== undefined && spaces.includes(picked) ? picked : spaces[0]
   const source = useMemo(() => (space ? createDshSource(space, { openSession: hostOpenSession() }) : undefined), [space])
 
   if (state.status === 'ready' && source && space) {
-    if (spaces.length < 2) return <TaktflowEmbed source={source} theme={dshTheme} />
+    // 外层容器保持稳定：空间数从 1 变多时只插入切换条，不把整个 embed 重新挂载。
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
-        {/* 作用域样式会给 .takt-root 设 100% 高度；切换条只占自身高度 */}
-        <div className="takt-root" style={{ flex: 'none', height: 'auto', minHeight: 0 }}>
-          <label className="takt-spacebar">
-            <span className="takt-spacebar-label">空间</span>
-            <select className="takt-spacebar-select" value={space} onChange={(event) => { setPicked(event.target.value); rememberSpace(event.target.value) }} aria-label="切换空间">
-              {spaces.map((root) => <option key={root} value={root} title={root}>{spaceLabel(root)}</option>)}
-            </select>
-            <span className="takt-spacebar-path" title={space}>{space}</span>
-          </label>
-        </div>
+        {spaces.length > 1 && (
+          /* 作用域样式会给 .takt-root 设 100% 高度；切换条只占自身高度 */
+          <div className="takt-root" style={{ flex: 'none', height: 'auto', minHeight: 0 }}>
+            <label className="takt-spacebar">
+              <span className="takt-spacebar-label">空间</span>
+              <select className="takt-spacebar-select" value={space} onChange={(event) => { setPicked(event.target.value); rememberSpace(event.target.value) }} aria-label="切换空间">
+                {spaces.map((root) => <option key={root} value={root} title={root}>{spaceLabel(root)}</option>)}
+              </select>
+              <span className="takt-spacebar-path" title={space}>{space}</span>
+            </label>
+          </div>
+        )}
         <div style={{ flex: 1, minHeight: 0 }}>
-          <TaktflowEmbed key={space} source={source} theme={dshTheme} />
+          <TaktflowEmbed key={space} source={source} theme={dshTheme} draftScope={space} />
         </div>
       </div>
     )
@@ -179,7 +189,8 @@ function TaktflowPanel(): ReactElement {
             <span className="takt-dot" aria-hidden="true" />
             宿主不可用：{state.detail}
           </p>
-          <p className="takt-hint">确认插件已安装并重启过 App。</p>
+          <p className="takt-hint">5 秒后自动重试；也可以立即重试。确认插件已安装并重启过 App。</p>
+          <button type="button" className="takt-retry" onClick={retry}>立即重试</button>
         </Notice>
       )}
       {state.status === 'ready' && (
@@ -215,6 +226,7 @@ type SessionViewState =
 function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement {
   useScopedStyle()
   const [state, setState] = useState<SessionViewState>({ status: 'loading' })
+  const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -230,7 +242,9 @@ function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement
           if (info.requirementId === undefined) timer = setTimeout(probe, 5000)
         })
         .catch((error: unknown) => {
-          if (!controller.signal.aborted) setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
+          if (controller.signal.aborted) return
+          setState({ status: 'failed', detail: error instanceof Error ? error.message : String(error) })
+          timer = setTimeout(probe, 5000)
         })
     }
     probe()
@@ -238,15 +252,19 @@ function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement
       controller.abort()
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [sessionId])
+  }, [sessionId, attempt])
 
+  const retry = (): void => {
+    setState({ status: 'loading' })
+    setAttempt((n) => n + 1)
+  }
   const info = state.status === 'ready' ? state.info : undefined
   const source = useMemo(() => (info?.space ? createDshSource(info.space, { openSession: hostOpenSession() }) : undefined), [info?.space])
 
   if (info && source) {
-    // key：需求变化（刚绑定）时重新挂载，让内存路由回到需求页。
+    // key：需求变化（刚绑定）或空间变化时重新挂载，让内存路由回到需求页且不串空间数据。
     const path = info.requirementId ? `/req/${encodeURIComponent(info.requirementId)}` : '/'
-    return <TaktflowEmbed key={path} source={source} theme={dshTheme} initialPath={path} />
+    return <TaktflowEmbed key={`${info.space}:${path}`} source={source} theme={dshTheme} initialPath={path} draftScope={`session:${sessionId}:${info.space}`} />
   }
   return (
     <div className="takt-root">
@@ -264,6 +282,8 @@ function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement
             <span className="takt-dot" aria-hidden="true" />
             读取失败：{state.detail}
           </p>
+          <p className="takt-hint">5 秒后自动重试；也可以立即重试。</p>
+          <button type="button" className="takt-retry" onClick={retry}>立即重试</button>
         </Notice>
       )}
       {state.status === 'ready' && (

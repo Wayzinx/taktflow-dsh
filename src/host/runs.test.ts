@@ -2,8 +2,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { agent, human, initProject, readLease, type AgentProfile, type HarnessRequest, type HarnessResult, type NodeDef, type WorkflowDefinition } from '@taktflow/core'
+import { agent, human, initProject, readLease, script, type AgentProfile, type AttentionItem, type HarnessRequest, type HarnessResult, type NodeDef, type WorkflowDefinition } from '@taktflow/core'
 import { AgentTraceHub, agentTraceHubFor } from './agent-trace.js'
+import { createApprovals } from './approvals.js'
 import type { createDshHarness } from './dsh-harness.js'
 import type { Agent, AgentPresetDefinition, SubagentActivationSpec, SubagentResult } from './dsh-types.js'
 import { DshRolePresets } from './presets.js'
@@ -579,5 +580,169 @@ describe('RunManager 真实 core 生命周期', () => {
     expect((await f.space.stores.runs.get(runId))?.status).toBe('waiting_human')
     const identity = JSON.parse(await readFile(join(f.space.stores.taktDir, 'runs', runId, 'dsh-runtime.json'), 'utf8'))
     expect(identity.autonomy).toBe('manual')
+  })
+
+  it('冷宿主终止 retry 经审批桥落账后直接取消，补记原始回答且不恢复函数', async () => {
+    const executed: string[] = []
+    const calls = { count: 0 }
+    const fakeHarness = {
+      id: 'dsh-host',
+      displayName: 'fake dsh-host',
+      capabilities: { usage: true },
+      async available() { return { ok: true } },
+      async run() {
+        calls.count += 1
+        return { ok: false, finalText: '', error: 'exit 7' }
+      },
+      async drain() {},
+    }
+    const harnessFactory = (() => fakeHarness) as unknown as typeof createDshHarness
+    const f = await fixture([
+      agent({ id: 'implement', title: '实现', role: 'dev', harness: { harness: 'dsh-host' }, prompt: '实现', writeScope: [], retry: { max: 5 } }),
+      // 函数节点让运行身份带 hasFunctions；它依赖 implement，不会被执行。
+      script({ id: 'publish', title: '发布', needs: ['implement'], run: async () => { executed.push('publish') } }),
+    ], { harnessFactory })
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'waiting_human')
+    expect(calls.count).toBe(2)
+    const item = (await f.space.stores.attention.list({ pending: true }))[0]!
+    expect(item).toMatchObject({ kind: 'retry', form: 'choice' })
+    await f.manager.disposeAll()
+
+    // 重启后的宿主没有 active runtime：终止回答必须走取消，不能冷恢复函数流程。
+    const manager = new DshRunManager({
+      ctx: f.ctx, spaces: f.spaces, ownership: f.ownership, presets: f.presets, permissions: f.permissions,
+      workflows: f.workflows, harnessFactory, log() {},
+    })
+    cleanups.push(() => manager.disposeAll())
+    const approvals = createApprovals({ ctx: f.ctx, ownership: f.ownership, runs: manager, config: { user: '审批人' } })
+    const humanInput = { type: 'human' as const, id: '审批人', via: 'dsh-web' }
+    const answered = await approvals.answer(f.space, {
+      requestId: item.requestId, attempt: item.attempt!, decision: 'choice', answer: '终止运行', by: humanInput,
+    })
+    await status(f.space, runId, 'cancelled')
+
+    const state = await f.space.stores.runs.get(runId)
+    expect(state?.nodes.implement?.status).toBe('cancelled')
+    expect(state?.nodes.publish?.status).toBe('pending')
+    expect(executed).toEqual([])
+    expect(calls.count).toBe(2)
+    expect(f.ctx.activations).toHaveLength(0)
+    const audits = await f.space.stores.events.read(runId, { types: ['human.answered'] })
+    expect(audits).toHaveLength(1)
+    expect(audits[0]).toMatchObject({
+      nodeId: 'implement',
+      actor: humanInput,
+      data: { requestId: item.requestId, decision: 'choice', answer: '终止运行' },
+    })
+    expect(await f.space.stores.events.verify(runId)).toEqual({ ok: true })
+
+    // 重复回调与重复提交都不产生第二条审计。
+    await manager.onAnswered(f.space, answered)
+    await expect(approvals.answer(f.space, {
+      requestId: item.requestId, attempt: item.attempt!, decision: 'choice', answer: '终止运行', by: humanInput,
+    })).resolves.toBeDefined()
+    expect(await f.space.stores.events.read(runId, { types: ['human.answered'] })).toHaveLength(1)
+  })
+
+  it('未持久化的伪造终止回答不能取消运行', async () => {
+    const executed: string[] = []
+    const calls = { count: 0 }
+    const fakeHarness = {
+      id: 'dsh-host',
+      displayName: 'fake dsh-host',
+      capabilities: { usage: true },
+      async available() { return { ok: true } },
+      async run() {
+        calls.count += 1
+        return { ok: false, finalText: '', error: 'exit 7' }
+      },
+      async drain() {},
+    }
+    const harnessFactory = (() => fakeHarness) as unknown as typeof createDshHarness
+    const f = await fixture([
+      agent({ id: 'implement', title: '实现', role: 'dev', harness: { harness: 'dsh-host' }, prompt: '实现', writeScope: [], retry: { max: 5 } }),
+      script({ id: 'publish', title: '发布', needs: ['implement'], run: async () => { executed.push('publish') } }),
+    ], { harnessFactory })
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'waiting_human')
+    const item = (await f.space.stores.attention.list({ pending: true }))[0]!
+    await f.manager.disposeAll()
+    const manager = new DshRunManager({
+      ctx: f.ctx, spaces: f.spaces, ownership: f.ownership, presets: f.presets, permissions: f.permissions,
+      workflows: f.workflows, harnessFactory, log() {},
+    })
+    cleanups.push(() => manager.disposeAll())
+
+    // 磁盘上仍是未回答待办；调用方只在内存里伪造“已回答的终止选择”。
+    const forged: AttentionItem = {
+      ...item,
+      answeredAt: new Date().toISOString(),
+      answeredBy: { type: 'human', id: '审批人', via: 'dsh-web' },
+      decision: 'choice',
+      answer: '终止运行',
+    }
+    await expect(manager.onAnswered(f.space, forged)).rejects.toMatchObject({
+      code: 'TAKT_RUN_BUSY', message: expect.stringContaining('包含函数'),
+    })
+
+    const state = await f.space.stores.runs.get(runId)
+    expect(state?.status).toBe('waiting_human')
+    expect(state?.nodes.implement?.status).toBe('blocked')
+    expect((await f.space.stores.attention.list()).find((entry) => entry.requestId === item.requestId)?.answeredAt).toBeUndefined()
+    expect(await f.space.stores.events.read(runId, { types: ['human.answered'] })).toEqual([])
+    expect(calls.count).toBe(2)
+    expect(executed).toEqual([])
+    expect(f.ctx.activations).toHaveLength(0)
+  })
+
+  it('冷宿主非终止 retry 在落账前被预检拒绝，待办保持未回答', async () => {
+    const executed: string[] = []
+    const calls = { count: 0 }
+    const fakeHarness = {
+      id: 'dsh-host',
+      displayName: 'fake dsh-host',
+      capabilities: { usage: true },
+      async available() { return { ok: true } },
+      async run() {
+        calls.count += 1
+        return { ok: false, finalText: '', error: 'exit 7' }
+      },
+      async drain() {},
+    }
+    const harnessFactory = (() => fakeHarness) as unknown as typeof createDshHarness
+    const f = await fixture([
+      agent({ id: 'implement', title: '实现', role: 'dev', harness: { harness: 'dsh-host' }, prompt: '实现', writeScope: [], retry: { max: 5 } }),
+      script({ id: 'publish', title: '发布', needs: ['implement'], run: async () => { executed.push('publish') } }),
+    ], { harnessFactory })
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'waiting_human')
+    const item = (await f.space.stores.attention.list({ pending: true }))[0]!
+
+    // 同进程已有受管记录：预检直接放行，不重新加载 workflow。
+    const loads = f.workflows.load.mock.calls.length
+    await f.manager.assertResumeReady(f.space, runId)
+    expect(f.workflows.load).toHaveBeenCalledTimes(loads)
+    await f.manager.disposeAll()
+
+    const manager = new DshRunManager({
+      ctx: f.ctx, spaces: f.spaces, ownership: f.ownership, presets: f.presets, permissions: f.permissions,
+      workflows: f.workflows, harnessFactory, log() {},
+    })
+    cleanups.push(() => manager.disposeAll())
+    await expect(manager.assertResumeReady(f.space, runId)).rejects.toMatchObject({
+      code: 'TAKT_RUN_BUSY', message: expect.stringContaining('包含函数'),
+    })
+    const approvals = createApprovals({ ctx: f.ctx, ownership: f.ownership, runs: manager, config: { user: '审批人' } })
+    await expect(approvals.answer(f.space, {
+      requestId: item.requestId, attempt: item.attempt!, decision: 'choice', answer: '再试一次',
+      by: { type: 'human', id: '审批人', via: 'dsh-web' },
+    })).rejects.toMatchObject({ code: 'TAKT_RUN_BUSY', message: expect.stringContaining('包含函数') })
+
+    expect((await f.space.stores.runs.get(runId))?.status).toBe('waiting_human')
+    expect((await f.space.stores.attention.list()).find((entry) => entry.requestId === item.requestId)?.answeredAt).toBeUndefined()
+    expect(calls.count).toBe(2)
+    expect(executed).toEqual([])
+    expect(await f.space.stores.events.read(runId, { types: ['human.answered'] })).toEqual([])
   })
 })

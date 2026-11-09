@@ -51,6 +51,7 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
       '何时用：用户明确要求改配置时（例如“把 PRD 评审最多改成 2 轮”“新建一个安全评审角色”）；先 show 看现状。',
       '何时不用：用户没要求就不要改；需求产物用 takt_artifact。删除 / 升级 / 回滚先 takt_ask_human 确认，再带 confirmed=true。',
       '每次修改都要 reason（引用用户原话）；结果里会给出怎么撤回。流程节点属性（评审轮次、角色、提示词等）用 workflow_read 读源码后 workflow_edit 整文件替换。',
+      '自测配置（selftest）只有 timeoutMs（1000..3600000 毫秒）和 allowedCommands（命令白名单）两个字段，没有 selftest.commands；不配置命令时默认用 environment.testCommand，quick-fix 固定 npm test，其它流程回退 package.json 的 test 脚本，不需要先配置命令才能自测。',
       '示例：{"action":"show"}',
       '示例：{"action":"set_config","patch":{"autonomy":"checkpoints"},"reason":"用户：评审签字我自己来"}',
       '示例：{"action":"save_role","role":"security","create":true,"copyFrom":"reviewer","profile":{"title":"安全评审"},"reason":"用户：加一个安全评审"}',
@@ -59,7 +60,7 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
       action: { type: 'string', enum: [...ACTIONS], required: true, description: '要做的事。' },
       reason: { type: 'string', description: '写操作必填：为什么改（引用用户原话）。' },
       confirmed: { type: 'boolean', description: '删除 / 回滚 / 执行升级时必填 true：表示已经用 takt_ask_human 得到用户确认。' },
-      patch: { type: 'json', description: 'set_config：要改的字段，可含 autonomy(full|checkpoints|manual)、defaultWorkflow、environment、selftest、budget、knowledge；null 表示恢复默认。' },
+      patch: { type: 'json', description: 'set_config：要改的字段，可含 autonomy(full|checkpoints|manual)、defaultWorkflow、environment、selftest({timeoutMs, allowedCommands})、budget、knowledge；null 表示恢复默认。selftest 没有 commands 字段。' },
       role: { type: 'string', description: 'save_role / delete_role / history / rollback(kind=agent)：角色 id。' },
       profile: { type: 'json', description: 'save_role：要改的字段 title / description / skills / writeScope / readScope(null 取消限制) / model(null 跟随 App)。' },
       instructions: { type: 'string', description: 'save_role：职责说明正文（整段替换）。' },
@@ -109,13 +110,23 @@ async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Actio
   switch (action) {
     case 'show': {
       const s = await read('space.settings') as SpaceSettings
+      // show 的嵌套可选字段必须显式给出 JSON 缺省：undefined 会被 dsh 的
+      // lossless JSON 校验拒绝（“value is not lossless JSON”）。
       return success('当前空间配置', {
         config: s.config,
         workflows: s.workflows.map((w) => ({ id: w.id, title: w.title, default: w.default })),
-        roles: s.roles.map((r) => ({ role: r.role, title: r.title, skills: r.skills, writeScope: r.writeScope, readScope: r.readScope, model: r.harness.model, usedBy: r.usedBy.length })),
+        roles: s.roles.map((r) => ({
+          role: r.role,
+          title: r.title ?? null,
+          skills: r.skills ?? [],
+          writeScope: r.writeScope ?? [],
+          readScope: r.readScope ?? null,
+          model: r.harness.model ?? null,
+          usedBy: r.usedBy.length,
+        })),
         skills: s.skills.map((k) => ({ name: k.name, description: k.description, usedBy: k.usedBy })),
         templates: s.templates.map((t) => t.id),
-        legacy: s.layout.legacy ? s.layout.issues : undefined,
+        legacy: s.layout.legacy ? s.layout.issues : null,
       }, s.layout.legacy ? ['takt_config action="upgrade"（先预览，再征得同意后执行）'] : ['按用户要求调用对应的写动作'])
     }
     case 'set_config': {

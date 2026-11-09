@@ -2,10 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { extractJsonBlock, type AgentProfile, type HarnessAdapter, type HarnessEvent, type HarnessRequest, type HarnessResult, type WorkflowDefinition } from '@taktflow/core'
-import { collectSecrets } from '@taktflow/harness'
+import { collectSecrets, createRedactor } from '@taktflow/harness'
 import type { AgentTraceHandle, AgentTraceHub, AgentTraceOutcome } from './agent-trace.js'
 import type { HostContext, SessionEvent, SubagentActivation } from './dsh-types.js'
 import type { RoleSkillSnapshots } from './role-skills.js'
+import { canUseSelftest } from './selftest-capability.js'
 import type { SelftestRegistration, SelftestService } from './selftest.js'
 import { supportsDshOutputSchema } from './dsh-schema.js'
 import { TaktToolError, type Ownership, type PermissionRegistry, type RolePresetHandle, type RolePresets, type SpaceHandle } from './types.js'
@@ -27,6 +28,8 @@ export interface DshHarnessDeps {
   traces?: AgentTraceHub
   /** M-K：受控自测服务；缺失时角色工具仍可注册，但执行会明确拒绝。 */
   selftests?: SelftestService
+  /** 受控自测命令的系统写入窗口；由 RunManager 绑定到同一引擎的 WriteGuard。 */
+  withSystemWrites?: <T>(paths: string[], fn: () => Promise<T>) => Promise<T>
   /** 运行开始时冻结的流程定义；用于判断节点 strictOutputs 的证据路径。 */
   workflow?: WorkflowDefinition
   /** RunManager 取消整条运行；回调不可等待当前 harness 所属任务。 */
@@ -71,6 +74,55 @@ function sameNames(left: readonly string[], right: readonly string[]): boolean {
   const sortedLeft = [...left].sort()
   const sortedRight = [...right].sort()
   return sortedLeft.every((name, index) => name === sortedRight[index])
+}
+
+/** 结果 schema 的顶层必填字段；只读对象 schema 的 required，不猜嵌套结构。 */
+function requiredFields(schema: Record<string, unknown> | undefined): string[] {
+  if (schema === undefined) return []
+  const required = schema.required
+  return Array.isArray(required) ? required.filter((field): field is string => typeof field === 'string' && field !== '') : []
+}
+
+/**
+ * 识别“把 schema 定义本身当结果”的明显形态：对象 schema 的 type/properties/required
+ * 都在，但顶层缺少实际 required 字段。正常结果只要 required 齐全就不会命中。
+ */
+function missingResultFields(value: unknown, required: readonly string[]): string[] {
+  if (required.length === 0 || value === null || typeof value !== 'object' || Array.isArray(value)) return []
+  const record = value as Record<string, unknown>
+  const properties = record.properties
+  if (record.type !== 'object' || properties === null || typeof properties !== 'object' || Array.isArray(properties)) return []
+  const declared = record.required
+  if (!Array.isArray(declared) || declared.length === 0 || !declared.every((field) => typeof field === 'string')) return []
+  return required.filter((field) => !Object.hasOwn(record, field))
+}
+
+/** 泛化停止诊断（如 error/failed）才允许被格式诊断替换；实质错误必须保留。 */
+function genericDiagnostic(value: string | undefined): boolean {
+  if (value === undefined) return true
+  const text = value.trim()
+  return text === '' || /^(?:error|failed|failure|unknown|子\s*agent\s*停止[:：]?\s*(?:error|failed)?)$/i.test(text)
+}
+
+/**
+ * 原生 structured_output 缺失时的诊断。
+ * 只陈述“没有收到有效提交”这一观察，不推断 SDK 校验、模型或鉴权原因。
+ */
+const NATIVE_MISSING_DIAGNOSTIC = '未收到 structured_output 的有效提交；文本/JSON代码块不能替代原生结构化结果'
+
+/** 结果格式提示：只描述格式，不替模型填写任何结论或默认通过。 */
+function structuredPrompt(schema: Record<string, unknown>, native: boolean): string {
+  const required = requiredFields(schema)
+  const fields = required.length > 0 ? `必须包含顶层字段：${required.join('、')}。` : '按 schema 的 properties 填写实际结果字段。'
+  const submission = native
+    ? '结果格式要求：完成时必须调用 structured_output 工具提交实际结果，且只调用一次；工具参数是实际结果字段，不是 schema 定义。不要用纯文本或代码块结束，只有 structured_output 的成功提交才算结果。'
+    : '最后输出一个 JSON 代码块；最终只提交实际结果 JSON 对象。'
+  return [
+    submission,
+    fields,
+    'type/properties/required 是 schema 格式定义，不是结果内容，禁止把 schema 定义本身当作结果提交。',
+    '不要用长文、批准话术或已读的人类报告替代结果；字段值按本次真实检查结论填写，不得伪造通过。',
+  ].join('')
 }
 
 function within(root: string, target: string): boolean {
@@ -143,6 +195,9 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
     async run(req: HarnessRequest, onEvent: (event: HarnessEvent) => void): Promise<HarnessResult> {
       if (deps === undefined) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', 'dsh-host 缺少宿主运行上下文')
       const { ctx, space } = deps
+      // 本次请求的密钥集合只用于内存脱敏；追溯和错误诊断共用同一份，避免错误文本泄露密钥。
+      const secrets = collectSecrets(req, space.stores.config?.providers ?? {})
+      const redact = createRedactor(secrets)
       const baseSignal = req.signal ?? new AbortController().signal
       const signal = req.timeoutMs === undefined ? baseSignal : AbortSignal.any([baseSignal, AbortSignal.timeout(req.timeoutMs)])
       signal.throwIfAborted()
@@ -191,6 +246,9 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       const writeScope = [...(req.tools?.writeScope ?? profile?.writeScope ?? [])]
       const readScope = profile?.readScope === undefined ? undefined : [...profile.readScope]
       const readOnly = writeScope.length === 0
+      // 与 preset 共用同一能力判定：只写需求产物/知识库的文档型角色不登记自测，
+      // 也不在启动前冻结一条它根本不会用的 QA 命令。权限范围本身不变。
+      const selftestEnabled = canUseSelftest(space, writeScope, readOnly)
       const requireParent = async () => {
         const parent = ctx.agents.get(deps.ownerSessionId)
         if (parent !== undefined) return parent
@@ -216,12 +274,14 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       const abort = () => { selftest?.cancel(signal.reason); void dispose().catch(() => {}) }
       try {
         // 启动子 Agent 前冻结受控自测上下文；没有可信命令时只登记错误，不阻断节点启动。
-        if (deps.selftests !== undefined) {
+        // 文档型角色不登记：它们没有代码/测试写入范围，也不应该拿到自测工具。
+        if (deps.selftests !== undefined && selftestEnabled) {
           selftest = await deps.selftests.register({
             childId, space, nodeRef, role, requirementId: run.requirementId,
             cwd: requestedCwd, env: { ...(req.env ?? {}) }, writeScope,
             signal, sessionId: childId, readOnly, allowBash: false,
             ...(deps.workflow === undefined ? {} : { workflow: deps.workflow }),
+            ...(deps.withSystemWrites === undefined ? {} : { withSystemWrites: deps.withSystemWrites }),
           })
           selftestChildren.add(childId)
         }
@@ -242,8 +302,7 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         await deps.onPreset?.(role, { id: preset.id, cfgHash: preset.cfgHash }, nodeRef)
         const outputSchema = supportsDshOutputSchema(req.resultSchema) ? req.resultSchema : undefined
         const prompt = [req.systemAppend, req.prompt,
-          req.resultSchema !== undefined && outputSchema === undefined
-            ? '最后输出一个 JSON 代码块，并遵守任务中声明的结果结构。' : '',
+          req.resultSchema === undefined ? '' : structuredPrompt(req.resultSchema, outputSchema !== undefined),
         ].filter(Boolean).join('\n\n')
         const label = `${req.env?.TAKT_REQ ?? run?.requirementId ?? runId}/${nodeId}#${nodeRef.attempt}`
         if (deps.traces !== undefined) {
@@ -270,7 +329,7 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
             ...(req.systemAppend === undefined ? {} : { systemAppend: req.systemAppend }),
             ...(outputSchema === undefined ? {} : { outputSchema }),
             // 本次请求的密钥集合（含 req.env 与冻结 providers）只用于内存脱敏。
-            secrets: collectSecrets(req, space.stores.config?.providers ?? {}),
+            secrets,
           })
           // 官方 dsh-subagent 在 result resolve 前就 dispose 子 Agent，必须在启动前订阅。
           const listener = ((session: { id?: string; header?: { id?: string } }, event: SessionEvent) => {
@@ -312,16 +371,38 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         const result = await activation.result
         const finalText = result.output.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
         if (finalText !== '') onEvent({ type: 'message', role: 'assistant', text: finalText })
-        const nativeStructured = outputSchema === undefined ? req.resultSchema === undefined ? undefined : extractJsonBlock(finalText) : result.structured
+        const required = requiredFields(req.resultSchema)
+        const native = outputSchema !== undefined
+        const parsedFinal = req.resultSchema === undefined ? undefined : extractJsonBlock(finalText)
+        // 原生 outputSchema 只认 structured_output 的提交；finalText 仅用于区分
+        // “把 schema 定义当结果”和“根本没有提交原生结果”，不能回退成成功。
+        const nativeStructured = native ? result.structured : parsedFinal
+        const missing = missingResultFields(nativeStructured === undefined ? parsedFinal : nativeStructured, required)
+        const schemaError = missing.length === 0 ? undefined
+          : `结构化结果格式错误：返回了 schema 定义，缺少实际结果字段：${missing.join('、')}`
+        // SDK 在原生 schema 下没有捕获到 tool 结果时会把 completed 改成 error；
+        // completed/error/failed 且无 structured 都明确报告“未提交”，取消/超时保留原停止原因。
+        const nativeMissing = native && result.structured === undefined
+        const nativeMissingError = nativeMissing
+          && (result.stopReason === 'completed' || result.stopReason === 'error' || result.stopReason === 'failed')
+          ? NATIVE_MISSING_DIAGNOSTIC : undefined
+        // 实质诊断（鉴权、超时等）必须保留；schema 定义错误优先于泛化的未提交诊断。
+        const specificError = schemaError ?? nativeMissingError
+        const failure = specificError === undefined
+          ? result.diagnostic ?? `子 Agent 停止：${result.stopReason}`
+          : result.diagnostic !== undefined && !genericDiagnostic(result.diagnostic)
+            ? `${result.diagnostic}；${specificError}`
+            : specificError
+        const ok = result.stopReason === 'completed' && schemaError === undefined && !nativeMissing
         // dsh 原生结果可能深冻结；core 会补齐归因 runId、规范化评审项，只能修改独立副本。
         const structured = nativeStructured === undefined ? undefined : structuredClone(nativeStructured)
-        const status = result.stopReason === 'completed' ? 'completed'
+        const status = ok ? 'completed'
           : result.stopReason === 'aborted' || result.stopReason === 'cancelled' ? 'cancelled' : 'failed'
         outcome = {
           status,
           stopReason: result.stopReason,
           ...(finalText === '' ? {} : { finalText }),
-          ...(status === 'completed' ? {} : { error: result.diagnostic ?? `子 Agent 停止：${result.stopReason}` }),
+          ...(status === 'completed' ? {} : { error: redact(failure) }),
         }
         // 结果已经返回时仍要保留 stopReason/finalText；取消只覆盖状态，不丢已有信息。
         if (signal.aborted) {
@@ -329,14 +410,14 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
             status: 'cancelled',
             ...(outcome.stopReason === undefined ? {} : { stopReason: outcome.stopReason }),
             ...(outcome.finalText === undefined ? {} : { finalText: outcome.finalText }),
-            error: errorMessage(signal.reason ?? '运行已取消'),
+            error: redact(errorMessage(signal.reason ?? '运行已取消')),
           }
           signal.throwIfAborted()
         }
         return {
-          ok: result.stopReason === 'completed', finalText, sessionId: childId,
+          ok, finalText, sessionId: childId,
           ...(structured === undefined ? {} : { structured }),
-          ...(result.stopReason === 'completed' ? {} : { error: result.diagnostic ?? `子 Agent 停止：${result.stopReason}` }),
+          ...(ok ? {} : { error: redact(failure) }),
         }
       } catch (error) {
         runError = error

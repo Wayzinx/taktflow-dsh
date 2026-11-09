@@ -181,6 +181,9 @@ it('full 克隆并强制关闭 args.review/args.reviews 的人工签字，manual
   expect(prepareRunArgs({ review: null, reviews: [] }, 'full')).toMatchObject({ review: null, reviews: [] })
 })
 
+// 该用例的 fixture 连续执行 init/config/add/commit 多条 git 子进程；
+// 每条 git 命令仍保留自己的 5s 超时，这里的 15s 是整条用例的总预算
+// （多个子进程启动与磁盘同步累计，而不是单条 git 变慢）。
 it('标准流程唯一 legacy main 补 app 别名并保留 main，缺省分支读真实 HEAD（master）', async () => {
   const { root, space, stores } = await fixture()
   await initGit(root, 'master')
@@ -193,7 +196,7 @@ it('标准流程唯一 legacy main 补 app 别名并保留 main，缺省分支�
   expect(repos.find((repo) => repo.id === 'app')).toMatchObject({ id: 'app', path: '.', purpose: 'app', defaultBranch: '' })
   const bindings = await repoBindingsForRun(runtime.space)
   expect(bindings.map((repo) => [repo.id, repo.defaultBranch])).toEqual([['main', 'master'], ['app', 'master']])
-})
+}, 15_000)
 
 it('多仓库或已有 app 时不做 main→app 别名；非标准流程完全不动', async () => {
   const { root, space, stores } = await fixture()
@@ -214,6 +217,8 @@ it('多仓库或已有 app 时不做 main→app 别名；非标准流程完全�
   expect(custom.space.stores.config.repos?.map((repo) => repo.id)).toEqual(['main'])
 })
 
+// 该用例的 fixture 先执行 init/config/add/commit，再执行 branch/checkout；
+// 每条 git 命令仍保留自己的 5s 超时，15s 只覆盖整条用例的累计子进程开销。
 it('缺省 defaultBranch 无法确定唯一分支时明确拒绝，不假定 main', async () => {
   const { root, space } = await fixture()
   await initGit(root, 'master')
@@ -224,7 +229,7 @@ it('缺省 defaultBranch 无法确定唯一分支时明确拒绝，不假定 mai
     code: 'TAKT_UNSUPPORTED_NODE',
     message: expect.stringContaining('无法从仓库确定唯一默认分支'),
   })
-})
+}, 15_000)
 
 it('full/dsh-host 的 planner 展开先克隆，不污染后续 manual/profile 运行', async () => {
   const { space } = await fixture()

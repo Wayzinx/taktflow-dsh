@@ -6,6 +6,7 @@ import type { AgentProfile, HarnessEvent, HarnessRequest } from '@taktflow/core'
 import type { AgentTraceHandle, AgentTraceHub, AgentTraceOutcome, AgentTraceStart } from './agent-trace.js'
 import type { Agent, SessionEvent, SubagentActivation, SubagentActivationSpec, SubagentResult } from './dsh-types.js'
 import { createDshHarness, type DshHarnessDeps } from './dsh-harness.js'
+import type { SelftestContextInput, SelftestService } from './selftest.js'
 import { FakeHostContext } from './testing/fake-ctx.js'
 import type { PermissionScope, SpaceHandle } from './types.js'
 
@@ -104,6 +105,28 @@ function fixture(options: { trace?: boolean } = {}) {
   return { ctx, calls, permissions, parent, acquire, releasePreset, deps, dispose, req, events, traces, run: () => createDshHarness(deps).run(req, (event) => events.push(event)) }
 }
 
+/** 记录 harness 是否登记受控自测，以及登记时的冻结范围。 */
+function selftestSpy() {
+  const registrations: Array<{
+    input: SelftestContextInput
+    cancel: ReturnType<typeof vi.fn>
+    release: ReturnType<typeof vi.fn>
+  }> = []
+  const service: SelftestService = {
+    register: vi.fn(async (input: SelftestContextInput) => {
+      const cancel = vi.fn()
+      const release = vi.fn(async () => {})
+      registrations.push({ input, cancel, release })
+      return { childId: input.childId, cancel, release }
+    }),
+    cancel: vi.fn(),
+    drain: vi.fn(async () => {}),
+    dispose: vi.fn(async () => {}),
+    run: vi.fn(async () => { throw new Error('此测试只验证能力分配') }),
+  }
+  return { service, registrations }
+}
+
 describe('dsh-host 节点生命周期', () => {
   it('先预留权限再创建子 Agent，审计完成后发布身份，并按顺序清理', async () => {
     const f = fixture()
@@ -125,6 +148,14 @@ describe('dsh-host 节点生命周期', () => {
     f.req.effort = 'high'
     f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
       expect(spec.request.outputSchema).toEqual(f.req.resultSchema)
+      expect(spec.request.prompt).toEqual([{ type: 'text', text: expect.stringContaining('必须包含顶层字段：ok') }])
+      expect(spec.request.prompt).toEqual([{ type: 'text', text: expect.stringContaining('type/properties/required 是 schema 格式定义') }])
+      const prompt = promptText(spec)
+      expect(prompt).toContain('structured_output')
+      expect(prompt).toContain('只调用一次')
+      expect(prompt).toContain('工具参数是实际结果字段')
+      expect(prompt).not.toContain('最后输出一个 JSON 代码块')
+      expect(prompt).not.toContain('JSON 代码块')
       // req.model/effort 不能覆盖 dsh 子 Agent；实际模型由 App 选择并只从 child options 报告。
       expect(Object.hasOwn(spec.request, 'agentOptions')).toBe(false)
       const child: Agent = {
@@ -141,11 +172,17 @@ describe('dsh-host 节点生命周期', () => {
 
   it('不支持的 schema 不透传，从最后的 JSON 代码块提取', async () => {
     const f = fixture()
-    f.req.resultSchema = { type: 'object', properties: { value: { type: 'number', minimum: 0 } } }
+    f.req.resultSchema = { type: 'object', properties: { value: { type: 'number', minimum: 0 } }, required: ['value'] }
     f.req.systemAppend = '角色说明'
     f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
       expect(Object.hasOwn(spec.request, 'outputSchema')).toBe(false)
+      expect(spec.request.prompt).toEqual([{ type: 'text', text: expect.stringContaining('必须包含顶层字段：value') }])
+      expect(spec.request.prompt).toEqual([{ type: 'text', text: expect.stringContaining('最后输出一个 JSON 代码块') }])
       expect(spec.request.prompt).toEqual([{ type: 'text', text: expect.stringContaining('角色说明') }])
+      const prompt = promptText(spec)
+      expect(prompt).toContain('最后输出一个 JSON 代码块')
+      expect(prompt).not.toContain('structured_output')
+      expect(prompt).not.toContain('必须调用')
       return { childId: spec.childId!, result: Promise.resolve({ output: [{ type: 'text', text: '```json\n{"value":1}\n```\n```json\n{"value":2}\n```' }], stopReason: 'completed' }), dispose: f.dispose }
     })
     expect(await f.run()).toMatchObject({ structured: { value: 2 } })
@@ -580,5 +617,238 @@ describe('原生深冻结结构化结果', () => {
     expect(Object.isFrozen(structured.issues)).toBe(true)
     expect(Object.isFrozen(structured.issues[0])).toBe(true)
     expect(Object.isFrozen(structured.issues[0]!.evidence)).toBe(true)
+  })
+})
+
+/** review-code 节点的结构化结果 schema；用于验证“把 schema 定义当结果”的边界。 */
+function reviewSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: {
+      verdict: { type: 'string', enum: ['approve', 'request_changes', 'blocked'] },
+      summary: { type: 'string' },
+      issues: { type: 'array', items: { type: 'object' } },
+    },
+    required: ['verdict', 'summary', 'issues'],
+    additionalProperties: false,
+  }
+}
+
+/** 把对象渲染成 finalText 末尾的 JSON 代码块，模拟模型原样粘贴 schema 定义。 */
+function jsonBlock(value: unknown): string {
+  return ['检查完成。', '```json', JSON.stringify(value, null, 2), '```'].join('\n')
+}
+
+/** 读取发给子 Agent 的纯文本 prompt，便于断言提示词边界。 */
+function promptText(spec: SubagentActivationSpec): string {
+  return spec.request.prompt.map((block) => block.type === 'text' ? block.text : '').join('\n')
+}
+
+describe('结构化结果格式诊断', () => {
+  it('finalText 最后一块是 schema 定义时明确报告格式错误，不当作泛化停止', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!,
+      result: Promise.resolve({
+        output: [{ type: 'text', text: jsonBlock(reviewSchema()) }],
+        stopReason: 'error',
+        diagnostic: 'error',
+      }),
+      dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('结构化结果格式错误')
+    expect(result.error).toContain('返回了 schema 定义')
+    expect(result.error).toContain('verdict、summary、issues')
+    // 泛化 error 必须被具体格式诊断替换，不能原样返回。
+    expect(result.error).not.toBe('error')
+  })
+
+  it('原生 structured 直接返回 schema 定义时判失败并指出缺字段', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!,
+      result: Promise.resolve({ output: [], structured: reviewSchema(), stopReason: 'completed' }),
+      dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('结构化结果格式错误')
+    expect(result.error).toContain('返回了 schema 定义')
+    expect(result.error).toContain('verdict、summary、issues')
+  })
+
+  it('正常实际结果不受格式诊断影响', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    const structured = {
+      verdict: 'request_changes',
+      summary: '实现缺少边界处理',
+      issues: [{ nodeId: 'build', detail: '越界写入' }],
+    }
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!, result: Promise.resolve({ output: [], structured, stopReason: 'completed' }), dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result).toMatchObject({ ok: true, structured })
+    expect(result.error).toBeUndefined()
+  })
+
+  it('实质错误诊断保留，并追加格式错误', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!,
+      result: Promise.resolve({
+        output: [{ type: 'text', text: jsonBlock(reviewSchema()) }],
+        stopReason: 'error',
+        diagnostic: '模型鉴权失败',
+      }),
+      dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('模型鉴权失败')
+    expect(result.error).toContain('结构化结果格式错误')
+  })
+
+  it('格式错误诊断不泄露密钥', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    f.req.env = { ...f.req.env, OPENAI_API_KEY: 'sk-secret-should-not-leak' }
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!,
+      result: Promise.resolve({
+        output: [{ type: 'text', text: jsonBlock(reviewSchema()) }],
+        stopReason: 'error',
+        diagnostic: '模型鉴权失败：sk-secret-should-not-leak',
+      }),
+      dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('[REDACTED]')
+    expect(result.error).not.toContain('sk-secret-should-not-leak')
+  })
+
+  it('原生 prompt 要求调用 structured_output，不要求 JSON 代码块，也不注入默认结论', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    let prompt = ''
+    const structured = { verdict: 'request_changes', summary: '缺少边界处理', issues: [] }
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
+      prompt = promptText(spec)
+      return {
+        childId: spec.childId!,
+        result: Promise.resolve({ output: [], structured, stopReason: 'completed' }),
+        dispose: f.dispose,
+      }
+    })
+    const result = await f.run()
+    // 空 finalText + 有效原生 structured 仍是成功。
+    expect(result).toMatchObject({ ok: true, structured })
+    expect(prompt).toContain('structured_output')
+    expect(prompt).toContain('只调用一次')
+    expect(prompt).toContain('工具参数是实际结果字段')
+    expect(prompt).toContain('只有 structured_output 的成功提交才算结果')
+    expect(prompt).not.toContain('最后输出一个 JSON 代码块')
+    expect(prompt).not.toContain('JSON 代码块')
+    // 不把 approve/request_changes 等结论预置进提示词。
+    expect(prompt).not.toContain('approve')
+    expect(prompt).not.toContain('request_changes')
+  })
+
+  it('原生 schema 下 finalText 是有效 JSON 但缺少 structured_output 时判失败并说明未提交', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!,
+      result: Promise.resolve({
+        output: [{ type: 'text', text: jsonBlock({ verdict: 'approve', summary: '通过', issues: [] }) }],
+        stopReason: 'error',
+        diagnostic: 'error',
+      }),
+      dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result.ok).toBe(false)
+    expect(result.structured).toBeUndefined()
+    expect(result.error).toContain('未收到 structured_output 的有效提交')
+    expect(result.error).toContain('文本/JSON代码块不能替代原生结构化结果')
+    // 泛化 error 必须被具体诊断替换，且不能从文本 JSON 回退成成功。
+    expect(result.error).not.toBe('error')
+  })
+
+  it('原生 schema completed 但没有 structured_output 提交仍判失败', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!,
+      result: Promise.resolve({ output: [{ type: 'text', text: 'done' }], stopReason: 'completed' }),
+      dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result.ok).toBe(false)
+    expect(result.structured).toBeUndefined()
+    expect(result.error).toContain('未收到 structured_output 的有效提交')
+  })
+
+  it('原生 schema 缺少 structured_output 时保留实质诊断并脱敏', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    f.req.env = { ...f.req.env, OPENAI_API_KEY: 'sk-secret-native-missing' }
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => ({
+      childId: spec.childId!,
+      result: Promise.resolve({
+        output: [{ type: 'text', text: '鉴权失败' }],
+        stopReason: 'error',
+        diagnostic: '模型鉴权失败：sk-secret-native-missing',
+      }),
+      dispose: f.dispose,
+    }))
+    const result = await f.run()
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('模型鉴权失败')
+    expect(result.error).toContain('未收到 structured_output 的有效提交')
+    expect(result.error).toContain('[REDACTED]')
+    expect(result.error).not.toContain('sk-secret-native-missing')
+  })
+})
+
+describe('受控自测能力分配', () => {
+  it('文档型角色不登记自测，也不冻结命令', async () => {
+    const f = fixture()
+    const { service } = selftestSpy()
+    f.deps.selftests = service
+    f.req.tools = { writeScope: ['.takt/workspaces/**', 'requirements/**'] }
+    expect((await f.run()).ok).toBe(true)
+    expect(service.register).not.toHaveBeenCalled()
+    expect(f.acquire).toHaveBeenCalledWith(f.deps.space, 'dev', {
+      readOnly: false, allowBash: false, writeScope: ['.takt/workspaces/**', 'requirements/**'],
+    })
+  })
+
+  it('代码/自定义代码角色登记自测，节点结束时取消并释放', async () => {
+    const f = fixture()
+    const { service, registrations } = selftestSpy()
+    f.deps.selftests = service
+    f.req.tools = { writeScope: ['services/api/src/**'] }
+    expect((await f.run()).ok).toBe(true)
+    expect(service.register).toHaveBeenCalledOnce()
+    expect(registrations[0]!.input).toMatchObject({ role: 'dev', writeScope: ['services/api/src/**'] })
+    expect(registrations[0]!.cancel).toHaveBeenCalled()
+    expect(registrations[0]!.release).toHaveBeenCalledOnce()
+  })
+
+  it('只读/空写范围不登记自测', async () => {
+    const f = fixture()
+    const { service } = selftestSpy()
+    f.deps.selftests = service
+    f.req.tools = { writeScope: [] }
+    expect((await f.run()).ok).toBe(true)
+    expect(service.register).not.toHaveBeenCalled()
   })
 })

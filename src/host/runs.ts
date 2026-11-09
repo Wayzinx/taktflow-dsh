@@ -1,7 +1,9 @@
-import { createEngine, type Actor, type AttentionItem, type Engine, type EventEnvelope, type ModelProvider, type ProjectStores, type RunId, type RunState, type TaktConfig, updateRequirement } from '@taktflow/core'
+import { relative } from 'node:path'
+import { createEngine, WriteGuard, type Actor, type AttentionItem, type Engine, type EventEnvelope, type ModelProvider, type ProjectStores, type RunId, type RunState, type TaktConfig, updateRequirement } from '@taktflow/core'
 import { collectSecrets, createHarnesses, createProvider, createRedactor } from '@taktflow/harness'
 import { createLocalSandboxProvider, createRepoManager } from '@taktflow/sandbox'
 import { AgentTraceHub, bindAgentTraceHub } from './agent-trace.js'
+import { terminalRetryAnswer } from './approvals.js'
 import { autonomyStep, nodeKindOf } from './autonomy.js'
 import { beginAutonomyAnswer } from './autonomy-state.js'
 import type { HostContext } from './dsh-types.js'
@@ -214,13 +216,54 @@ export class DshRunManager implements RunManager {
     })
   }
 
+  /**
+   * 冷宿主落账前的只读预检：只检查能否恢复，不建 runtime、不启动 harness、
+   * 不执行函数。同进程已有受管记录时直接放行，保持快速回答路径不变。
+   */
+  async assertResumeReady(space: SpaceHandle, runId: RunId): Promise<void> {
+    this.assertOpen()
+    const record = this.records.get(keyFor(space, runId))
+    if (record !== undefined) {
+      // 同进程快速回答仍走原 resume；但异常终止原因下 resume 本身会拒绝，
+      // 预检必须保持一致，避免落账后才发现无法恢复。
+      if (record.meta.endReason) throw busy('仅无异常终止原因的 waiting_human 运行允许恢复')
+      return
+    }
+    const state = await space.stores.runs.get(runId)
+    const meta = await this.deps.ownership.readRun(space, runId)
+    if (!state || state.status !== 'waiting_human' || !meta || meta.endReason) throw busy('仅无异常终止原因的 waiting_human 运行允许恢复')
+    const definition = await this.deps.workflows.load(state.workflowId, space)
+    const runtime = await loadRunRuntime(space, definition, {
+      // 与 resumeOnce 相同的保守语义：历史运行缺 autonomy 时按 manual 核验。
+      autonomy: meta.autonomy ?? 'manual',
+      roleHarness: meta.roleHarness ?? this.deps.config?.roleHarness,
+    })
+    await assertRuntimeIdentity(runtime, runId)
+  }
+
   /** 审批落账后调用；快速回答先等本轮收敛，再重读状态，避免丢掉答案。 */
   async onAnswered(space: SpaceHandle, item: AttentionItem): Promise<void> {
     if (!item.answeredAt || this.disposed) return
     await this.records.get(keyFor(space, item.runId))?.task
     const state = await space.stores.runs.get(item.runId)
     if (state?.status !== 'waiting_human') return
-    try { await this.resume(space, item.runId, item.answeredBy ?? system) } catch (error) {
+    // 终止分发必须依据真实持久化记录：requestId/runId/requirementId 全部匹配，
+    // 不能只信调用方传入的内存 item。非终止回答保留旧兼容：快速回答可能先于
+    // 本轮收敛，仍按原 resume 路径处理。
+    const persisted = (await space.stores.attention.list({ requirementId: item.requirementId }))
+      .find((entry) => entry.requestId === item.requestId
+        && entry.runId === item.runId
+        && entry.requirementId === item.requirementId)
+    const stored = persisted?.answeredAt === undefined ? undefined : persisted
+    try {
+      // 终止 retry 只需要取消；冷恢复含函数流程会被身份保护拒绝，回答也会
+      // 留在无人消费的 waiting_human 运行里。Core cancel 负责补记原始人工回答。
+      if (stored !== undefined && terminalRetryAnswer(stored, stored)) {
+        await this.cancel(space, item.runId, stored.answeredBy ?? system)
+        return
+      }
+      await this.resume(space, item.runId, (stored ?? item).answeredBy ?? system)
+    } catch (error) {
       const current = await space.stores.runs.get(item.runId)
       if (error instanceof TaktToolError && error.code === 'TAKT_RUN_BUSY') {
         // 另一个 onAnswered/resume 已在推进（可能还没把状态写成 running）时是幂等重复，
@@ -273,11 +316,20 @@ export class DshRunManager implements RunManager {
       fork?: (profiles: RunRuntime['profiles'], skills: RunRuntime['roleSkills']) => RolePresets
     }
     const presets = registry.fork?.(runtime.profiles, runtime.roleSkills) ?? registry
+    // 每个受管运行只建一个 WriteGuard：引擎的工作树守卫和受控自测系统窗口必须
+    // 共享同一份快照/窗口状态；根目录取自已打开的空间，不做全局单例或路径猜测。
+    const projectDir = runtime.space.stores.projectDir
+    const guard = new WriteGuard(
+      projectDir,
+      relative(projectDir, runtime.space.stores.paths.requirements),
+      relative(projectDir, runtime.space.stores.paths.evals ?? `${runtime.space.stores.taktDir}/evals`),
+    )
+    const withSystemWrites = <T>(paths: string[], fn: () => Promise<T>): Promise<T> => guard.system(paths, fn)
     const harness = (this.deps.harnessFactory ?? createDshHarness)({
       ctx, space: runtime.space, presets, permissions: this.deps.permissions,
       ownership: this.deps.ownership, ownerSessionId: meta.ownerSessionId, profiles: runtime.profiles,
       profileSources: runtime.profileSources, roleSkills: runtime.roleSkills, traces: this.traces,
-      ...(this.deps.selftests === undefined ? {} : { selftests: this.deps.selftests }),
+      ...(this.deps.selftests === undefined ? {} : { selftests: this.deps.selftests, withSystemWrites }),
       workflow: runtime.workflow,
       onLeadOffline: async (nodeRef) => this.leadOffline(managed, nodeRef),
       onPreset: async (role, preset, nodeRef) => {
@@ -355,7 +407,7 @@ export class DshRunManager implements RunManager {
             return harness.run(request, onEvent)
           } },
         },
-      }, { harnessOverride: 'dsh-host' })
+      }, { harnessOverride: 'dsh-host', guard })
     } else {
       // profile 模式完整沿用角色/节点的 harness 选择；不传 skillsDir，避免 core
       // syncSkills 把全空间技能同步给所有外部 CLI。
@@ -366,7 +418,7 @@ export class DshRunManager implements RunManager {
           projectDir: runtime.space.root,
           providers: runtimeProviders(runtime.space.stores.config),
         }),
-      })
+      }, { guard })
     }
     return managed
   }

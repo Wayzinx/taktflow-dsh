@@ -34,6 +34,7 @@ export function createSelftestTool(service: SelftestService | undefined): ToolDe
     name: SELFTEST_TOOL_NAME,
     description: [
       '执行当前节点冻结的受控自测命令（默认 5 分钟，可被空间配置调整）。',
+      '仓库/worktree 节点执行仓库自身的显式 testCommand 或 environment/package 回退；只有空间根才使用流程 QA caseCommand。',
       '命令来自可信配置，调用方不能提供 command/cwd/env/timeout；只能选择全量、测试文件或测试名称过滤。',
       '完成前必须调用；根据真实 exitCode 和输出写完成说明，非 0 或超时/取消不能称为通过。',
     ].join(''),

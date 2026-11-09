@@ -49,7 +49,8 @@ export const ROLE_PROMPT_SECTION: SystemPromptSection = {
     '- 不要使用 bash 或任意 shell；只有宿主挂载了受控自测工具时，才能用它执行当前节点冻结的测试命令。',
     '- 只读模式（readOnly）下不要修改任何文件，也不要执行命令。',
     '- 写入范围是 glob 白名单；不在白名单内的文件即使存在也不要改。',
-    '- 结果用结构化 JSON 时，字段名与节点 resultSchema 对齐；失败时给出可执行的下一步。',
+    '- 有结构化结果约束（resultSchema/outputSchema）时：如果宿主提供了 structured_output 工具，完成时必须调用它提交实际结果（只调用一次，参数是实际结果字段，不是 schema 定义；不要用纯文本替代）；没有该工具时，按节点约定提交实际结果，节点要求 JSON 时输出实际结果 JSON。字段名、类型和必填项按约束填写，字段值按本次真实检查结论填写。',
+    '- 不要把 schema 定义本身（type/properties/required 等）当作结果提交，也不要用长文、批准话术或已读的人类报告替代实际结果；失败时在结果字段中给出可执行的下一步。',
     '- 无法完成时明确返回 blocked 和原因，不要伪造成功。',
   ].join('\n'),
 }

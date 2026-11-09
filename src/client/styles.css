@@ -63,6 +63,23 @@
   animation: pulse 1.2s ease-in-out infinite;
 }
 
+.takt-retry {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 5px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.takt-retry:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
 @media (max-width: 640px) {
   .takt-panel {
     padding: 12px;

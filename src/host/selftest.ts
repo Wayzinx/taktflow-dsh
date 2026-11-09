@@ -1,14 +1,29 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile, realpath } from 'node:fs/promises'
+import { lstat, readFile, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 import {
+  archiveCaseEvidence,
   assertNoSymlinks,
   assertRunId,
+  bindWorkspaceQaCommand,
+  captureGitSnapshot,
+  diffExecutionAssets,
+  executionEvidenceDir,
+  newExecutionId,
   readJsonFile,
+  selectWorkspaceQaIntegration,
+  snapshotExecutionAssets,
   withFileLock,
+  writeExecutionReceipt,
   writeFileAtomic,
   matchGlob,
   runShellCommand,
+  type ExecutionArchiveResult,
+  type ExecutionAssetDiff,
+  type ExecutionAssetFile,
+  type ExecutionAssetSnapshot,
+  type ExecutionGitSnapshot,
+  type ExecutionReceiptRef,
   type HarnessRequest,
   type NodeDef,
   type RunState,
@@ -34,6 +49,13 @@ export type SelftestCommandSource =
   | 'environment.testCommand'
   | 'quick-fix'
   | 'package-script'
+
+/**
+ * 命令作用域：空间根节点使用流程 QA 的 caseCommand；仓库/worktree 节点只使用
+ * 仓库自身的 testCommand 或 environment/package 回退。登记时按冻结 cwd 与
+ * space.root 的规范路径是否相等判定，不依赖角色名。
+ */
+export type SelftestCommandScope = 'workspace' | 'repo'
 
 export type SelftestFilterMode = 'all' | 'files' | 'name'
 
@@ -84,6 +106,8 @@ export interface SelftestResult {
   cancelled: boolean
   trusted: boolean
   scriptsChanged: boolean
+  /** 标准空间 QA 的入口目录树在本次执行期间是否变化；变化即不可信。 */
+  executionAssetsChanged?: boolean
   command: string
   commandSource: SelftestCommandSource
   commandHash: string
@@ -107,6 +131,8 @@ export interface SelftestContextInput {
   workflow?: WorkflowDefinition
   readOnly?: boolean
   allowBash?: boolean
+  /** 仅宿主注入：可信自测子进程的产物归因窗口，绑定到同一引擎的 WriteGuard。 */
+  withSystemWrites?: <T>(paths: string[], fn: () => Promise<T>) => Promise<T>
 }
 
 export interface SelftestRegistration {
@@ -134,9 +160,26 @@ export interface SelftestServiceOptions {
   readPackage?: (cwd: string) => Promise<PackageSnapshot>
 }
 
+/**
+ * 标准流程空间 QA 的实际执行绑定。
+ *
+ * 权限登记仍使用空间根 cwd；这里只改变可信自测进程的 cwd/命令，避免把
+ * 集成 worktree 当成角色权限范围。包脚本基线和源脚本哈希都在登记时冻结。
+ */
+interface WorkspaceQaExecution {
+  cwd: string
+  command: string
+  commandHash: string
+  packageState: string
+  packageScriptsHash?: string
+  scriptPath?: string
+  scriptHash?: string
+}
+
 interface FrozenContext extends SelftestContextInput {
   command?: SelftestCommand
   commandError?: string
+  execution?: WorkspaceQaExecution
   timeoutMs: number
   packageScripts?: Record<string, string>
   packageScriptsHash?: string
@@ -160,13 +203,60 @@ function errorMessage(error: unknown): string {
   return String(error)
 }
 
-function sha256(text: string): string {
-  return createHash('sha256').update(text).digest('hex')
+function sha256(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex')
 }
 
 function canonicalScripts(scripts: Record<string, string>): string {
   const sorted = Object.fromEntries(Object.entries(scripts).sort(([left], [right]) => left.localeCompare(right)))
   return JSON.stringify(sorted)
+}
+
+interface CaseSummarySnapshot {
+  path: string
+  digest?: string
+  cases: Array<{ id: string; status: string; evidence?: string }>
+  error?: string
+}
+
+/** 只读取当前需求 evidence/summary.json，保留原始用例行供 receipt 关联。 */
+async function readCaseSummary(root: string): Promise<CaseSummarySnapshot> {
+  const relative = 'evidence/summary.json'
+  const file = path.join(root, relative)
+  let text: string
+  try {
+    await assertNoSymlinks(root, file)
+    text = await readFile(file, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { path: relative, cases: [] }
+    return { path: relative, cases: [], error: errorMessage(error) }
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown
+    const rows = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as { cases?: unknown }).cases
+      : undefined
+    const cases: Array<{ id: string; status: string; evidence?: string }> = []
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row === null || typeof row !== 'object' || Array.isArray(row)) continue
+        const item = row as Record<string, unknown>
+        if (typeof item.id !== 'string' || item.id === '' || typeof item.status !== 'string') continue
+        cases.push({
+          id: item.id,
+          status: item.status,
+          ...(typeof item.evidence === 'string' && item.evidence !== '' ? { evidence: item.evidence } : {}),
+        })
+      }
+    }
+    return { path: relative, digest: sha256(text), cases }
+  } catch (error) {
+    return { path: relative, digest: sha256(text), cases: [], error: `summary 不是有效 JSON：${errorMessage(error)}` }
+  }
+}
+
+function caseRowsDigest(cases: Array<{ id: string; status: string; evidence?: string }>): string {
+  return sha256(JSON.stringify(cases))
 }
 
 /** 冻结整个 scripts 映射；dev 合法改依赖不影响，但任何 test/pretest/posttest 变化都会被发现。 */
@@ -267,12 +357,18 @@ interface ResolvedCommand {
  * environment.testCommand 或 package test 允许形式时才执行；不匹配时明确拒绝，
  * 绝不静默回退到其它命令。未传命令时 environment.testCommand 优先，其次 quick-fix
  * 固定 npm test，最后才是 package.json 的 test 脚本。
+ *
+ * scope 缺省为 'workspace'，保留既有调用行为：caseCommand 优先，其次 testCommand。
+ * 登记时仓库/worktree 传 'repo'：run.args.caseCommand 是标准流程后续在空间根执行的
+ * QA 入口，不是当前仓库的单测命令，因此完全忽略；只接受显式 testCommand（仍需精确
+ * 授权），未传时走 environment/package 回退。被忽略的 caseCommand 不是失败后的回退项。
  */
 export async function resolveSelftestCommand(
   space: SpaceHandle,
   run: RunState | undefined,
   cwd: string,
   readPackage: (cwd: string) => Promise<PackageSnapshot> = readPackageSnapshot,
+  scope: SelftestCommandScope = 'workspace',
 ): Promise<ResolvedCommand> {
   const rawConfig = (space.stores.config as unknown as { selftest?: unknown }).selftest
   const parsed = parseSelftestConfig(rawConfig)
@@ -309,7 +405,10 @@ export async function resolveSelftestCommand(
   }
 
   const args = run?.args ?? {}
-  for (const key of ['caseCommand', 'testCommand'] as const) {
+  // 空间根才把 caseCommand 当作本次自测入口；仓库/worktree 只认显式 testCommand，
+  // 避免把流程 QA 的 run-cases 命令误当成仓库单测命令而阻断或覆盖 package test。
+  const keys = scope === 'repo' ? ['testCommand'] as const : ['caseCommand', 'testCommand'] as const
+  for (const key of keys) {
     if (!Object.hasOwn(args, key)) continue
     const value = args[key]
     if (typeof value !== 'string' || value.trim() === '') {
@@ -518,11 +617,25 @@ export class InMemorySelftestService implements SelftestService {
     let baselineState = packageState(snapshot)
     if (packageError === undefined) {
       try {
-        baselineState = await this.packageBaseline(input, snapshot)
+        baselineState = await this.packageBaseline(input.space, input.nodeRef.runId, input.cwd, snapshot, input.signal)
         if (baselineState !== packageState(snapshot)) packageError = '本运行的 package scripts 基线已变化；重试或角色返工不能重新授权测试命令'
       } catch (error) { packageError = `无法读取或建立本运行的测试基线：${errorMessage(error)}` }
     }
-    const resolved = await resolveSelftestCommand(input.space, run, input.cwd, async () => snapshot)
+    // 冻结 cwd 与空间根都用 realpath 规范化；只有空间根本身使用流程 QA 的
+    // caseCommand，仓库/worktree（含 .takt/worktrees 下的 dev 工作树）只认仓库自身测试入口。
+    const [cwdReal, spaceRootReal] = await Promise.all([realpath(input.cwd), realpath(input.space.root)])
+    const commandScope: SelftestCommandScope = cwdReal === spaceRootReal ? 'workspace' : 'repo'
+    const resolved = await resolveSelftestCommand(input.space, run, input.cwd, async () => snapshot, commandScope)
+    // 标准流程空间 QA：只有空间根的 caseCommand 绑定到本次运行的主仓库集成工作树。
+    // 仓库/worktree 的 testCommand 与其它 workflow 保持原行为。
+    let execution: WorkspaceQaExecution | undefined
+    let executionError: string | undefined
+    if (run !== undefined && commandScope === 'workspace' && run.workflowId === 'taktflow-standard'
+      && resolved.command?.source === 'run-args:caseCommand') {
+      const bound = await this.standardQaExecution(input, run, resolved.command, spaceRootReal)
+      execution = bound.execution
+      executionError = bound.error
+    }
     let expanded: { env: Record<string, string>; secrets: string[] } = { env: {}, secrets: [] }
     let environmentError: string | undefined = packageError
     try { expanded = expandEnvironmentReferences((input.space.stores.config as unknown as { environment?: { env?: Record<string,string> } }).environment?.env) }
@@ -536,8 +649,9 @@ export class InMemorySelftestService implements SelftestService {
       nodeRef: { ...input.nodeRef },
       writeScope: [...input.writeScope],
       timeoutMs: resolved.timeoutMs,
-      ...(resolved.command === undefined || environmentError !== undefined ? {} : { command: resolved.command }),
-      ...(resolved.error === undefined && environmentError === undefined ? {} : { commandError: redact(environmentError ?? resolved.error!) }),
+      ...(resolved.command === undefined || environmentError !== undefined || executionError !== undefined ? {} : { command: resolved.command }),
+      ...(resolved.error === undefined && environmentError === undefined && executionError === undefined ? {} : { commandError: redact(executionError ?? environmentError ?? resolved.error!) }),
+      ...(execution === undefined ? {} : { execution }),
       ...(resolved.packageScripts === undefined ? {} : { packageScripts: { ...resolved.packageScripts } }),
       ...(resolved.packageScriptsHash === undefined ? {} : { packageScriptsHash: resolved.packageScriptsHash }),
       ...(resolved.environmentTestCommand === undefined ? {} : { environmentTestCommand: resolved.environmentTestCommand }),
@@ -557,20 +671,112 @@ export class InMemorySelftestService implements SelftestService {
     }
   }
 
+  /**
+   * 标准流程空间 QA 的执行绑定。
+   *
+   * 只在「空间根 + taktflow-standard + run-args:caseCommand」时启用：
+   * - integration 必须是本次运行已成功的节点，工作树必须位于空间根内且无符号链接；
+   * - 执行 cwd 使用主仓库集成工作树，权限登记仍保持空间根；
+   * - Node 脚本命令绑定到空间根源脚本绝对路径，保留脚本相对 import；
+   * - integration 的 package scripts 基线在此冻结，执行前后复核。
+   *
+   * 结果缺失/未成功时返回明确错误，绝不回退到空间根执行旧代码。
+   */
+  private async standardQaExecution(
+    input: SelftestContextInput,
+    run: RunState,
+    command: SelftestCommand,
+    spaceRootReal: string,
+  ): Promise<{ execution?: WorkspaceQaExecution; error?: string }> {
+    const integrationNode = run.nodes.integration
+    if (integrationNode === undefined || integrationNode.attempts < 1 || integrationNode.status !== 'succeeded') {
+      return { error: `标准流程空间 QA 需要本次运行已成功的 integration 节点（当前 ${integrationNode?.status ?? '缺失'}）；不会退回空间根执行` }
+    }
+    let raw = integrationNode.result
+    if (raw === undefined || raw === null) {
+      // 部分持久化/面板快照不保留节点 result；integration 模板同时直写需求产物，可作只读回退。
+      try {
+        const text = await input.space.stores.workspaces.readArtifact({ workspace: input.requirementId, path: 'tasks/integration.json' })
+        if (text === undefined) return { error: 'integration 节点已成功，但没有可读取的结果或 tasks/integration.json' }
+        raw = JSON.parse(text.toString('utf8')) as unknown
+      } catch (error) {
+        return { error: `读取 integration 结果失败：${errorMessage(error)}` }
+      }
+    }
+    const repo = typeof run.args.repo === 'string' && run.args.repo.trim() !== '' ? run.args.repo.trim() : 'app'
+    const selected = selectWorkspaceQaIntegration(raw, input.nodeRef.runId, repo, input.space.root)
+    if (selected.kind === 'error') return { error: selected.error }
+    const integrationPath = selected.integration.path
+    let cwd: string
+    try {
+      // 先做词法包含和符号链接组件校验，再用 realpath 复核空间根包含关系。
+      await assertNoSymlinks(input.space.root, integrationPath)
+      cwd = await realpath(integrationPath)
+      const rel = path.relative(spaceRootReal, cwd)
+      if (rel === '' || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+        return { error: `integration 工作树必须位于空间根内的独立目录：${integrationPath}` }
+      }
+      const info = await stat(cwd)
+      if (!info.isDirectory()) return { error: `integration 工作树不是目录：${integrationPath}` }
+      const git = await lstat(path.join(cwd, '.git'))
+      if (git.isSymbolicLink() || (!git.isDirectory() && !git.isFile())) {
+        return { error: `integration 工作树的 .git 不是可信的普通文件/目录：${integrationPath}` }
+      }
+    } catch (error) {
+      return { error: `integration 工作树不可用：${errorMessage(error)}` }
+    }
+
+    let snapshot: PackageSnapshot
+    try {
+      snapshot = await this.readPackage(cwd)
+    } catch (error) {
+      return { error: `读取 integration package.json 失败：${errorMessage(error)}` }
+    }
+    let state = packageState(snapshot)
+    try {
+      state = await this.packageBaseline(input.space, input.nodeRef.runId, cwd, snapshot, input.signal)
+      if (state !== packageState(snapshot)) {
+        return { error: '本运行的 integration package scripts 基线已变化；重试或角色返工不能重新授权测试命令' }
+      }
+    } catch (error) {
+      return { error: `无法读取或建立 integration 测试基线：${errorMessage(error)}` }
+    }
+
+    const testScript = typeof run.args.testScript === 'string' ? run.args.testScript : undefined
+    const binding = bindWorkspaceQaCommand(command.text, testScript, spaceRootReal)
+    if (binding.kind === 'error') return { error: binding.error }
+    return {
+      execution: {
+        cwd,
+        command: binding.kind === 'bound' ? binding.command : command.text,
+        commandHash: binding.kind === 'bound' ? sha256(binding.command) : command.hash,
+        packageState: state,
+        ...(snapshot.scriptsHash === undefined ? {} : { packageScriptsHash: snapshot.scriptsHash }),
+        ...(binding.kind === 'bound' ? { scriptPath: binding.sourceScript } : {}),
+      },
+    }
+  }
+
   /** 同一运行和物理 cwd 首次登记时固定脚本身份；跨 attempt、角色和宿主恢复均不覆盖。 */
-  private async packageBaseline(input: SelftestContextInput, snapshot: PackageSnapshot): Promise<string> {
-    const runId = assertRunId(input.nodeRef.runId)
-    const cwd = await realpath(input.cwd)
-    const file = path.join(input.space.stores.taktDir, 'runs', runId, 'selftest', `${sha256(cwd)}.json`)
-    await assertNoSymlinks(input.space.root, file)
+  private async packageBaseline(
+    space: SpaceHandle,
+    runIdInput: string,
+    cwdInput: string,
+    snapshot: PackageSnapshot,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const runId = assertRunId(runIdInput)
+    const cwd = await realpath(cwdInput)
+    const file = path.join(space.stores.taktDir, 'runs', runId, 'selftest', `${sha256(cwd)}.json`)
+    await assertNoSymlinks(space.root, file)
     return withFileLock(file, async () => {
-      await assertNoSymlinks(input.space.root, file)
+      await assertNoSymlinks(space.root, file)
       const current = await readJsonFile<unknown>(file)
       if (current !== undefined) return readBaselineState(current)
-      if (this.disposed || input.signal.aborted) throw new Error('登记已取消，不能建立测试基线')
-      await this.options.ownership?.ensureLease(input.space)
-      if (this.disposed || input.signal.aborted) throw new Error('登记已取消，不能建立测试基线')
-      await assertNoSymlinks(input.space.root, file)
+      if (this.disposed || signal.aborted) throw new Error('登记已取消，不能建立测试基线')
+      await this.options.ownership?.ensureLease(space)
+      if (this.disposed || signal.aborted) throw new Error('登记已取消，不能建立测试基线')
+      await assertNoSymlinks(space.root, file)
       const state = packageState(snapshot)
       // 只写身份指纹，不写脚本原文、cwd、环境变量或密钥。
       await writeFileAtomic(file, JSON.stringify({ schemaVersion: 1, ...JSON.parse(state) }) + '\n')
@@ -627,8 +833,11 @@ export class InMemorySelftestService implements SelftestService {
       throw new Error('受控自测已取消，不能启动新进程')
     }
     const filter = parseSelftestFilter(args)
-    const runner = classifyRunner(context.command.text, context.packageScripts)
-    const command = buildSelftestCommand(context.command.text, filter, runner)
+    // 标准流程空间 QA 的实际执行命令可能已绑定到空间根源脚本绝对路径；
+    // 过滤仍只追加到实际命令上，不改变配置命令的身份与哈希。
+    const base = context.execution?.command ?? context.command.text
+    const runner = classifyRunner(base, context.packageScripts)
+    const command = buildSelftestCommand(base, filter, runner)
     const task = this.execute(entry, scope, filter, command, exec)
     entry.active.add(task)
     try {
@@ -686,7 +895,9 @@ export class InMemorySelftestService implements SelftestService {
     const current = await context.space.stores.runs.get(context.nodeRef.runId)
     if (!current || current.status !== 'running' || current.nodes[context.nodeRef.nodeId]?.attempts !== context.nodeRef.attempt
       || current.nodes[context.nodeRef.nodeId]?.status !== 'running') throw new Error('自测节点或尝试已过期')
-    for (const file of filter.files ?? []) await assertNoSymlinks(context.cwd, path.resolve(context.cwd, file))
+    const execution = context.execution
+    const executionCwd = execution?.cwd ?? context.cwd
+    for (const file of filter.files ?? []) await assertNoSymlinks(executionCwd, path.resolve(executionCwd, file))
     // 执行前复核 scripts：dev 合法改依赖不影响，但测试脚本变化后不能继续宣称可信。
     let before: PackageSnapshot
     try {
@@ -697,6 +908,56 @@ export class InMemorySelftestService implements SelftestService {
     if (packageState(before) !== context.packageState) {
       throw new Error('package.json scripts 在执行前已变化，拒绝执行受控自测；请重新启动运行')
     }
+    if (execution !== undefined) {
+      let beforeExecution: PackageSnapshot
+      try {
+        beforeExecution = await this.readPackage(execution.cwd)
+      } catch (error) {
+        throw new Error(`受控自测执行前读取 integration package.json 失败：${errorMessage(error)}`)
+      }
+      if (packageState(beforeExecution) !== execution.packageState) {
+        throw new Error('integration package.json scripts 在执行前已变化，拒绝执行受控自测；请重新启动运行')
+      }
+    }
+    // 源脚本由自动化角色在本次运行中生成，登记时可能尚不存在；执行前固定哈希，
+    // 执行后复核。脚本不是普通文件或包含符号链接时拒绝执行。
+    let scriptHash: string | undefined
+    if (execution?.scriptPath !== undefined) {
+      try {
+        await assertNoSymlinks(spaceRoot, execution.scriptPath)
+        const info = await lstat(execution.scriptPath)
+        if (info.isSymbolicLink() || !info.isFile()) throw new Error('脚本不是普通文件')
+        scriptHash = sha256(await readFile(execution.scriptPath))
+      } catch (error) {
+        throw new Error(`空间 QA 源脚本不可用：${errorMessage(error)}`)
+      }
+    }
+
+    // 每次实际调用都有独立执行目录：入口脚本所在目录树的完整资产哈希、调用前
+    // 用例证据归档和最终 receipt 都不可变落盘，后续重跑不能覆盖历史失败证据。
+    const executionId = execution === undefined ? undefined : newExecutionId(context.nodeRef.attempt)
+    const executionDir = executionId === undefined
+      ? undefined
+      : executionEvidenceDir(context.nodeRef.runId, context.nodeRef.nodeId, executionId)
+    const priorArchive = executionDir === undefined
+      ? undefined
+      : await this.archiveExecution(entry, exec, artifactRoot, executionDir, 'prior')
+    let assetsBefore: ExecutionAssetSnapshot | undefined
+    if (execution?.scriptPath !== undefined) {
+      try {
+        // 目录树包含入口脚本的相对 helper/用例脚本；空间根入口只快照自身。
+        assetsBefore = await snapshotExecutionAssets(spaceRoot, execution.scriptPath)
+      } catch (error) {
+        throw new Error(`空间 QA 源资产快照失败：${errorMessage(error)}`)
+      }
+    }
+    const baselineRevision = typeof context.env.TAKT_REGRESSION_BASELINE_REV === 'string'
+      && context.env.TAKT_REGRESSION_BASELINE_REV !== ''
+      ? context.env.TAKT_REGRESSION_BASELINE_REV
+      : undefined
+    const gitBefore = execution === undefined
+      ? undefined
+      : await captureGitSnapshot(executionCwd, baselineRevision)
 
     const env: Record<string, string> = { ...context.env, TAKT_RUN_ID: context.nodeRef.runId, TAKT_REQ: context.requirementId, TAKT_NODE: context.nodeRef.nodeId, TAKT_WORKSPACE: artifactRoot, TAKT_SELFTEST: '1' }
     const secrets = context.secrets
@@ -722,12 +983,18 @@ export class InMemorySelftestService implements SelftestService {
     const signal = AbortSignal.any([context.signal, entry.controller.signal, exec.signal, timeout.signal])
     let exitCode = -1
     let spawnError: unknown
+    // 可信自测子进程的写入由引擎的同一个 WriteGuard 归因：只有当前需求的
+    // evidence/** 进入系统窗口，角色写权限本身不变；窗口在 finally 关闭。
+    const evidenceScope = `${path.relative(context.space.stores.projectDir, artifactRoot).split(path.sep).join('/')}/evidence/**`
+    const invoke = () => this.runCommand(command, executionCwd, env, signal, {
+      redact: capture,
+      redactionOverlap,
+    })
     try {
       this.assertLive(entry, scope, exec)
-      const result = await this.runCommand(command, context.cwd, env, signal, {
-        redact: capture,
-        redactionOverlap,
-      })
+      const result = context.withSystemWrites === undefined
+        ? await invoke()
+        : await context.withSystemWrites([evidenceScope], invoke)
       exitCode = result.code
     } catch (error) {
       spawnError = error
@@ -748,16 +1015,172 @@ export class InMemorySelftestService implements SelftestService {
     } catch {
       scriptsChanged = true
     }
+    let executionScriptChanged = false
+    if (execution !== undefined) {
+      try {
+        const afterExecution = await this.readPackage(execution.cwd)
+        if (packageState(afterExecution) !== execution.packageState) scriptsChanged = true
+      } catch {
+        scriptsChanged = true
+      }
+      if (execution.scriptPath !== undefined && scriptHash !== undefined) {
+        try {
+          if (sha256(await readFile(execution.scriptPath)) !== scriptHash) executionScriptChanged = true
+        } catch {
+          executionScriptChanged = true
+        }
+      }
+    }
+    scriptsChanged = scriptsChanged || executionScriptChanged
+
+    // 入口目录树的完整资产快照在执行后复核；helper/用例脚本变化同样使结果不可信。
+    let assetsAfter: ExecutionAssetSnapshot | undefined
+    let assetDiff: ExecutionAssetDiff | undefined
+    if (assetsBefore !== undefined && execution?.scriptPath !== undefined) {
+      try {
+        assetsAfter = await snapshotExecutionAssets(spaceRoot, execution.scriptPath)
+        assetDiff = diffExecutionAssets(assetsBefore, assetsAfter)
+      } catch (error) {
+        assetDiff = {
+          before: assetsBefore.digest,
+          after: '',
+          changed: true,
+          added: [],
+          removed: [],
+          modified: [],
+          error: context.redact(`执行后源资产快照失败：${errorMessage(error)}`),
+        }
+      }
+    }
+    const executionAssetsChanged = assetDiff?.changed === true
+    const gitAfter = execution === undefined ? undefined : await captureGitSnapshot(executionCwd, baselineRevision)
     cancelled = !timedOut && (context.signal.aborted || entry.controller.signal.aborted || exec.signal.aborted)
-    const trusted = !scriptsChanged
+    const trusted = !scriptsChanged && !executionAssetsChanged
     const succeeded = exitCode === 0 && trusted && !timedOut && !cancelled && counts.summaryOk !== false && !(counts.failed && counts.failed > 0)
     const endedAt = new Date().toISOString()
     const durationMs = Date.now() - started
     const outputTail = redactedTail
+    const caseSummary = execution === undefined ? undefined : await readCaseSummary(artifactRoot)
+    const currentArchive = executionDir === undefined
+      ? undefined
+      : await this.archiveExecution(entry, exec, artifactRoot, executionDir, 'current', [
+        { name: 'output.log', content: outputTail },
+      ])
+    const executionMetadata = execution === undefined || executionId === undefined
+      ? undefined
+      : {
+        executionId,
+        receipt: executionDir === undefined ? null : `${executionDir}/receipt.json`,
+        sourceDigest: assetsBefore?.digest ?? null,
+        sourceFiles: assetsBefore?.files.length ?? 0,
+        casesDigest: caseSummary === undefined ? null : caseRowsDigest(caseSummary.cases),
+        startedAt,
+        endedAt,
+        exitCode,
+        timedOut,
+        cancelled,
+        trusted,
+        executionAssetsChanged,
+      }
+    let executionReceipt: ExecutionReceiptRef | undefined
+    let executionReceiptError: string | undefined
+    let summaryUpdated: boolean | undefined
+    let summaryUpdateError: string | undefined
+    if (executionDir !== undefined && executionId !== undefined && execution !== undefined) {
+      const receipt = {
+        schemaVersion: 1,
+        kind: 'selftest',
+        runId: context.nodeRef.runId,
+        nodeId: context.nodeRef.nodeId,
+        attempt: context.nodeRef.attempt,
+        executionId,
+        requirementId: context.requirementId,
+        role: context.role,
+        sessionId: context.sessionId ?? context.childId,
+        startedAt,
+        endedAt,
+        durationMs,
+        configuredCommand: redactor(commandInfo.text),
+        configuredCommandHash: commandInfo.hash,
+        actualCommand: redactor(command),
+        commandSource: commandInfo.source,
+        cwd: redactor(executionCwd),
+        exitCode,
+        timedOut,
+        cancelled,
+        trusted,
+        scriptsChanged,
+        executionAssetsChanged,
+        error: spawnError === undefined ? null : redactor(errorMessage(spawnError)),
+        sourceAssets: assetsBefore === undefined ? null : {
+          entry: assetsBefore.entry,
+          directory: assetsBefore.directory,
+          scope: assetsBefore.scope,
+          digest: assetsBefore.digest,
+          files: assetsBefore.files,
+          afterDigest: assetsAfter?.digest ?? null,
+          diff: assetDiff ?? null,
+        },
+        git: {
+          before: gitBefore ?? null,
+          after: gitAfter ?? null,
+          baselineRevision: baselineRevision ?? null,
+        },
+        caseSummary: caseSummary === undefined ? null : {
+          path: caseSummary.path,
+          digest: caseSummary.digest ?? null,
+          cases: caseSummary.cases,
+          casesDigest: caseRowsDigest(caseSummary.cases),
+          error: caseSummary.error ?? null,
+        },
+        archives: { prior: priorArchive ?? null, current: currentArchive ?? null },
+        output: {
+          path: 'current/output.log',
+          sha256: sha256(outputTail),
+          bytes: Buffer.byteLength(outputTail),
+          streams: 'combined',
+        },
+        summaryExecution: executionMetadata ?? null,
+      }
+      const persisted = await this.persistExecutionReceipt(entry, exec, artifactRoot, executionDir, receipt)
+      executionReceipt = persisted.ref
+      executionReceiptError = persisted.error
+      if (executionMetadata !== undefined) {
+        const stamped = await this.stampCaseSummary(entry, exec, artifactRoot, executionMetadata)
+        summaryUpdated = stamped.updated
+        summaryUpdateError = stamped.error
+      }
+    }
     const evidenceResult = await this.writeEvidence(entry, scope, exec, {
       commandInfo, filter, command, startedAt, endedAt, durationMs,
       exitCode, succeeded, passed: counts.passed, failed: counts.failed, trusted, scriptsChanged, timedOut, cancelled, outputTail,
-      spaceRoot, artifactRoot,
+      spaceRoot, artifactRoot, cwd: executionCwd,
+      ...(execution === undefined ? {} : { executionCommand: execution.command, executionCommandHash: execution.commandHash }),
+      ...(execution?.packageScriptsHash === undefined ? {} : { executionPackageScriptsHash: execution.packageScriptsHash }),
+      ...(scriptHash === undefined ? {} : { executionScriptHash: scriptHash }),
+      ...(executionScriptChanged ? { executionScriptChanged } : {}),
+      ...(executionId === undefined ? {} : { executionId }),
+      ...(executionReceipt === undefined ? {} : { executionReceipt }),
+      ...(executionReceiptError === undefined ? {} : { executionReceiptError }),
+      ...(assetsBefore === undefined ? {} : {
+        executionAssetEntry: assetsBefore.entry,
+        executionAssetDirectory: assetsBefore.directory,
+        executionAssetScope: assetsBefore.scope,
+        executionAssetDigest: assetsBefore.digest,
+        executionAssetFiles: assetsBefore.files.length,
+        ...(assetsAfter === undefined ? {} : { executionAssetAfterDigest: assetsAfter.digest }),
+        ...(assetDiff === undefined ? {} : { executionAssetDiff: assetDiff }),
+      }),
+      ...(executionAssetsChanged ? { executionAssetsChanged } : {}),
+      ...(gitBefore === undefined && gitAfter === undefined ? {} : {
+        executionGit: { before: gitBefore ?? null, after: gitAfter ?? null, baselineRevision: baselineRevision ?? null },
+      }),
+      ...(caseSummary === undefined ? {} : { executionCaseSummary: caseSummary }),
+      ...(priorArchive === undefined && currentArchive === undefined ? {} : {
+        executionArchives: { prior: priorArchive ?? null, current: currentArchive ?? null },
+      }),
+      ...(summaryUpdated === undefined ? {} : { executionSummaryUpdated: summaryUpdated }),
+      ...(summaryUpdateError === undefined ? {} : { executionSummaryError: summaryUpdateError }),
     })
     const finalCancelled = !timedOut && (context.signal.aborted || entry.controller.signal.aborted || exec.signal.aborted)
     return {
@@ -772,6 +1195,7 @@ export class InMemorySelftestService implements SelftestService {
       cancelled: finalCancelled,
       trusted,
       scriptsChanged,
+      ...(execution === undefined ? {} : { executionAssetsChanged }),
       command: redactor(command),
       commandSource: commandInfo.source,
       commandHash: commandInfo.hash,
@@ -803,6 +1227,35 @@ export class InMemorySelftestService implements SelftestService {
       outputTail: string
       spaceRoot: string
       artifactRoot: string
+      cwd: string
+      executionCommand?: string
+      executionCommandHash?: string
+      executionPackageScriptsHash?: string
+      executionScriptHash?: string
+      executionScriptChanged?: boolean
+      executionId?: string
+      executionReceipt?: ExecutionReceiptRef
+      executionReceiptError?: string
+      executionAssetEntry?: string
+      executionAssetDirectory?: string
+      executionAssetScope?: 'directory' | 'entry'
+      executionAssetDigest?: string
+      executionAssetFiles?: number
+      executionAssetAfterDigest?: string
+      executionAssetDiff?: ExecutionAssetDiff
+      executionAssetsChanged?: boolean
+      executionGit?: {
+        before: ExecutionGitSnapshot | null
+        after: ExecutionGitSnapshot | null
+        baselineRevision: string | null
+      }
+      executionCaseSummary?: CaseSummarySnapshot
+      executionArchives?: {
+        prior: ExecutionArchiveResult | null
+        current: ExecutionArchiveResult | null
+      }
+      executionSummaryUpdated?: boolean
+      executionSummaryError?: string
     },
   ): Promise<{ evidence: SelftestEvidence | null; reason?: string }> {
     const context = entry.context
@@ -853,6 +1306,29 @@ export class InMemorySelftestService implements SelftestService {
         command: redactCommand(result.command),
         commandHash: result.commandInfo.hash,
         packageScriptsHash: context.packageScriptsHash,
+        // 实际执行 cwd/命令与 integration 基线；配置命令身份仍由 source/commandHash 保留。
+        cwd: redactCommand(result.cwd),
+        ...(result.executionCommand === undefined ? {} : { executionCommand: redactCommand(result.executionCommand) }),
+        ...(result.executionCommandHash === undefined ? {} : { executionCommandHash: result.executionCommandHash }),
+        ...(result.executionPackageScriptsHash === undefined ? {} : { executionPackageScriptsHash: result.executionPackageScriptsHash }),
+        ...(result.executionScriptHash === undefined ? {} : { executionScriptHash: result.executionScriptHash }),
+        ...(result.executionScriptChanged === true ? { executionScriptChanged: true } : {}),
+        ...(result.executionId === undefined ? {} : { executionId: result.executionId }),
+        ...(result.executionReceipt === undefined ? {} : { executionReceipt: result.executionReceipt }),
+        ...(result.executionReceiptError === undefined ? {} : { executionReceiptError: result.executionReceiptError }),
+        ...(result.executionAssetEntry === undefined ? {} : { executionAssetEntry: result.executionAssetEntry }),
+        ...(result.executionAssetDirectory === undefined ? {} : { executionAssetDirectory: result.executionAssetDirectory }),
+        ...(result.executionAssetScope === undefined ? {} : { executionAssetScope: result.executionAssetScope }),
+        ...(result.executionAssetDigest === undefined ? {} : { executionAssetDigest: result.executionAssetDigest }),
+        ...(result.executionAssetFiles === undefined ? {} : { executionAssetFiles: result.executionAssetFiles }),
+        ...(result.executionAssetAfterDigest === undefined ? {} : { executionAssetAfterDigest: result.executionAssetAfterDigest }),
+        ...(result.executionAssetDiff === undefined ? {} : { executionAssetDiff: result.executionAssetDiff }),
+        ...(result.executionAssetsChanged === true ? { executionAssetsChanged: true } : {}),
+        ...(result.executionGit === undefined ? {} : { executionGit: result.executionGit }),
+        ...(result.executionCaseSummary === undefined ? {} : { executionCaseSummary: result.executionCaseSummary }),
+        ...(result.executionArchives === undefined ? {} : { executionArchives: result.executionArchives }),
+        ...(result.executionSummaryUpdated === undefined ? {} : { executionSummaryUpdated: result.executionSummaryUpdated }),
+        ...(result.executionSummaryError === undefined ? {} : { executionSummaryError: result.executionSummaryError }),
         filter: result.filter,
         timedOut: result.timedOut,
         cancelled: result.cancelled,
@@ -882,6 +1358,116 @@ export class InMemorySelftestService implements SelftestService {
       return { evidence: null, reason: '节点启用了 strictOutputs，但没有声明允许的任务/证据路径；本次只返回结果' }
     }
     return { evidence: null, reason: '当前写权限范围不允许写 tasks/ 或 evidence/ 证据；本次只返回结果' }
+  }
+
+  /** 归档当前需求在本次调用前后的 summary/逐例证据；只写 evidence/executions 下。 */
+  private async archiveExecution(
+    entry: Entry,
+    exec: ToolRunContext,
+    artifactRoot: string,
+    executionDir: string | undefined,
+    label: 'prior' | 'current',
+    extra?: Array<{ name: string; content: string | Buffer }>,
+  ): Promise<ExecutionArchiveResult | undefined> {
+    if (executionDir === undefined) return undefined
+    const context = entry.context
+    const guard = createWriteGuard(this.options.permissions)
+    const probe = path.join(artifactRoot, executionDir, label, 'evidence/summary.json')
+    const denial = guard({ ...exec, name: 'write', arguments: { file_path: probe } })
+    if (denial !== undefined) {
+      return {
+        directory: `${executionDir}/${label}`,
+        files: [],
+        cases: [],
+        missing: [],
+        error: context.redact(`执行证据归档被写入守卫拒绝：${denial}`),
+      }
+    }
+    try {
+      return await archiveCaseEvidence({
+        workspaceDir: artifactRoot,
+        archiveDir: executionDir,
+        label,
+        ...(extra === undefined ? {} : { extra }),
+      })
+    } catch (error) {
+      return {
+        directory: `${executionDir}/${label}`,
+        files: [],
+        cases: [],
+        missing: [],
+        error: context.redact(`执行证据归档失败：${errorMessage(error)}`),
+      }
+    }
+  }
+
+  /** 不可变 receipt 落盘后登记归属；登记失败不抹掉已落盘的执行证据。 */
+  private async persistExecutionReceipt(
+    entry: Entry,
+    exec: ToolRunContext,
+    artifactRoot: string,
+    executionDir: string,
+    receipt: Record<string, unknown>,
+  ): Promise<{ ref?: ExecutionReceiptRef; error?: string }> {
+    const context = entry.context
+    const guard = createWriteGuard(this.options.permissions)
+    const target = path.join(artifactRoot, executionDir, 'receipt.json')
+    const denial = guard({ ...exec, name: 'write', arguments: { file_path: target } })
+    if (denial !== undefined) return { error: context.redact(`执行 receipt 被写入守卫拒绝：${denial}`) }
+    try {
+      const ref = await writeExecutionReceipt(artifactRoot, executionDir, receipt)
+      try {
+        await context.space.stores.workspaces.writeArtifact({
+          ref: { workspace: context.requirementId, path: ref.path },
+          content: `${JSON.stringify(receipt, null, 2)}\n`,
+          kind: 'evidence',
+          author: { type: 'agent', role: context.role, harness: 'dsh-host' },
+          producedBy: { runId: context.nodeRef.runId, nodeId: context.nodeRef.nodeId },
+          title: '受控自测执行 receipt',
+          tags: ['selftest', 'execution-receipt'],
+        })
+      } catch (error) {
+        return { ref, error: context.redact(`receipt 归属登记失败：${errorMessage(error)}`) }
+      }
+      return { ref }
+    } catch (error) {
+      return { error: context.redact(`执行 receipt 写入失败：${errorMessage(error)}`) }
+    }
+  }
+
+  /** 只追加执行元数据，保留 runner 产出的 cases/status/assertions 原样。 */
+  private async stampCaseSummary(
+    entry: Entry,
+    exec: ToolRunContext,
+    artifactRoot: string,
+    execution: Record<string, unknown>,
+  ): Promise<{ updated: boolean; error?: string }> {
+    const context = entry.context
+    const target = path.join(artifactRoot, 'evidence/summary.json')
+    const guard = createWriteGuard(this.options.permissions)
+    const denial = guard({ ...exec, name: 'write', arguments: { file_path: target } })
+    if (denial !== undefined) {
+      return { updated: false, error: context.redact(`summary 执行元数据被写入守卫拒绝：${denial}`) }
+    }
+    try {
+      await assertNoSymlinks(artifactRoot, target)
+      const text = await readFile(target, 'utf8')
+      const parsed: unknown = JSON.parse(text)
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { updated: false, error: 'summary 不是对象，未写入执行元数据' }
+      }
+      const record = parsed as Record<string, unknown>
+      const next = {
+        ...record,
+        ...(typeof record.generatedAt === 'string' && record.generatedAt !== '' ? {} : { generatedAt: execution.endedAt }),
+        execution,
+      }
+      await writeFileAtomic(target, `${JSON.stringify(next, null, 2)}\n`)
+      return { updated: true }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { updated: false }
+      return { updated: false, error: context.redact(`summary 执行元数据写入失败：${errorMessage(error)}`) }
+    }
   }
 }
 

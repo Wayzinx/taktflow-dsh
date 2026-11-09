@@ -3,6 +3,7 @@ import type { AgentProfile } from '@taktflow/core'
 import type { AgentPresetDefinition, AgentPresetDisposer, HostContext } from './dsh-types.js'
 import type { RoleSkillSnapshot, RoleSkillSnapshots } from './role-skills.js'
 import { loadRunProfiles } from './run-runtime.js'
+import { canUseSelftest } from './selftest-capability.js'
 import { TaktToolError, type RolePresetHandle, type RolePresets, type SpaceHandle } from './types.js'
 
 /** Lead preset 的固定 id；cordis.patch.yml 与客户端选择器共用。 */
@@ -96,9 +97,10 @@ export class DshRolePresets implements RolePresets {
       throw new TaktToolError('TAKT_FORBIDDEN_FOR_LEAD', `空间没有可用的角色档案：${role}`)
     }
     if (profile.allowBash) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', `P0 角色 ${role} 的 allowBash 必须为 false`)
-    // M-K：preset 按本次实际生效范围决定是否挂受控自测；只读或空范围不挂。
+    // M-K：preset 按本次实际生效范围决定是否挂受控自测；只读、空范围以及只写
+    // 需求产物/知识库的文档型角色不挂（与 harness 登记共用同一判定）。
     const effectiveWriteScope = [...(variant.writeScope ?? profile.writeScope)]
-    const selftest = !variant.readOnly && effectiveWriteScope.length > 0
+    const selftest = canUseSelftest(space, effectiveWriteScope, variant.readOnly)
     const declared = [...new Set(profile.skills)]
     const roleSkills = this.skills?.[role] ?? []
     // 生产必须带运行开始时的冻结快照；缺任何声明技能都明确失败，不能退化成只写 prompt。
