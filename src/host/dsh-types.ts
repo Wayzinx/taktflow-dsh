@@ -484,6 +484,11 @@ export interface HostContext {
   tools: {
     register(definition: ToolDefinition): Disposer
     guard(guard: ToolGuard): Disposer
+    /**
+     * 来源：@deepseek-ai/dsh-tools@0.2.2-rc.1/lib/index.js:2991-3006。只能在 agent 作用域调用；
+     * 屏蔽这个 Agent 继承的全局工具，名字必须是已注册的全局工具。旧测试替身可省略。
+     */
+    restrict?(filter: { allow?: readonly string[]; deny?: readonly string[] }): Disposer
   }
   subagents: {
     startActivation(spec: SubagentActivationSpec): Promise<SubagentActivation>

@@ -1,5 +1,5 @@
 import { createApiCore, ApiError, type ApiCore, type WriteOp } from '@taktflow/server'
-import type { Actor, ProjectStores, SpaceSettings, SpaceUpgradePlan, WorkflowDocument } from '@taktflow/core'
+import type { Actor, ProjectStores, SpaceDetail, SpaceSettings, SpaceUpgradePlan, WorkflowDocument } from '@taktflow/core'
 import { BUNDLED_AGENT_FILES, BUNDLED_WORKFLOW_FILES } from '../../templates/bundled.js'
 import type { DefineToolOptions, ToolExecutionContext } from '../dsh-types.js'
 import { TaktToolError, type SpaceHandle } from '../types.js'
@@ -18,7 +18,7 @@ import {
 const ACTIONS = [
   'show', 'set_config', 'save_role', 'delete_role', 'save_skill', 'delete_skill',
   'workflow_create', 'workflow_meta', 'workflow_delete', 'workflow_read', 'workflow_edit',
-  'upgrade', 'history', 'rollback',
+  'upgrade', 'history', 'rollback', 'repo_add', 'repo_sync',
 ] as const
 type Action = (typeof ACTIONS)[number]
 const DESTRUCTIVE = new Set<Action>(['delete_role', 'delete_skill', 'workflow_delete', 'rollback'])
@@ -52,6 +52,7 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
       '何时不用：用户没要求就不要改；需求产物用 takt_artifact。删除 / 升级 / 回滚先 takt_ask_human 确认，再带 confirmed=true。',
       '每次修改都要 reason（引用用户原话）；结果里会给出怎么撤回。流程节点属性（评审轮次、角色、提示词等）用 workflow_read 读源码后 workflow_edit 整文件替换。',
       '自测配置（selftest）只有 timeoutMs（1000..3600000 毫秒）和 allowedCommands（命令白名单）两个字段，没有 selftest.commands；不配置命令时默认用 environment.testCommand，quick-fix 固定 npm test，其它流程回退 package.json 的 test 脚本，不需要先配置命令才能自测。',
+      '代码仓库：用户要在某个 git 仓库上开发时，用 repo_add 绑定（id 默认 app，流程里的开发节点用 repo=app），宿主会拉取并在独立工作区里改代码；不要满盘搜文件找项目，问用户要地址。',
       '示例：{"action":"show"}',
       '示例：{"action":"set_config","patch":{"autonomy":"checkpoints"},"reason":"用户：评审签字我自己来"}',
       '示例：{"action":"save_role","role":"security","create":true,"copyFrom":"reviewer","profile":{"title":"安全评审"},"reason":"用户：加一个安全评审"}',
@@ -79,6 +80,12 @@ export function taktConfigTool(deps: ToolDeps): DefineToolOptions {
       kind: { type: 'string', enum: ['agent', 'skill', 'config'], description: 'history / rollback：哪类文件。' },
       rev: { type: 'string', description: 'rollback：要恢复到的修订（history 返回）。' },
       dryRun: { type: 'boolean', description: 'upgrade：只看要做什么，默认 true。' },
+      url: { type: 'string', description: 'repo_add：远端 git 地址（宿主负责拉取，你不需要也不能执行 git 命令）。' },
+      path: { type: 'string', description: 'repo_add：本机已有 git 仓库的路径（和 url 二选一）。' },
+      defaultBranch: { type: 'string', description: 'repo_add：默认分支，缺省 main；开发节点从它开分支。' },
+      repoId: { type: 'string', description: 'repo_add / repo_sync：仓库 id，缺省 app（流程模板里的产品仓库）。' },
+      purpose: { type: 'string', description: 'repo_add：仓库用途说明（可选）。' },
+      bootstrap: { type: 'string', description: 'repo_add：开发工作区准备命令，例如 npm ci（可选）。' },
     },
     output: { schema: OUTPUT_SCHEMA, render: renderResult },
     async execute(raw: unknown, exec: ToolExecutionContext): Promise<LeadToolResult> {
@@ -112,8 +119,10 @@ async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Actio
       const s = await read('space.settings') as SpaceSettings
       // show 的嵌套可选字段必须显式给出 JSON 缺省：undefined 会被 dsh 的
       // lossless JSON 校验拒绝（“value is not lossless JSON”）。
+      const detail = await read('space') as SpaceDetail
       return success('当前空间配置', {
         config: s.config,
+        repos: detail.repos.map((r) => ({ id: r.id, url: r.url ?? null, path: r.path, defaultBranch: r.defaultBranch, status: r.status, message: r.message ?? null })),
         workflows: s.workflows.map((w) => ({ id: w.id, title: w.title, default: w.default })),
         roles: s.roles.map((r) => ({
           role: r.role,
@@ -198,6 +207,33 @@ async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Actio
       const kind = requiredString(args, 'kind')
       const list = await read('space.file.revisions', { kind, name: optionalString(args, kind === 'skill' ? 'name' : 'role') }) as Array<{ rev: string; summary: string; reason: string; at: string }>
       return success(`${list.length} 条修改记录`, { revisions: list.slice(0, 20) }, ['takt_config action="rollback" kind=… rev=… confirmed=true（先征得同意）'])
+    }
+    case 'repo_add': {
+      const id = optionalString(args, 'repoId') ?? 'app'
+      const url = optionalString(args, 'url')
+      const local = optionalString(args, 'path')
+      if ((url === undefined) === (local === undefined)) throw new ApiError(400, 'url（远端 git 地址）和 path（本机仓库路径）二选一')
+      const why = reason()
+      const body: Record<string, unknown> = { id, path: url !== undefined ? `.takt/repos/${id}` : local, defaultBranch: optionalString(args, 'defaultBranch') ?? 'main', reason: why }
+      if (url !== undefined) body.url = url
+      for (const key of ['purpose', 'bootstrap'] as const) {
+        const value = optionalString(args, key)
+        if (value !== undefined) body[key] = value
+      }
+      await write('space.repo.add', {}, body)
+      // 绑定后立即同步一次：拉取失败（权限、地址错）当场告诉用户，不留到运行时才发现。
+      try {
+        const synced = await write('space.repo.sync', { repoId: id }, { reason: `绑定后首次同步：${why}` }) as { head: string }
+        return success(`已绑定并同步仓库 ${id}（HEAD ${synced.head.slice(0, 8)}）`, { id, head: synced.head, synced: true }, ['之后的运行里，开发节点在这个仓库的独立工作区里改代码，不动你的主分支', '解绑或改地址：面板「空间设置 → 代码仓库」'])
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return success(`已绑定仓库 ${id}，但同步失败：${message}`, { id, synced: false, syncError: message }, ['确认地址和本机 git 权限后 takt_config action="repo_sync"', '地址填错：面板「空间设置 → 代码仓库」修改'])
+      }
+    }
+    case 'repo_sync': {
+      const id = optionalString(args, 'repoId') ?? 'app'
+      const synced = await write('space.repo.sync', { repoId: id }, { reason: reason() }) as { head: string }
+      return success(`仓库 ${id} 已同步（HEAD ${synced.head.slice(0, 8)}）`, { id, head: synced.head }, [])
     }
     case 'rollback': {
       const kind = requiredString(args, 'kind')

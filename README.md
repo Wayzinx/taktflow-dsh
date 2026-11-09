@@ -25,6 +25,7 @@
 | M-J 标准流程 | `taktflow-standard`、角色能力、autonomy、run-status、状态工具与文档；构建/类型/单测 35 文件 548 项通过；真实 dsh + 模型 standard e2e 已执行 5 批，前 4 批未通过（目录遗漏与 sandbox 包解析已修；第 4 批跑到 loop，5 轮评审、9 条生成用例 8 过 1 失败，因缺基线环境变量升级）；第 5 批跑到 loop 后升级给人（34 项 26 过 8 失败，`ok=false`） | 🚧 到人工升级，未全链通过 |
 | M-K 评测与缺陷归因宿主 | 复用 M3，接入 Lead 缺陷动作（defects / why / report / attribute / scorecard）、人工归因原生卡片、通知及 recipe 追溯；可写角色的受控自测工具 `takt_selftest`（见 [docs/controlled-selftest.md](docs/controlled-selftest.md)）；构建/类型/单测 39 文件 665 项通过。真实 dsh + 模型用 quick-fix 跑完需求 → 自测 → 独立评审 → 交付校验 → 报缺陷 → auditor 归因 → 卡片人工确认 → Lead 汇报，第 7 批 25/25 | ✅ 归因确认闭环；回放评测与前端未真实验收 |
 | M-L 可视化与对话式配置 | 设置页改成表单（运行策略、角色、技能、知识源），新建 / 复制 / 删除，修改记录可恢复；Workflow 页新建（模板 / 复制）、改名、设默认、删除；面板“告诉 Lead”与 Lead 的 `takt_config`（第 7 个工具）走同一套操作；dsh 下不显示模型与 Harness、成员；角色可选 App 里的模型；多空间与旧空间一键升级；本机旧宿主进程已退出时自动接管租约；面板在 App 常见宽度下的布局修复 | ✅ 单测 41 文件 676 项；隔离 dsh web 实测设置、流程新建、升级、告诉 Lead（真实模型对话待模型服务恢复后补测） |
+| 普通会话交给 Taktflow、Lead 绑定代码仓库 | 标准模式等普通会话里有 `taktflow_handoff`：遇到需求开发类任务时弹原生卡片征求同意，同意后在空间目录新开 Taktflow 会话并带上需求和仓库；Lead 和职责角色看不到它。Lead 的 `takt_config` 新增 `repo_add` / `repo_sync`：给 git 地址或本机路径即可绑定（id 默认 app）并立即同步，失败当场说明 | ✅ 单测 52 文件 795 项；隔离 dsh web + 真实模型：标准会话自主转交 → 卡片确认 → Lead 依次 init、repo_add、建需求、写 inputs/request.md、启动流程 |
 | P1 / P2 | 从节点重跑、产物回退、配方与归因完整视图；M3 宿主接入以 M-K 行及 spike 新节为准 | 后续及前端整合范围 |
 
 第 5 批最终结果：run `run-20261106-124857-4d67`，34 项验收 26 通过 / 8 失败、整体 `ok=false`；生成 12 条业务用例首轮 9 过 3 失败，独立 6 项产品 AC 通过；研发测试 loop 的 judge 停在 `waiting_human`，最终升级待办保持未回答。未到质量报告/准出/知识回流，不宣称标准全链通过。证据归档见 `e2e/out/standard-history/`。

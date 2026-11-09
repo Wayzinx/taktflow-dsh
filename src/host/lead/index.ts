@@ -1,6 +1,7 @@
 import type { DefineTool, Disposer, HostContext } from '../dsh-types.js'
 import type { TaktflowService } from '../types.js'
 import { loadDefineTool } from '../dsh-runtime.js'
+import { hideHandoff } from '../handoff.js'
 import { LEAD_PROMPT_SECTION } from './prompt.js'
 import { LEAD_SKILL } from './skill.js'
 import { registerLeadTools } from './tools.js'
@@ -36,6 +37,7 @@ export interface LeadApplyOptions {
  * - 单测通过 options.defineTool 注入，保持同步注册便于断言。
  */
 export function apply(ctx: LeadContext, options: LeadApplyOptions = {}): void {
+  ctx.effect(() => hideHandoff(ctx), 'taktflow lead hides handoff')
   ctx.effect(() => ctx.systemPrompt.section(LEAD_PROMPT_SECTION), 'taktflow lead prompt')
   ctx.effect(() => ctx.skills.register(LEAD_SKILL), 'taktflow lead skill')
   ctx.effect(() => {

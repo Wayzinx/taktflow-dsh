@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { isJsonValue } from '@deepseek-ai/dsh-util-values'
@@ -127,5 +128,25 @@ describe('takt_config', () => {
     expect(denied.ok).toBe(false)
     const unknown = await h.call({ action: 'nuke' })
     expect(unknown.error?.code).toBe('TAKT_INVALID_INPUT')
+  })
+
+  it('repo_add 绑定本机仓库并立即同步，show 能看到；url 和 path 必须二选一；show 仍是合法 JSON', async () => {
+    const h = await harness()
+    const repo = await realpath(await mkdtemp(path.join(tmpdir(), 'taktflow-repo-')))
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' })
+    git('init', '-q', '-b', 'main'); git('config', 'user.email', 't@example.com'); git('config', 'user.name', 't')
+    await writeFile(path.join(repo, 'README.md'), 'portal\n'); git('add', '.'); git('commit', '-q', '-m', 'init')
+    try {
+      const both = await h.call({ action: 'repo_add', url: 'git@example.com:a/b.git', path: repo, reason: '用户：绑定仓库' })
+      expect(both.ok).toBe(false)
+      const added = await h.call({ action: 'repo_add', path: repo, reason: '用户：在这个仓库上开发' })
+      expect(added.ok).toBe(true)
+      expect(added).toMatchObject({ id: 'app', synced: true })
+      const shown = await h.call({ action: 'show' })
+      expect(isJsonValue(shown)).toBe(true)
+      expect(shown.repos).toEqual([expect.objectContaining({ id: 'app', path: repo, defaultBranch: 'main', status: 'ready' })])
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
   })
 })

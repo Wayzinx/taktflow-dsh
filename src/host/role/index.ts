@@ -1,6 +1,7 @@
 import type { HostContext, SystemPromptSection } from '../dsh-types.js'
 import { createRoleSkillTool, roleSkillRegistration, type RoleSkillSnapshot } from '../role-skills.js'
 import { createSelftestTool } from './selftest.js'
+import { hideHandoff } from '../handoff.js'
 import type { TaktflowService } from '../types.js'
 
 export const name = 'taktflow/role'
@@ -62,6 +63,8 @@ export const ROLE_PROMPT_SECTION: SystemPromptSection = {
  * 失败语义：重复注册同名段/技能会抛错，由 preset 注册失败暴露。
  */
 export function apply(ctx: RoleContext, config: RoleConfig = {}): void {
+  // 职责角色就在流水线里，不需要“交给 Taktflow”。
+  ctx.effect(() => hideHandoff(ctx), 'taktflow role hides handoff')
   const selftest = config.selftest === true && config.readOnly !== true && (config.writeScope?.length ?? 0) > 0 && config.role !== 'lead'
   const snapshots = config.skillSnapshot ?? []
   const skillNames = snapshots.length > 0 ? snapshots.map((skill) => skill.name) : config.skills ?? []

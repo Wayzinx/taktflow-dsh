@@ -5,6 +5,8 @@ import type { HostContext } from './dsh-types.js'
 import { PlaceholderApprovals } from './approvals.js'
 import { createLeadServices, type LeadServices } from './lead/services.js'
 import { createM3Service } from './m3.js'
+import { loadDefineTool } from './dsh-runtime.js'
+import { createHandoffTool, markHandoffRegistered } from './handoff.js'
 import { PlaceholderNotifier } from './notify.js'
 import { FsOwnership } from './ownership.js'
 import { PlaceholderBindings } from './bindings.js'
@@ -28,7 +30,7 @@ export const inject = ['connection', 'subagents', 'agents', 'tools']
 
 /** 宿主行配置；spaces 为空时 forSession 只接受“cwd 本身就是空间根”。 */
 export interface Config {
-  /** 允许的空间根列表；P0 最多一个（同一个根的不同路径/symlink 会去重）。 */
+  /** 允许的空间根列表（可多个；同一个根的不同路径/symlink 会去重）。不配时任何目录都可以 init 成空间。 */
   spaces?: string[]
   /** 审计里代表的人；默认 os.userInfo().username。不参与 hostOwner。 */
   user?: string
@@ -36,6 +38,8 @@ export interface Config {
   autonomy?: Autonomy
   /** 角色子 Agent 执行方式；缺省 dsh-host（App 模型 + 编队可见）。 */
   roleHarness?: RoleHarness
+  /** 普通会话里的“交给 Taktflow”工具（taktflow_handoff）；缺省开启，false 关闭。 */
+  handoff?: boolean
 }
 
 /** 仅供程序化组装和隔离测试；生产仍使用随包流程目录。 */
@@ -199,6 +203,31 @@ function attachOnOpen(registry: SpaceRegistry, notifier: Notifier): SpaceRegistr
  * 所有注册都交给 ctx.effect；卸载时先取消在途运行（runs.disposeAll），再注销
  * 服务和路由。配置错误（重复加载同名服务、路由冲突）会让插件加载失败。
  */
+/**
+ * 全局注册“交给 Taktflow”工具：所有会话可见，Lead / 职责角色的会话各自 restrict 掉。
+ * dsh-tools 加载失败只记警告：这是入口增强，不能拖垮宿主加载。
+ */
+function registerHandoff(ctx: HostContext, config: Config): void {
+  if (config.handoff === false) return
+  ctx.effect(() => {
+    // 同步返回清理函数；dsh-tools 异步加载完成前宿主已卸载时不再注册。
+    let disposed = false
+    let unregister: (() => unknown) | undefined
+    loadDefineTool().then((defineTool) => {
+      if (disposed) return
+      unregister = ctx.tools.register(defineTool(createHandoffTool({ ctx })))
+      markHandoffRegistered(true)
+    }).catch((error: unknown) => {
+      ctx.logger?.warn(`taktflow_handoff 未注册：${error instanceof Error ? error.message : String(error)}`)
+    })
+    return () => {
+      disposed = true
+      markHandoffRegistered(false)
+      return unregister?.() as void | Promise<void>
+    }
+  }, 'taktflow handoff tool')
+}
+
 export function apply(ctx: HostContext, config: Config = {}): void {
   // Cordis 并发卸载顶层 effect；同一外层 effect 内的清理才按逆序等待。
   ctx.effect(() => {
@@ -206,6 +235,7 @@ export function apply(ctx: HostContext, config: Config = {}): void {
     ctx.provide('taktflow', service)
     registerRoutes(ctx, service, config)
     ctx.tools.guard(createWriteGuard(service.permissions))
+    registerHandoff(ctx, config)
     return async () => {
       // 同时停止入场和进程，再等待引擎收尾；不能先等可能正等待工具的 Agent。
       const stopped = await Promise.allSettled([service.selftests?.dispose(), service.runs.disposeAll(), service.m3?.dispose()])
