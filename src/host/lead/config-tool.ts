@@ -1,3 +1,6 @@
+import { execFile } from 'node:child_process'
+import path from 'node:path'
+import { promisify } from 'node:util'
 import { createApiCore, ApiError, type ApiCore, type WriteOp } from '@taktflow/server'
 import type { Actor, ProjectStores, SpaceDetail, SpaceSettings, SpaceUpgradePlan, WorkflowDocument } from '@taktflow/core'
 import { BUNDLED_AGENT_FILES, BUNDLED_WORKFLOW_FILES } from '../../templates/bundled.js'
@@ -224,7 +227,13 @@ async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Actio
       // 绑定后立即同步一次：拉取失败（权限、地址错）当场告诉用户，不留到运行时才发现。
       try {
         const synced = await write('space.repo.sync', { repoId: id }, { reason: `绑定后首次同步：${why}` }) as { head: string }
-        return success(`已绑定并同步仓库 ${id}（HEAD ${synced.head.slice(0, 8)}）`, { id, head: synced.head, synced: true }, ['之后的运行里，开发节点在这个仓库的独立工作区里改代码，不动你的主分支', '解绑或改地址：面板「空间设置 → 代码仓库」'])
+        const settings = await read('space.settings') as SpaceSettings
+        const scope = await checkRoleScopes(path.resolve(space.root, String(body.path)), String(body.defaultBranch), settings.roles)
+        const next = ['之后的运行里，开发节点在这个仓库的独立工作区里改代码，不动你的主分支', '解绑或改地址：面板「空间设置 → 代码仓库」']
+        if (scope.warnings.length > 0) {
+          next.unshift(`先修写范围：${scope.warnings.map((w) => `${w.role} 的 ${w.patterns.join('、')}`).join('；')} 在这个仓库里匹配不到任何文件（仓库顶层：${scope.topLevel.join('、')}）。按仓库实际的代码目录用 save_role 改 profile.writeScope，否则开发节点写代码会被拒绝`)
+        }
+        return success(`已绑定并同步仓库 ${id}（HEAD ${synced.head.slice(0, 8)}）`, { id, head: synced.head, synced: true, scopeWarnings: scope.warnings, topLevel: scope.topLevel }, next)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return success(`已绑定仓库 ${id}，但同步失败：${message}`, { id, synced: false, syncError: message }, ['确认地址和本机 git 权限后 takt_config action="repo_sync"', '地址填错：面板「空间设置 → 代码仓库」修改'])
@@ -242,6 +251,54 @@ async function run(api: ApiCore, space: SpaceHandle, actor: Actor, action: Actio
       return success('已恢复到指定版本', {}, ['恢复本身也记了一条修改记录'])
     }
   }
+}
+
+/** 公共产物 / 知识库等空间内路径：不属于代码仓库，不按仓库目录检查。 */
+const SPACE_PREFIXES = ['requirements/', '.takt/', 'knowledge/', 'agents/', 'skills/', 'workflows/']
+
+/**
+ * 绑定仓库后检查各角色的代码写范围：模板默认是 src/** + package.json，换到 Python 等其它布局的仓库会
+ * 一条都匹配不上，要等到实现节点写代码被拒才暴露。按默认分支的顶层目录 / 文件对照模式首段
+ * （远端仓库的本地副本是 bare 仓库，只能读 git 树）；首段带通配符的模式不判断，读不到树时不报。
+ */
+export async function checkRoleScopes(checkout: string, branch: string, roles: ReadonlyArray<{ role: string; writeScope: readonly string[]; readOnly?: boolean }>): Promise<{
+  warnings: Array<{ role: string; patterns: string[] }>
+  topLevel: string[]
+}> {
+  const entries = await topLevelEntries(checkout, branch)
+  if (entries.length === 0) return { warnings: [], topLevel: [] }
+  const dirs = new Set(entries.filter((e) => e.dir).map((e) => e.name))
+  const files = new Set(entries.filter((e) => !e.dir).map((e) => e.name))
+  const warnings: Array<{ role: string; patterns: string[] }> = []
+  for (const role of roles) {
+    if (role.readOnly === true) continue
+    const code = role.writeScope.filter((p) => !SPACE_PREFIXES.some((prefix) => p.startsWith(prefix)))
+    const unmatched = code.filter((pattern) => {
+      const [head, ...rest] = pattern.split('/')
+      if (head === undefined || head === '' || /[*?[{]/.test(head)) return false
+      return rest.length === 0 ? !files.has(head) && !dirs.has(head) : !dirs.has(head)
+    })
+    // 有一条代码模式能匹配就不报：package.json 缺失但 src/** 存在是正常的
+    if (code.length > 0 && unmatched.length === code.length) warnings.push({ role: role.role, patterns: unmatched })
+  }
+  const topLevel = [...entries].sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)).slice(0, 20).map((e) => (e.dir ? `${e.name}/` : e.name))
+  return { warnings, topLevel }
+}
+
+async function topLevelEntries(checkout: string, branch: string): Promise<Array<{ name: string; dir: boolean }>> {
+  for (const ref of [branch, 'HEAD']) {
+    try {
+      const { stdout } = await promisify(execFile)('git', ['-C', checkout, 'ls-tree', '-z', ref], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 })
+      // 每项：<mode> <type> <sha>\t<name>
+      return stdout.split('\0').filter(Boolean).map((line) => {
+        const tab = line.indexOf('\t')
+        return { name: line.slice(tab + 1), dir: line.slice(0, tab).split(' ')[1] === 'tree' }
+      })
+    } catch {
+      // 分支名不存在时退到 HEAD；都读不到就不检查
+    }
+  }
+  return []
 }
 
 function done(summary: string, kind: 'config' | 'agent' | 'skill', name?: string): LeadToolResult {

@@ -4,7 +4,7 @@ import path from 'node:path'
 import { extractJsonBlock, type AgentProfile, type HarnessAdapter, type HarnessEvent, type HarnessRequest, type HarnessResult, type WorkflowDefinition } from '@taktflow/core'
 import { collectSecrets, createRedactor } from '@taktflow/harness'
 import type { AgentTraceHandle, AgentTraceHub, AgentTraceOutcome } from './agent-trace.js'
-import type { HostContext, SessionEvent, SubagentActivation } from './dsh-types.js'
+import type { AgentTurnStoppingEvent, HostContext, SessionEvent, SubagentActivation, ToolExecution, UserMessage } from './dsh-types.js'
 import type { RoleSkillSnapshots } from './role-skills.js'
 import { canUseSelftest } from './selftest-capability.js'
 import type { SelftestRegistration, SelftestService } from './selftest.js'
@@ -109,6 +109,27 @@ function genericDiagnostic(value: string | undefined): boolean {
  * 只陈述“没有收到有效提交”这一观察，不推断 SDK 校验、模型或鉴权原因。
  */
 const NATIVE_MISSING_DIAGNOSTIC = '未收到 structured_output 的有效提交；文本/JSON代码块不能替代原生结构化结果'
+
+/**
+ * 子 Agent 想结束却还没提交原生结果时，在同一轮里提醒的次数上限。
+ * 模型常把结论写成文字里的 JSON 代码块就收尾（评审最常见）；提醒只要求把已有结论用工具交一次，
+ * 不重做任务，结构化工具和 schema 校验都还在同一个 activation 里，结果仍然只认工具提交。
+ */
+const SUBMIT_REMINDERS = 2
+const SUBMIT_REMINDER = '你还没有调用 structured_output，本次结果不会被记录。现在立即调用 structured_output，'
+  + '把你已经得出的结论按它的参数 schema 原样提交一次：不要重新检查、不要再写长文，文字或代码块里的 JSON 不算提交。'
+
+/** 提醒后仍未提交时补充的说明：把“没调工具”和“截断 / 模型报错”分清，免得 Lead 误判。 */
+function missingSubmissionDetail(reminders: number): string {
+  return reminders > 0
+    ? `子 Agent 正常结束了对话，但没有调用 structured_output（同一轮内提醒 ${reminders} 次仍未提交）；不是输出被截断或模型报错，SDK 没收到工具提交时会把停止原因记为 error`
+    : '子 Agent 正常结束了对话，但没有调用 structured_output；不是输出被截断或模型报错，SDK 没收到工具提交时会把停止原因记为 error'
+}
+
+function reminderMessage(): UserMessage {
+  // 官方 MessageSource 只接受已知 kind；插件消息沿用 user 来源（同 notify.ts）。
+  return { id: randomUUID(), role: 'user', content: [{ type: 'text', text: SUBMIT_REMINDER }], source: { kind: 'user' } }
+}
 
 /** 结果格式提示：只描述格式，不替模型填写任何结论或默认通过。 */
 function structuredPrompt(schema: Record<string, unknown>, native: boolean): string {
@@ -267,6 +288,8 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
       let disposal: Promise<void> | undefined
       let trace: AgentTraceHandle | undefined
       let unsubscribeSession: (() => void | Promise<void>) | undefined
+      let unsubscribeSubmit: Array<() => void | Promise<void>> = []
+      let reminders = 0
       let outcome: AgentTraceOutcome | undefined
       let selftest: SelftestRegistration | undefined
       let runError: unknown
@@ -338,6 +361,23 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
           }) as (...args: never[]) => void
           unsubscribeSession = ctx.on('session/event', listener)
         }
+        if (outputSchema !== undefined) {
+          // 原生结果只认 structured_output：子 Agent 想结束却还没提交时，在同一轮里提醒它把已有结论交上来。
+          // turn-stopping 在本轮关闭前串行派发，steer 进下一步的输入让本轮继续，不和 activation 结算竞争。
+          let submitted = false
+          unsubscribeSubmit = [
+            ctx.on('tools/result', ((exec: ToolExecution, result: { isError?: boolean } | undefined) => {
+              if (exec.agent?.id === childId && exec.name === 'structured_output' && result?.isError !== true) submitted = true
+            }) as (...args: never[]) => void),
+            ctx.on('agent/turn-stopping', ((event: AgentTurnStoppingEvent) => {
+              const agent = event?.agent
+              if (agent?.id !== childId || submitted || reminders >= SUBMIT_REMINDERS) return
+              if (signal.aborted || event.signal?.aborted || typeof agent.steer !== 'function') return
+              reminders += 1
+              agent.steer(reminderMessage())
+            }) as (...args: never[]) => void),
+          ]
+        }
         // 角色档案选了 App 里的模型（<provider>/<model>）时用它；模板里的别名等其它写法跟随 App 当前模型。
         const modelOption = await dshModelOption(ctx, req.model)
         while (activation === undefined) {
@@ -385,7 +425,7 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         const nativeMissing = native && result.structured === undefined
         const nativeMissingError = nativeMissing
           && (result.stopReason === 'completed' || result.stopReason === 'error' || result.stopReason === 'failed')
-          ? NATIVE_MISSING_DIAGNOSTIC : undefined
+          ? `${NATIVE_MISSING_DIAGNOSTIC}。${missingSubmissionDetail(reminders)}` : undefined
         // 实质诊断（鉴权、超时等）必须保留；schema 定义错误优先于泛化的未提交诊断。
         const specificError = schemaError ?? nativeMissingError
         const failure = specificError === undefined
@@ -498,6 +538,12 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         // 会话事件订阅保留到最终刷新和 dispose 完成，避免漏掉最后一条 usage/tool 结果。
         if (unsubscribeSession !== undefined) {
           try { await unsubscribeSession() } catch (error) {
+            cleanupFailures.push(error)
+            cleanupError ??= error
+          }
+        }
+        for (const off of unsubscribeSubmit) {
+          try { await off() } catch (error) {
             cleanupFailures.push(error)
             cleanupError ??= error
           }

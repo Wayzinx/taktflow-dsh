@@ -257,3 +257,13 @@ it('full/dsh-host 的 planner 展开先克隆，不污染后续 manual/profile �
   // 闭包里的共享数组必须原样保留，否则 full 会把后续 manual 也改成无签字。
   expect(shared[0]).toMatchObject({ humanSignoff: true, reviewers: [{ harness: { harness: 'profile' } }] })
 })
+
+it('dsh-host 保留角色选的 App 模型（<provider>/<model>），模板别名、provider、fallback 照旧清掉', async () => {
+  const { space, stores } = await fixture()
+  await writeFile(join(stores.paths.agents, 'reviewer.md'), '---\nrole: reviewer\nharness: { harness: claude-code, model: fake/fake-1, effort: high, fallback: [{ harness: codex }] }\nwriteScope: []\n---\n评审')
+  await writeFile(join(stores.paths.agents, 'dev.md'), '---\nrole: dev\nharness: { harness: claude-code, model: sonnet, provider: anthropic }\nwriteScope: ["src/**"]\n---\n开发')
+  const workflow: WorkflowDefinition = { id: 'test', version: '1', title: '模型', stages: [], nodes: [] }
+  const runtime = await loadRunRuntime(space, workflow, { autonomy: 'full', roleHarness: 'dsh-host' })
+  expect(runtime.profiles.reviewer!.harness).toEqual({ harness: 'dsh-host', model: 'fake/fake-1', effort: 'high' })
+  expect(runtime.profiles.dev!.harness).toEqual({ harness: 'dsh-host' })
+})

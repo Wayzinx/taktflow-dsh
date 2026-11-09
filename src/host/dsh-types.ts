@@ -105,6 +105,18 @@ export interface Agent {
   /** 来源：同上 :202-231；官方为必填。 */
   followup(message: UserMessage): void
   inject(message: UserMessage): void
+  /** 来源：同上；进入下一步的输入并唤醒。旧替身可省略。 */
+  steer?(message: UserMessage): void
+}
+
+/**
+ * agent/turn-stopping：本轮本该结束（没有工具调用、没有待处理的下一步输入）时串行派发；
+ * 监听者 steer 一条消息就能让同一轮继续。来源：@deepseek-ai/dsh-agent-loop/lib/index.js（serial 派发）。
+ */
+export interface AgentTurnStoppingEvent {
+  readonly agent: Agent
+  readonly turn: number
+  readonly signal: AbortSignal
 }
 
 /** 来源：@deepseek-ai/dsh-agent@0.2.2-rc.1/lib/types/runtime-types.d.ts:22-34。 */

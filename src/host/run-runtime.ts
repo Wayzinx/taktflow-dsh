@@ -178,7 +178,7 @@ export async function loadRunRuntime(
   // 标准流程按 app 引用主仓库；只有“唯一 legacy main”这一种旧数据才补 app 别名，
   // 且原 main 必须保留。其它流程/多仓库配置一律不动，避免把真实 ID 改名后冲突。
   applyStandardRepoAlias(frozenSpace, definition)
-  // dsh-host 模式统一使用 App 模型：清掉角色与节点选择里的 model/provider/fallback，
+  // dsh-host 模式统一使用 App 模型：清掉角色与节点选择里的 provider/fallback 和非 App 模型 id，
   // 否则 core 的 selectHarness(override) 会保留它们，自定义 provider 会被拒绝。
   const profiles = roleHarness === 'dsh-host' ? sanitizeProfiles(loaded.profiles) : loaded.profiles
   if (roleHarness === 'dsh-host') sanitizeDshSelectors(definition)
@@ -210,10 +210,18 @@ function resolveRoleHarness(value: RoleHarness | undefined): RoleHarness {
   throw new Error(`roleHarness 不合法：${String(value)}（只允许 dsh-host/profile）`)
 }
 
-/** dsh-host 只用 App 模型；effort 仍可由角色选择，但 model/provider/fallback 必须清掉。 */
+/** App 模型 id 的写法：<App 里的 provider>/<模型>（设置页角色的“模型”下拉写的就是它）。 */
+const APP_MODEL_ID = /^[^/\s]+\/\S+$/
+
+/**
+ * dsh-host 只用 App 模型；effort 仍可由角色选择，provider/fallback 必须清掉。
+ * model 只保留 App 模型 id（dsh-harness 在 App 模型目录里核对后作为子 Agent 的模型）；
+ * 模板里的别名（sonnet 等）不是 App 模型，清掉后跟随 App 当前模型。
+ */
 function sanitizeSelector(selector: HarnessSelector): HarnessSelector {
   return {
     harness: 'dsh-host',
+    ...(selector.model !== undefined && APP_MODEL_ID.test(selector.model) ? { model: selector.model } : {}),
     ...(selector.effort === undefined ? {} : { effort: selector.effort }),
   }
 }

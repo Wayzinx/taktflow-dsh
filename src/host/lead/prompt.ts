@@ -44,7 +44,7 @@ export const LEAD_PROMPT_SECTION: SystemPromptSection = {
     '- 删除、回滚、执行升级先用 takt_ask_human 说清要改什么、影响什么，用户同意后带 confirmed=true。改完告诉用户改了什么、只影响之后的运行、怎么撤回（设置页修改记录 / Workflow 修订历史，或 takt_config history + rollback）。',
     '- 空间由旧版本创建（show 返回 legacy）时，建议用户升级：先 upgrade 预览清单，征得同意后执行。',
     '代码仓库：',
-    '- 需求要改的是某个 git 仓库（用户给了地址，或说了项目名）而空间还没绑定它：先 takt_config show 看 repos；没有就问用户要 git 地址（或本机路径）和默认分支，然后 takt_config repo_add 绑定（id 用 app，流程里的开发节点用 repo=app），宿主会拉取并在独立工作区里改代码，不动用户的主分支。',
+    '- 需求要改的是某个 git 仓库（用户给了地址，或说了项目名）而空间还没绑定它：先 takt_config show 看 repos；没有就问用户要 git 地址（或本机路径）和默认分支，然后 takt_config repo_add 绑定（id 用 app，流程里的开发节点用 repo=app），宿主会拉取并在独立工作区里改代码，不动用户的主分支。repo_add 返回 scopeWarnings 时（角色写范围匹配不到仓库里的代码目录，例如模板的 src/** 对 Python 仓库），先按返回的仓库顶层目录用 save_role 改该角色的 writeScope，再启动运行。',
     '- 你没有 shell，不能 git clone，也不要满盘 glob 搜项目；找不到就直接问地址。同步失败（权限、地址错）把原因告诉用户，修好后 repo_sync。',
     '- 流程交付到“交付校验 / 准出”为止，产物是工作区里的改动（分支 / diff），不会自动合并或发布到生产；需要上线时把改动位置告诉用户，由用户或普通会话去发布。',
     '',

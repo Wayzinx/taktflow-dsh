@@ -796,6 +796,69 @@ describe('结构化结果格式诊断', () => {
     expect(result.error).toContain('未收到 structured_output 的有效提交')
   })
 
+  it('子 Agent 想不提交就结束时同一轮提醒它提交；提交后不再提醒，别的 Agent 不受影响', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    const steered: string[] = []
+    const others: string[] = []
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
+      const child: Agent = {
+        id: spec.childId!, options: {}, session: { header: { id: spec.childId!, cwd: root } }, followup() {}, inject() {},
+        steer: (message) => { steered.push(message.content.map((c) => (c as { text: string }).text).join('')) },
+      }
+      const other: Agent = { id: 'other', options: {}, session: { header: { id: 'other', cwd: root } }, followup() {}, inject() {}, steer: () => { others.push('x') } }
+      const fire = (event: string, ...args: unknown[]) => {
+        for (const l of f.ctx.listeners.filter((x) => x.event === event)) (l.listener as (...a: unknown[]) => void)(...args)
+      }
+      const stopping = (agent: Agent) => fire('agent/turn-stopping', { agent, turn: 1, signal: new AbortController().signal })
+      // 第一次想结束：没提交 → 提醒；别的 Agent 的同名事件不处理
+      stopping(child)
+      stopping(other)
+      // 模型按提醒调用 structured_output；失败的提交不算
+      fire('tools/result', { agent: child, name: 'structured_output' }, { isError: true })
+      stopping(child)
+      fire('tools/result', { agent: child, name: 'structured_output' }, { isError: false })
+      stopping(child)
+      return { childId: spec.childId!, result: Promise.resolve({ output: [], structured: { verdict: 'approve', summary: '通过', issues: [] }, stopReason: 'completed' }), dispose: f.dispose }
+    })
+    const result = await f.run()
+    expect(result.ok).toBe(true)
+    expect(steered).toHaveLength(2)
+    expect(steered[0]).toContain('调用 structured_output')
+    expect(steered[0]).toContain('不要重新检查')
+    expect(others).toHaveLength(0)
+    // 结束后监听全部注销
+    expect(f.ctx.listeners.filter((x) => x.event === 'agent/turn-stopping' || x.event === 'tools/result')).toHaveLength(0)
+  })
+
+  it('最多提醒两次；仍未提交时说明是没调工具，不是截断或模型报错', async () => {
+    const f = fixture()
+    f.req.resultSchema = reviewSchema()
+    let steers = 0
+    f.ctx.subagents.startActivation = vi.fn(async (spec: SubagentActivationSpec): Promise<SubagentActivation> => {
+      const child: Agent = { id: spec.childId!, options: {}, session: { header: { id: spec.childId!, cwd: root } }, followup() {}, inject() {}, steer: () => { steers += 1 } }
+      for (let i = 0; i < 4; i++) {
+        for (const l of f.ctx.listeners.filter((x) => x.event === 'agent/turn-stopping')) {
+          (l.listener as (e: unknown) => void)({ agent: child, turn: 1, signal: new AbortController().signal })
+        }
+      }
+      return { childId: spec.childId!, result: Promise.resolve({ output: [{ type: 'text', text: jsonBlock({ verdict: 'approve', summary: '通过', issues: [] }) }], stopReason: 'error' }), dispose: f.dispose }
+    })
+    const result = await f.run()
+    expect(steers).toBe(2)
+    expect(result.ok).toBe(false)
+    expect(result.structured).toBeUndefined()
+    expect(result.error).toContain('未收到 structured_output 的有效提交')
+    expect(result.error).toContain('提醒 2 次仍未提交')
+    expect(result.error).toContain('不是输出被截断或模型报错')
+  })
+
+  it('没有原生 schema 时不挂提醒', async () => {
+    const f = fixture()
+    await f.run()
+    expect(f.ctx.listeners.some((x) => x.event === 'agent/turn-stopping')).toBe(false)
+  })
+
   it('原生 schema 缺少 structured_output 时保留实质诊断并脱敏', async () => {
     const f = fixture()
     f.req.resultSchema = reviewSchema()

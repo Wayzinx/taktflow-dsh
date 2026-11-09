@@ -8,6 +8,7 @@ import { createInsights, initProject } from '@taktflow/core'
 import type { Agent, DefineTool, HostContext, ToolDefinition, ToolExecutionContext } from '../dsh-types.js'
 import type { SpaceHandle, TaktflowService } from '../types.js'
 import { registerLeadTools, type LeadToolResult } from './tools.js'
+import { checkRoleScopes } from './config-tool.js'
 
 const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))) })
@@ -137,16 +138,51 @@ describe('takt_config', () => {
     git('init', '-q', '-b', 'main'); git('config', 'user.email', 't@example.com'); git('config', 'user.name', 't')
     await writeFile(path.join(repo, 'README.md'), 'portal\n'); git('add', '.'); git('commit', '-q', '-m', 'init')
     try {
+      await h.call({ action: 'upgrade', dryRun: false, confirmed: true, reason: '准备' })
       const both = await h.call({ action: 'repo_add', url: 'git@example.com:a/b.git', path: repo, reason: '用户：绑定仓库' })
       expect(both.ok).toBe(false)
       const added = await h.call({ action: 'repo_add', path: repo, reason: '用户：在这个仓库上开发' })
       expect(added.ok).toBe(true)
-      expect(added).toMatchObject({ id: 'app', synced: true })
+      expect(added).toMatchObject({ id: 'app', synced: true, topLevel: ['README.md'] })
+      // 模板 dev 写 src/** + package.json：这个仓库里一条都匹配不上，绑定时就告诉 Lead
+      expect(added.scopeWarnings).toContainEqual({ role: 'dev', patterns: ['src/**', 'package.json'] })
+      expect((added.next_actions as string[])[0]).toContain('先修写范围')
+      expect(isJsonValue(added)).toBe(true)
       const shown = await h.call({ action: 'show' })
       expect(isJsonValue(shown)).toBe(true)
       expect(shown.repos).toEqual([expect.objectContaining({ id: 'app', path: repo, defaultBranch: 'main', status: 'ready' })])
     } finally {
       await rm(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('checkRoleScopes', () => {
+  it('按默认分支顶层对照代码写范围：bare 副本也能读；有一条能匹配就不报；产物范围和只读角色不查', async () => {
+    const work = await realpath(await mkdtemp(path.join(tmpdir(), 'taktflow-scope-')))
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'ignore' })
+    try {
+      const src = path.join(work, 'src-repo')
+      execFileSync('mkdir', ['-p', path.join(src, 'case_portal')])
+      git(src, 'init', '-q', '-b', 'main'); git(src, 'config', 'user.email', 't@example.com'); git(src, 'config', 'user.name', 't')
+      await writeFile(path.join(src, 'case_portal', 'app.py'), 'x = 1\n'); await writeFile(path.join(src, 'pyproject.toml'), '[project]\n')
+      git(src, 'add', '.'); git(src, 'commit', '-q', '-m', 'init')
+      git(work, 'clone', '-q', '--bare', src, 'bare')
+      const roles = [
+        { role: 'dev', writeScope: ['src/**', 'package.json', 'requirements/**/tasks/**'] },
+        { role: 'dev2', writeScope: ['src/**', 'case_portal/**'] },
+        { role: 'pm', writeScope: ['.takt/workspaces/**', 'requirements/**'] },
+        { role: 'any', writeScope: ['**/*.py'] },
+        { role: 'ro', writeScope: ['src/**'], readOnly: true },
+      ]
+      const result = await checkRoleScopes(path.join(work, 'bare'), 'main', roles)
+      expect(result.warnings).toEqual([{ role: 'dev', patterns: ['src/**', 'package.json'] }])
+      expect(result.topLevel).toEqual(['case_portal/', 'pyproject.toml'])
+      // 分支名不对时退到 HEAD；目录不是仓库时不报
+      expect((await checkRoleScopes(path.join(work, 'bare'), 'nope', roles)).warnings).toHaveLength(1)
+      expect(await checkRoleScopes(work, 'main', roles)).toEqual({ warnings: [], topLevel: [] })
+    } finally {
+      await rm(work, { recursive: true, force: true })
     }
   })
 })
