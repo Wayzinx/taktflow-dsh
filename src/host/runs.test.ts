@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative as relativePath } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { agent, human, initProject, readLease, script, type AgentProfile, type AttentionItem, type HarnessRequest, type HarnessResult, type NodeDef, type WorkflowDefinition } from '@taktflow/core'
 import { AgentTraceHub, agentTraceHubFor } from './agent-trace.js'
@@ -410,6 +410,35 @@ describe('RunManager 真实 core 生命周期', () => {
     expect(executed).toEqual([])
     expect(f.ctx.activations).toHaveLength(0)
     expect((await f.manager.get(f.space, runId))?.status).toBe('waiting_human')
+  })
+
+  it.each([
+    ['经 withHostWrites 的 Lead 写入不算节点越界，运行成功', true, 'succeeded'],
+    ['不经窗口的同一写入仍被算成节点越界（守卫没有被放宽）', false, 'failed'],
+  ] as const)('节点执行期间 Lead 写决策记录：%s', async (_name, viaHost, expected) => {
+    const f = await fixture()
+    const result = deferred<SubagentResult>()
+    f.ctx.subagents.startActivation = async (spec) => {
+      f.ctx.activations.push(spec)
+      return { childId: spec.childId!, result: result.promise, dispose: async () => {} }
+    }
+    const { runId } = await f.manager.start(f.input)
+    await vi.waitFor(() => expect(f.ctx.activations).toHaveLength(1))
+    // 和真实事故相同：节点（评审）还在执行，Lead 用已审计的产物写入记录决策
+    const target = 'decisions/lead-notes.md'
+    const relative = relativePath(f.space.stores.projectDir, join(f.space.stores.workspaces.dir(f.input.requirementId), target))
+    const write = () => f.space.stores.workspaces.writeArtifact({
+      ref: { workspace: f.input.requirementId, path: target }, content: '# Lead 决策\n', kind: 'decision',
+      author: { type: 'agent', role: 'lead', harness: 'dsh', onBehalfOf: 'tester' }, reason: '记录人的授权',
+    })
+    if (viaHost) await f.manager.withHostWrites(f.space, [relative], write)
+    else await write()
+    result.resolve({ stopReason: 'completed', output: [] })
+    await status(f.space, runId, expected)
+    const events = await f.space.stores.events.read(runId)
+    const violation = events.find((event) => event.type === 'guard.violation')
+    if (viaHost) expect(violation).toBeUndefined()
+    else expect(violation?.data).toMatchObject({ paths: [relative] })
   })
 
   it('提供追溯中心时，真实节点运行落盘 starting→completed，并冻结角色来源', async () => {

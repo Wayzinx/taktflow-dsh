@@ -172,6 +172,11 @@ export interface RunManager {
   get(space: SpaceHandle, runId: RunId): Promise<RunState | undefined>
   onAnswered(space: SpaceHandle, item: AttentionItem): Promise<void>
   disposeAll(): Promise<void>
+  /**
+   * 增量（可选）：宿主通道在运行期间写当前需求公共产物时，在本空间在册运行的写入守卫上开系统窗口，
+   * 避免把这些已审计的写入算成正在执行节点的越界。paths 相对空间根。
+   */
+  withHostWrites?<T>(space: SpaceHandle, paths: string[], fn: () => Promise<T>): Promise<T>
 }
 
 /** 一个子 Agent 的权限范围；执行器在启动子 Agent 前登记。 */

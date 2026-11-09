@@ -50,6 +50,8 @@ interface ManagedRun extends RunRuntime {
   autonomyDriving: boolean
   /** 已登记的通知抑制；stop/fail/dispose 统一释放。 */
   autonomyReleases: Map<string, () => void>
+  /** 本运行引擎的写入守卫；宿主通道（Lead 写产物等）在它上面开系统窗口。 */
+  guard?: WriteGuard
 }
 
 const system: Actor = { type: 'system', id: 'dsh-host' }
@@ -301,6 +303,18 @@ export class DshRunManager implements RunManager {
   /** 宿主诊断：进入卸载后禁止接收新运行。 */
   isDisposed(): boolean { return this.disposed }
 
+  /**
+   * 宿主通道（Lead 的 takt_artifact 写入等）在运行期间改当前需求的公共产物：在本空间每个在册运行的
+   * WriteGuard 上开只含这些路径的系统窗口，再执行写入。否则节点执行期间的工作区快照差异会把 Lead
+   * 已审计的写入算成正在执行节点的越界，节点失败、整个运行失败。
+   * paths 相对空间根；窗口只放行这些精确路径，其它越界照样拦。
+   */
+  async withHostWrites<T>(space: SpaceHandle, paths: string[], fn: () => Promise<T>): Promise<T> {
+    const prefix = `${space.root}\0`
+    const guards = [...this.records.entries()].filter(([key, run]) => key.startsWith(prefix) && run.guard !== undefined).map(([, run]) => run.guard!)
+    return guards.reduceRight<() => Promise<T>>((next, guard) => () => guard.system(paths, next), fn)()
+  }
+
   private async build(runtime: RunRuntime, meta: RunOwnerMeta, created?: (state: RunState) => Promise<void>): Promise<ManagedRun> {
     const ctx = this.deps.ctx
     if (!ctx) throw new TaktToolError('TAKT_UNSUPPORTED_NODE', 'dsh 宿主上下文不可用，无法启动子 Agent', '通过已加载的 taktflow 宿主服务启动。')
@@ -324,6 +338,7 @@ export class DshRunManager implements RunManager {
       relative(projectDir, runtime.space.stores.paths.requirements),
       relative(projectDir, runtime.space.stores.paths.evals ?? `${runtime.space.stores.taktDir}/evals`),
     )
+    managed.guard = guard
     const withSystemWrites = <T>(paths: string[], fn: () => Promise<T>): Promise<T> => guard.system(paths, fn)
     const harness = (this.deps.harnessFactory ?? createDshHarness)({
       ctx, space: runtime.space, presets, permissions: this.deps.permissions,

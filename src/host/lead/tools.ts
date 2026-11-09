@@ -1163,7 +1163,10 @@ async function writeArtifact(
     caller.requirementId,
     'manifest.json',
   )
-  const written = await withFileLock(manifestKey, async () => {
+  // 运行期间 Lead 写产物：在在跑运行的写入守卫上放行这一个文件，不被算成正在执行节点的越界。
+  const relativeTarget = path.relative(caller.space.stores.projectDir, path.join(caller.space.stores.workspaces.dir(caller.requirementId), target)).split(path.sep).join('/')
+  const hostWrite = <T>(fn: () => Promise<T>): Promise<T> => caller.service.runs?.withHostWrites?.(caller.space, [relativeTarget], fn) ?? fn()
+  const written = await hostWrite(() => withFileLock(manifestKey, async () => {
     const records = await caller.space.stores.workspaces.listArtifacts(caller.requirementId)
     const record = records.find((item) => item.path === target)
     const current = record?.versions.at(-1)?.version ?? 0
@@ -1181,7 +1184,7 @@ async function writeArtifact(
       author: leadActor(caller.agent, caller.human),
       reason,
     })
-  })
+  }))
 
   const unchanged = baseVersion > 0 && written.version === baseVersion
   return success(

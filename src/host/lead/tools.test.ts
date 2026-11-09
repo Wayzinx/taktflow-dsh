@@ -74,6 +74,12 @@ class FakeRuns implements RunManager {
   deduped = false
   runId = 'run-001'
 
+  readonly hostWrites: string[][] = []
+  async withHostWrites<T>(_space: SpaceHandle, paths: string[], fn: () => Promise<T>): Promise<T> {
+    this.hostWrites.push(paths)
+    return fn()
+  }
+
   async start(input: StartRunInput): Promise<{ runId: string; deduped: boolean }> {
     this.starts.push(input)
     return { runId: this.runId, deduped: this.deduped }
@@ -960,6 +966,14 @@ describe('takt_artifact', () => {
     const log = await h.call('takt_artifact', { action: 'log', path: 'decisions/lead-notes.md' })
     expect((log.versions as unknown[]).length).toBe(1)
     expect(log.truncated).toBe(false)
+  })
+
+  it('write 在运行写入守卫的宿主窗口里执行，只放行这一个文件（运行中写决策不算节点越界）', async () => {
+    const h = await boundHarness()
+    const written = await h.call('takt_artifact', { action: 'write', path: 'decisions/lead-notes.md', content: '# 决策', reason: '记录授权', baseVersion: 0 })
+    expect(written.ok).toBe(true)
+    const dir = h.space.stores.workspaces.dir('REQ-001')
+    expect(h.runs.hostWrites).toEqual([[path.relative(h.space.stores.projectDir, path.join(dir, 'decisions/lead-notes.md')).split(path.sep).join('/')]])
   })
 
   it('inputs/request.md 是唯一允许的 inputs 路径，按原始输入留档', async () => {
