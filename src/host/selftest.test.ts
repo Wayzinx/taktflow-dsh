@@ -17,7 +17,7 @@ import { apply, type RoleContext } from './role/index.js'
 import { createSelftestTool, SELFTEST_TOOL_NAME } from './role/selftest.js'
 import { InMemoryPermissionRegistry } from './permissions.js'
 import {
-  classifyRunner, InMemorySelftestService, readPackageSnapshot,
+  buildSelftestCommand, classifyRunner, InMemorySelftestService, readPackageSnapshot,
   type SelftestContextInput, type SelftestServiceOptions,
 } from './selftest.js'
 import { FsSpaceRegistry } from './space.js'
@@ -499,6 +499,49 @@ describe('命令冻结与可靠过滤', () => {
     ['node -e "console.log(\'jest\')"', undefined, 'unknown'],
   ] as const)('仅从实际测试主入口识别 runner：%s / %j', (command, scripts, expected) => {
     expect(classifyRunner(command, scripts)).toBe(expected)
+  })
+
+  // 真实空间的命令形状：环境变量前缀 + venv 解释器 + unittest discover
+  const UNITTEST = 'CASE_ROOT=/srv/case-source /srv/case-source/.venv/bin/python -m unittest discover -s case_portal/tests -t .'
+  it.each([
+    [UNITTEST, 'unittest'],
+    ['python3 -m unittest', 'unittest'],
+    ['python -m unittest discover -v', 'unittest'],
+    ['.venv/bin/python -m pytest -q case_portal/tests', 'pytest'],
+    ['pytest --maxfail=1 -x tests', 'pytest'],
+    ['pytest -k smoke tests', 'unknown'],
+    ['pytest --rootdir tests', 'unknown'],
+    ['python -m unittest discover -s tests && echo done', 'unknown'],
+    ["python -m unittest discover -s 'my tests'", 'unknown'],
+  ] as const)('识别 Python 测试入口：%s', (command, expected) => {
+    expect(classifyRunner(command, undefined)).toBe(expected)
+  })
+
+  it.each([
+    [UNITTEST, { mode: 'files', files: ['case_portal/tests/test_a.py', 'case_portal/tests/test_b.py'] },
+      "CASE_ROOT=/srv/case-source /srv/case-source/.venv/bin/python -m unittest 'case_portal/tests/test_a.py' 'case_portal/tests/test_b.py'"],
+    [UNITTEST, { mode: 'name', name: 'StudioTrial' }, `${UNITTEST} -k 'StudioTrial'`],
+    ['.venv/bin/python -m pytest -q case_portal/tests', { mode: 'files', files: ['case_portal/tests/test_a.py'] }, ".venv/bin/python -m pytest -q 'case_portal/tests/test_a.py'"],
+    ['pytest tests', { mode: 'name', name: 'trial' }, "pytest tests -k 'trial'"],
+  ] as const)('Python 入口的文件 / 名称过滤：%s %j', (base, filter, expected) => {
+    const runner = classifyRunner(base, undefined)
+    expect(buildSelftestCommand(base, filter as never, runner)).toBe(expected)
+  })
+
+  it('全量超时的结果提示改用文件过滤；按文件跑的超时不重复提示', () => {
+    const render = createSelftestTool(undefined).output!.render!
+    const text = (value: Record<string, unknown>) => (render({}, value as never) as Array<{ text: string }>)[0]!.text
+    const base = { exitCode: -1, succeeded: false, outputTail: '受控自测超过 600000ms', evidence: null, timedOut: true }
+    expect(text({ ...base, filter: { mode: 'all' } })).toContain('改用 mode=files')
+    expect(text({ ...base, filter: { mode: 'files', files: ['a.py'] } })).not.toContain('改用 mode=files')
+    expect(text({ ...base, timedOut: false, filter: { mode: 'all' } })).not.toContain('超时：')
+  })
+
+  it('配置的 unittest 命令按文件过滤实际传给执行器（全量超时时可以只跑相关测试）', async () => {
+    const runCommand = vi.fn<NonNullable<SelftestServiceOptions['runCommand']>>().mockResolvedValue({ code: 0, output: 'Ran 3 tests in 0.1s\n\nOK\n' })
+    const f = await fixture({ environment: envCommand('python3 -m unittest discover -s tests -t .'), serviceOptions: { runCommand } })
+    await f.service.run(childId, { mode: 'files', files: ['tests/test_trial.py'] }, f.exec)
+    expect(runCommand.mock.calls[0]![0]).toBe("python3 -m unittest 'tests/test_trial.py'")
   })
 
   it('不能从 pretest 或命令字符串猜测 runner 后附加过滤参数', async () => {

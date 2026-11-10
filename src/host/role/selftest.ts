@@ -14,8 +14,14 @@ function renderSelftestResult(value: JsonValue): string {
     const evidenceText = evidence === null || evidence === undefined
       ? `证据：无${typeof record.evidenceReason === 'string' ? `（${record.evidenceReason}）` : ''}`
       : `证据：${JSON.stringify(evidence)}`
+    const filter = record.filter !== null && typeof record.filter === 'object' && !Array.isArray(record.filter) ? (record.filter as Record<string, JsonValue>).mode : undefined
+    // 全量套件超过时限不是用例失败；提示改成只跑相关测试，别反复重跑全量（真实事故：5 次全量都卡在 600s）
+    const timeoutHint = record.timedOut === true && filter !== 'files'
+      ? '超时：这次是全量没跑完，不是用例失败。不要再重跑全量；改用 mode=files 只跑与改动相关的测试文件（或 mode=name 按名称过滤），完成说明里写清跑了哪些、全量为什么没跑完。'
+      : ''
     return [
       `受控自测${passed ? '通过' : '未通过'}（exitCode=${exitCode}）`,
+      timeoutHint,
       evidenceText,
       tail === '' ? '' : `输出尾部：\n${tail}`,
     ].filter(Boolean).join('\n')
@@ -37,6 +43,7 @@ export function createSelftestTool(service: SelftestService | undefined): ToolDe
       '仓库/worktree 节点执行仓库自身的显式 testCommand 或 environment/package 回退；只有空间根才使用流程 QA caseCommand。',
       '命令来自可信配置，调用方不能提供 command/cwd/env/timeout；只能选择全量、测试文件或测试名称过滤。',
       '完成前必须调用；根据真实 exitCode 和输出写完成说明，非 0 或超时/取消不能称为通过。',
+      '仓库测试很多时，先用 mode=files 跑与改动相关的测试文件；全量超时不要反复重跑。',
     ].join(''),
     parameters: {
       type: 'object',

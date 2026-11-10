@@ -510,7 +510,35 @@ function assertSafeFilter(value: string, label: string): void {
   if (!SAFE_FILTER.test(value)) throw new Error(`${label} 包含不允许的 shell 字符：${value}`)
 }
 
-type RunnerKind = 'vitest' | 'jest' | 'node-test' | 'unknown'
+type RunnerKind = 'vitest' | 'jest' | 'node-test' | 'unittest' | 'pytest' | 'unknown'
+
+// Python 入口：可选的环境变量前缀 + 解释器 -m unittest / pytest（或 pytest 可执行文件）。
+// 只认能确定参数位置的写法；带引号、管道、分号等复合 shell 一律算 unknown。
+const PLAIN = String.raw`[^\s'"\`$;|&<>()\\]`
+const ENV_PREFIX = String.raw`(?:[A-Za-z_][A-Za-z0-9_]*=${PLAIN}+ )*`
+const PYTHON = String.raw`${PLAIN}*python[0-9.]*`
+const UNITTEST_RE = new RegExp(
+  String.raw`^(${ENV_PREFIX})(${PYTHON}) -m unittest(?: discover(?: (?:-s|-t|-p|--start-directory|--top-level-directory|--pattern) ${PLAIN}+| -v| --verbose| -q| --quiet| -f| --failfast| -b| --buffer| -c| --catch)*)?$`,
+)
+const PYTEST_RE = new RegExp(String.raw`^(${ENV_PREFIX})((?:${PYTHON} -m pytest)|(?:${PLAIN}*pytest))((?: ${PLAIN}+)*)$`)
+/** pytest 里后面单独跟一个值的短选项：遇到它们无法区分值和测试路径。 */
+const PYTEST_VALUE_FLAGS = new Set(['-k', '-m', '-c', '-p', '-o', '-n', '-W', '-r'])
+
+/** 拆 pytest 命令尾部：选项原样保留，位置参数（测试路径）单独拿出；有歧义时返回 undefined。 */
+function pytestTail(tail: string): { options: string[]; positional: string[] } | undefined {
+  const tokens = tail.trim() === '' ? [] : tail.trim().split(' ')
+  const options: string[] = []
+  const positional: string[] = []
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]!
+    if (!token.startsWith('-')) { positional.push(token); continue }
+    if (PYTEST_VALUE_FLAGS.has(token)) return undefined
+    // --name value 与 --flag 后跟测试路径无法区分
+    if (token.startsWith('--') && !token.includes('=') && tokens[index + 1] !== undefined && !tokens[index + 1]!.startsWith('-')) return undefined
+    options.push(token)
+  }
+  return { options, positional }
+}
 
 /** 从实际命令和冻结的 package scripts 判断 runner；未知 runner 明确拒绝过滤。 */
 export function classifyRunner(command: string, scripts: Record<string, string> | undefined): RunnerKind {
@@ -519,6 +547,9 @@ export function classifyRunner(command: string, scripts: Record<string, string> 
   if (/^(?:npx (?:--no-install )?)?vitest(?: run)?(?: --[A-Za-z-]+(?:=[A-Za-z0-9_-]+)?)*$/.test(text)) return 'vitest'
   if (/^(?:npx (?:--no-install )?)?jest(?: --[A-Za-z-]+(?:=[A-Za-z0-9_-]+)?)*$/.test(text)) return 'jest'
   if (/^node --test$/.test(text)) return 'node-test'
+  if (UNITTEST_RE.test(text)) return 'unittest'
+  const pytest = PYTEST_RE.exec(text)
+  if (pytest !== null && pytestTail(pytest[3] ?? '') !== undefined) return 'pytest'
 
   return 'unknown'
 }
@@ -541,12 +572,21 @@ export function buildSelftestCommand(
     const files = (filter.files ?? []).map(shellQuote).join(' ')
     if (runner === 'vitest' || runner === 'node-test') return join(files)
     if (runner === 'jest') return join(`--runTestsByPath ${files}`)
-    throw new Error('当前测试入口无法可靠映射文件过滤；请使用 mode=all，或把测试入口换成 vitest/jest/node --test')
+    // unittest discover 不能再加文件；改成同一解释器、同一环境直接跑这些测试文件（Python 3.5+ 接受文件路径）
+    const unittest = runner === 'unittest' ? UNITTEST_RE.exec(base.trim()) : null
+    if (unittest !== null) return `${unittest[1]}${unittest[2]} -m unittest ${files}`
+    // pytest 去掉原来的测试路径，保留选项，只跑这些文件
+    const pytest = runner === 'pytest' ? PYTEST_RE.exec(base.trim()) : null
+    const parts = pytest === null ? undefined : pytestTail(pytest[3] ?? '')
+    if (pytest !== null && parts !== undefined) return [`${pytest[1]}${pytest[2]}`, ...parts.options, files].join(' ')
+    throw new Error('当前测试入口无法可靠映射文件过滤；请使用 mode=all，或把测试入口换成 vitest/jest/node --test/python -m unittest/pytest')
   }
   if (runner === 'vitest' || runner === 'jest') return join(`-t ${shellQuote(filter.name ?? '')}`)
   if (runner === 'node-test') {
     return join(`--test-name-pattern=${shellQuote(filter.name ?? '')}`)
   }
+  // unittest（3.7+）与 pytest 都用 -k 按名称子串过滤
+  if (runner === 'unittest' || runner === 'pytest') return `${base.trim()} -k ${shellQuote(filter.name ?? '')}`
   throw new Error('当前测试入口无法可靠映射名称过滤；请使用 mode=all')
 }
 
