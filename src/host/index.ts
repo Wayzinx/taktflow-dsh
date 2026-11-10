@@ -1,7 +1,7 @@
 import { createHarnesses } from '@taktflow/harness'
 import type { HarnessInfo, ModelInfo, TaktConfig } from '@taktflow/core'
 import { BUNDLED_ROLE_NAMES } from '../roles/defaults.js'
-import type { HostContext } from './dsh-types.js'
+import type { Agent, HostContext } from './dsh-types.js'
 import { PlaceholderApprovals } from './approvals.js'
 import { createLeadServices, type LeadServices } from './lead/services.js'
 import { createM3Service } from './m3.js'
@@ -236,7 +236,20 @@ export function apply(ctx: HostContext, config: Config = {}): void {
     registerRoutes(ctx, service, config)
     ctx.tools.guard(createWriteGuard(service.permissions))
     registerHandoff(ctx, config)
+    // Lead 会话上线（App 重启后打开会话、会话重新加载）时，继续它名下被打断的运行。
+    // agent/created 串行派发且监听器抛错会让会话创建失败：这里只排队、不等待、不抛错。
+    const offCreated = ctx.on('agent/created', ((event: { agent?: Agent } | undefined) => {
+      const agent = event?.agent
+      const header = agent?.session.header as { cwd?: string; parentSession?: string } | undefined
+      if (agent === undefined || header?.parentSession !== undefined || service.runs.resumeForSession === undefined) return
+      setTimeout(() => {
+        service.runs.resumeForSession!(agent.id, header?.cwd).catch((error: unknown) => {
+          ctx.logger?.warn(`继续被打断的运行失败：${error instanceof Error ? error.message : String(error)}`)
+        })
+      }, 0)
+    }) as (...args: never[]) => void)
     return async () => {
+      offCreated()
       // 同时停止入场和进程，再等待引擎收尾；不能先等可能正等待工具的 Agent。
       const stopped = await Promise.allSettled([service.selftests?.dispose(), service.runs.disposeAll(), service.m3?.dispose()])
       const failures = stopped.filter((result): result is PromiseRejectedResult => result.status === 'rejected')

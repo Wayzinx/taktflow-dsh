@@ -11,6 +11,7 @@ import { DshRolePresets } from './presets.js'
 import type { RoleSkillSnapshots } from './role-skills.js'
 import { DshRunManager } from './runs.js'
 import { spaceConfigPatterns } from './config-paths.js'
+import { recordWorkflowSourceHash } from '../workflows/source-hash.js'
 import { FsOwnership } from './ownership.js'
 import { InMemoryPermissionRegistry } from './permissions.js'
 import { FsSpaceRegistry } from './space.js'
@@ -134,19 +135,32 @@ describe('RunManager 真实 core 生命周期', () => {
     expect(f.ctx.activations).toHaveLength(0)
   })
 
-  it('Lead离线取消整条运行并保留恢复提示，不会死锁或派发子Agent', async () => {
+  it('Lead 离线时暂停而不是取消：不派发子 Agent；Lead 会话上线后自动从断点继续并跑完', async () => {
     const f = await fixture()
+    const online = f.ctx.agents.get
     f.ctx.agents.get = () => undefined
     const { runId } = await f.manager.start(f.input)
-    await status(f.space, runId, 'cancelled')
-    await vi.waitFor(async () => expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ endReason: { reason: 'lead_offline' } }))
-    await vi.waitFor(async () => expect(await f.space.stores.attention.list({ pending: true })).toHaveLength(1))
+    await vi.waitFor(async () => expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ interrupted: { reason: 'lead_offline' } }))
+    await vi.waitFor(async () => expect(Object.values((await f.space.stores.runs.get(runId))!.nodes).every((node) => node.status === 'pending')).toBe(true))
+    expect((await f.space.stores.runs.get(runId))?.status).toBe('running')
+    expect((await f.ownership.readRun(f.space, runId))?.endReason).toBeUndefined()
     expect(f.ctx.activations).toHaveLength(0)
-    await f.manager.disposeAll()
-    expect((await f.space.stores.attention.list({ pending: true }))[0]?.ask).toContain('重新启动')
+    expect(await f.space.stores.attention.list({ pending: true })).toHaveLength(0)
+    // 被打断的运行挡住同一需求的新运行，并提示从断点继续
+    await expect(f.manager.start({ ...f.input, requestKey: 'again' })).rejects.toMatchObject({ code: 'TAKT_RUN_BUSY', message: expect.stringContaining('被打断') })
+    // Lead 没上线时手动继续也不行
+    await expect(f.manager.resumeInterrupted!(f.space, runId, by)).rejects.toMatchObject({ message: expect.stringContaining('Lead 会话没有打开') })
+    f.ctx.agents.get = online
+    // 别的会话上线不影响；所属 Lead 会话上线后自动继续
+    expect(await f.manager.resumeForSession!('someone-else', f.space.root)).toEqual([])
+    expect(await f.manager.resumeForSession!('lead', f.space.root)).toEqual([runId])
+    await status(f.space, runId, 'succeeded')
+    expect((await f.ownership.readRun(f.space, runId))?.interrupted).toBeUndefined()
+    const log = (await f.space.stores.events.read(runId)).filter((event) => event.type === 'log').map((event) => (event.data as { message: string }).message)
+    expect(log.some((message) => message.includes('从断点继续运行'))).toBe(true)
   })
 
-  it('disposeAll幂等，host_lost落账，子Agent清理完成后才释放lease', async () => {
+  it('disposeAll 幂等：宿主退出只暂停运行（不写 host_lost），子 Agent 清理完成后才释放 lease；新宿主打开 Lead 会话后从断点跑完', async () => {
     const f = await fixture()
     const result = deferred<SubagentResult>()
     const cleanup = deferred<void>()
@@ -158,12 +172,29 @@ describe('RunManager 真实 core 生命周期', () => {
     await vi.waitFor(() => expect(f.ctx.activations).toHaveLength(1))
     const stopping = f.manager.disposeAll()
     expect(f.manager.disposeAll()).toBe(stopping)
-    await vi.waitFor(async () => expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ endReason: { reason: 'host_lost' } }))
+    await vi.waitFor(async () => expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ interrupted: { reason: 'host_exit' } }))
     expect(await readLease(f.space.stores.taktDir)).toBeDefined()
     cleanup.resolve()
     await stopping
     expect(await readLease(f.space.stores.taktDir)).toBeUndefined()
-    await expect(f.manager.start({ ...f.input, requestKey: 'again' })).rejects.toMatchObject({ code: 'TAKT_RUN_BUSY' })
+    const paused = (await f.space.stores.runs.get(runId))!
+    expect(paused.status).toBe('running')
+    expect(Object.values(paused.nodes).map((node) => node.status)).not.toContain('cancelled')
+    expect((await f.ownership.readRun(f.space, runId))?.endReason).toBeUndefined()
+
+    // 新宿主（新进程）：Lead 会话打开 → 从断点继续
+    const next = new DshRunManager({
+      ctx: f.ctx, spaces: f.spaces, ownership: new FsOwnership({ hostId: 'runs-test-2' }), presets: f.presets,
+      permissions: f.permissions, workflows: f.workflows, log() {},
+    })
+    cleanups.push(() => next.disposeAll())
+    f.ctx.subagents.startActivation = async (spec) => {
+      f.ctx.activations.push(spec)
+      return { childId: spec.childId!, result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} }
+    }
+    expect(await next.resumeForSession('lead', f.space.root)).toEqual([runId])
+    await status(f.space, runId, 'succeeded')
+    expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ owner: 'dsh:runs-test-2' })
   })
 
   it('waiting_human期间修改档案和流程，resume仍使用开始时的runtime', async () => {
@@ -265,12 +296,18 @@ describe('RunManager 真实 core 生命周期', () => {
     const { runId } = await f.manager.start(f.input)
     await announced.promise
     const stopped = action === 'cancel' ? f.manager.cancel(f.space, runId, by) : f.manager.disposeAll()
-    await status(f.space, runId, 'cancelled')
+    if (action === 'cancel') await status(f.space, runId, 'cancelled')
     gate.resolve()
     await stopped
-    await status(f.space, runId, 'cancelled')
     expect(f.ctx.activations).toHaveLength(0)
-    expect((await f.space.stores.workspaces.getRequirement(f.input.requirementId))?.status).not.toBe('running')
+    if (action === 'cancel') {
+      await status(f.space, runId, 'cancelled')
+      expect((await f.space.stores.workspaces.getRequirement(f.input.requirementId))?.status).not.toBe('running')
+    } else {
+      // 宿主退出只暂停：运行保持 running、标记被打断，之后从断点继续
+      await status(f.space, runId, 'running')
+      expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ interrupted: { reason: 'host_exit' } })
+    }
   })
 
   it('冷恢复准备期间卸载会等待准备退出，不会卸载后派发或遗留lease', async () => {
@@ -337,7 +374,7 @@ describe('RunManager 真实 core 生命周期', () => {
     await status(f.space, runId, 'cancelled')
   })
 
-  it('写host_lost原因被延迟时先取消执行，不能成功后才补异常原因', async () => {
+  it('写暂停标记被延迟时执行已先中止：子 Agent 晚到的完成不能把节点算成功', async () => {
     const f = await fixture()
     const result = deferred<SubagentResult>()
     f.ctx.subagents.startActivation = async (spec) => {
@@ -346,21 +383,23 @@ describe('RunManager 真实 core 生命周期', () => {
     }
     const { runId } = await f.manager.start(f.input)
     await vi.waitFor(() => expect(f.ctx.activations).toHaveLength(1))
-    const reasonStarted = deferred<void>()
-    const reasonGate = deferred<void>()
-    const setReason = f.ownership.setEndReason.bind(f.ownership)
-    vi.spyOn(f.ownership, 'setEndReason').mockImplementation(async (...args) => {
-      reasonStarted.resolve()
-      await reasonGate.promise
-      return setReason(...args)
+    const markStarted = deferred<void>()
+    const markGate = deferred<void>()
+    const mark = f.ownership.markInterrupted.bind(f.ownership)
+    vi.spyOn(f.ownership, 'markInterrupted').mockImplementation(async (...args) => {
+      markStarted.resolve()
+      await markGate.promise
+      return mark(...args)
     })
     const stopping = f.manager.disposeAll()
-    await reasonStarted.promise
+    await markStarted.promise
     result.resolve({ stopReason: 'completed', output: [] })
-    await status(f.space, runId, 'cancelled')
-    reasonGate.resolve()
+    markGate.resolve()
     await stopping
-    expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ endReason: { reason: 'host_lost' } })
+    const state = (await f.space.stores.runs.get(runId))!
+    expect(state.status).toBe('running')
+    expect(Object.values(state.nodes).some((node) => node.status === 'succeeded' && node.id === 'work')).toBe(false)
+    expect(await f.ownership.readRun(f.space, runId)).toMatchObject({ interrupted: { reason: 'host_exit' } })
   })
 
   it('自然完成先赢shutdown竞争时保留succeeded且不写host_lost', async () => {
@@ -411,6 +450,39 @@ describe('RunManager 真实 core 生命周期', () => {
     expect(executed).toEqual([])
     expect(f.ctx.activations).toHaveLength(0)
     expect((await f.manager.get(f.space, runId))?.status).toBe('waiting_human')
+  })
+
+  it.each([
+    ['流程源码闭包（含 hooks）没变：新宿主可以冷恢复含函数的流程', 'same', 'succeeded'],
+    ['流程源码闭包变了：拒绝冷恢复，不执行换过的函数', 'changed', 'waiting_human'],
+  ] as const)('%s', async (_name, change, expected) => {
+    const executed: string[] = []
+    const approval = human({ id: 'approval', title: '审批', ask: '批准？', form: 'approve' })
+    const nodes = (): NodeDef[] => [approval, { id: 'script', kind: 'script', title: '钩子', needs: ['approval'], run: async () => { executed.push('script') } }]
+    const f = await fixture(nodes())
+    const original = definition(nodes())
+    recordWorkflowSourceHash(original, 'closure-v1')
+    f.setWorkflow(original)
+    const { runId } = await f.manager.start(f.input)
+    await status(f.space, runId, 'waiting_human')
+    const item = (await f.space.stores.attention.list({ pending: true }))[0]!
+    await f.space.stores.attention.answer(item.requestId, { decision: 'approve', by })
+    await f.manager.disposeAll()
+    // 新宿主重新加载流程文件：得到新的函数对象，闭包哈希由 catalog 按文件内容算
+    const reloaded = definition(nodes())
+    recordWorkflowSourceHash(reloaded, change === 'same' ? 'closure-v1' : 'closure-v2')
+    f.setWorkflow(reloaded)
+    const manager = new DshRunManager({ ctx: f.ctx, spaces: f.spaces, ownership: f.ownership, presets: f.presets, permissions: f.permissions, workflows: f.workflows, log() {} })
+    cleanups.push(() => manager.disposeAll())
+    if (change === 'same') {
+      await manager.resume(f.space, runId, by)
+      await status(f.space, runId, expected)
+      expect(executed).toEqual(['script'])
+    } else {
+      await expect(manager.resume(f.space, runId, by)).rejects.toMatchObject({ code: 'TAKT_RUN_BUSY', message: expect.stringContaining('不一致') })
+      expect(executed).toEqual([])
+      expect((await f.manager.get(f.space, runId))?.status).toBe(expected)
+    }
   })
 
   it.each([

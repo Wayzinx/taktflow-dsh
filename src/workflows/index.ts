@@ -3,6 +3,8 @@ import { openProject } from '@taktflow/core'
 import { TaktToolError, type SpaceHandle, type SpaceRegistry, type WorkflowCatalog } from '../host/types.js'
 import { loadP0DeliveryWorkflow, P0_DELIVERY_ID, validateWorkflowForP0 } from './p0-delivery.js'
 import { WorkflowFileLoader, type LoadedWorkflowFile } from './loader.js'
+import { recordWorkflowSourceHash } from './source-hash.js'
+export { workflowSourceHash } from './source-hash.js'
 
 export { loadP0DeliveryWorkflow, P0_DELIVERY_ID, validateWorkflowForP0 } from './p0-delivery.js'
 export { WorkflowFileLoader } from './loader.js'
@@ -88,6 +90,7 @@ export function createWorkflowCatalog(
           `涉及的模板：${matches.map((item) => item.file).join('、')}；请只保留一份或改名。`,
         )
       }
+      recordWorkflowSourceHash(matches[0]!.workflow, matches[0]!.hash)
       return matches[0]!.workflow
     },
     async defaultId(space?: SpaceHandle) {

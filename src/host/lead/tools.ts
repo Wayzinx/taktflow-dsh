@@ -1257,18 +1257,20 @@ function taktRunTool(deps: ToolDeps): DefineToolOptions {
       '何时用：需求已绑定且需要推进流程时；用 get 查看节点状态和待办。',
       '何时不用：不要用未支持的 action 绕过审批；cancel 只用于确实要终止的运行。',
       '示例：{"action":"start","requestKey":"run-20261105-01"}',
+      '运行被打断（App 退出、重启或 Lead 会话离线）时不会作废：Lead 会话打开后自动从断点继续；没自动继续时用 resume，不要重新 start 从头跑。',
       '示例：{"action":"get","runId":"run-20261105-0001"}',
+      '示例：{"action":"resume","runId":"run-20261105-0001"}',
     ].join('\n'),
     parameters: {
       action: {
         type: 'string',
-        enum: ['start', 'cancel', 'get', 'rerun_from', 'dispatch', 'ask'],
+        enum: ['start', 'cancel', 'get', 'resume', 'rerun_from', 'dispatch', 'ask'],
         required: true,
-        description: 'P0 支持 start / cancel / get；rerun_from、dispatch、ask 是 P1。',
+        description: 'start / cancel / get / resume；resume 从断点继续被打断（App 退出 / 重启 / Lead 离线）的运行。rerun_from、dispatch、ask 是 P1。',
       },
       workflow: { type: 'string', description: 'start 可选：流程 ID，默认当前空间配置的第一个流程（无空间流程时 p0-delivery）。' },
       requestKey: { type: 'string', description: 'start 必填：稳定幂等键；重试必须相同。' },
-      runId: { type: 'string', description: 'cancel 必填；get 可选（不填取最近一次运行）。' },
+      runId: { type: 'string', description: 'cancel / resume 必填；get 可选（不填取最近一次运行）。' },
       args: { type: 'json', description: 'start 可选：传给流程的参数对象。' },
     },
     output: { schema: OUTPUT_SCHEMA, render: renderResult },
@@ -1283,7 +1285,8 @@ function taktRunTool(deps: ToolDeps): DefineToolOptions {
         if (action === 'start') return await startRun(deps, caller, args)
         if (action === 'cancel') return await cancelRun(deps, caller, args)
         if (action === 'get') return await getRun(caller, args)
-        throw invalidAction('takt_run', action, ['start', 'cancel', 'get'])
+        if (action === 'resume') return await resumeRun(deps, caller, args)
+        throw invalidAction('takt_run', action, ['start', 'cancel', 'get', 'resume'])
       } catch (error) {
         return toFailure(error)
       }
@@ -1333,6 +1336,24 @@ async function startRun(
     },
     [`takt_run get runId="${started.runId}"`, `takt_trace audit runId="${started.runId}"`],
   )
+}
+
+async function resumeRun(
+  deps: ToolDeps,
+  caller: BoundCaller,
+  args: Record<string, unknown>,
+): Promise<LeadToolResult> {
+  const runId = validateRunIdArg(requiredString(args, 'runId'))
+  await ownedRun(caller, runId)
+  const state = await caller.space.stores.runs.get(runId)
+  if (state?.status === 'waiting_human') {
+    throw new TaktToolError('TAKT_RUN_BUSY', `运行 ${runId} 在等人处理，不是被打断`, '用 takt_ask_human 呈现待办，回答后自动继续。')
+  }
+  if (deps.service.runs.resumeInterrupted === undefined) {
+    throw new TaktToolError('TAKT_UNSUPPORTED_NODE', '当前宿主不支持从断点继续', '取消后重新启动。')
+  }
+  await deps.service.runs.resumeInterrupted(caller.space, runId, leadActor(caller.agent, caller.human))
+  return success(`已从断点继续运行 ${runId}（已完成的节点保留）`, { runId }, [`takt_run get runId="${runId}"`])
 }
 
 async function cancelRun(

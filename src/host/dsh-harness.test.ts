@@ -274,7 +274,7 @@ describe('dsh-host 节点生命周期', () => {
   it('Lead 离线取消整条运行，不启动 child', async () => {
     const f = fixture()
     f.ctx.agents.get = () => undefined
-    await expect(f.run()).rejects.toThrow('Lead Agent 已离线')
+    await expect(f.run()).rejects.toThrow('Lead 会话不在线，运行已暂停')
     expect(f.deps.onLeadOffline).toHaveBeenCalledWith({ runId: 'run-1', nodeId: 'build', attempt: 2 })
     expect(f.acquire).not.toHaveBeenCalled()
   })
@@ -285,7 +285,7 @@ describe('dsh-host 节点生命周期', () => {
       f.ctx.agents.get = () => undefined
       throw Object.assign(new Error('满额'), { code: 'ACTIVATION_LIMIT_REACHED' })
     }
-    await expect(f.run()).rejects.toThrow('Lead Agent 已离线')
+    await expect(f.run()).rejects.toThrow('Lead 会话不在线，运行已暂停')
     expect(f.deps.onLeadOffline).toHaveBeenCalledOnce()
     expect(f.permissions.size).toBe(0)
     expect(f.releasePreset).toHaveBeenCalledOnce()

@@ -10,7 +10,7 @@ import type { HostContext } from './dsh-types.js'
 import { createDshHarness, type DshHarness } from './dsh-harness.js'
 import type { SelftestService } from './selftest.js'
 import { assertRuntimeIdentity, loadRunRuntime, prepareRunArgs, recordRuntimeIdentity, repoBindingsForRun, type RunRuntime } from './run-runtime.js'
-import { TaktToolError, type Approvals, type Autonomy, type EndReason, type Notifier, type Ownership, type PermissionRegistry, type RoleHarness, type RolePresets, type RunManager, type RunOwnerMeta, type SpaceHandle, type SpaceRegistry, type StartRunInput, type WorkflowCatalog } from './types.js'
+import { TaktToolError, type Approvals, type Autonomy, type EndReason, type Notifier, type Ownership, type PermissionRegistry, type RoleHarness, type RolePresets, type RunInterruption, type RunManager, type RunOwnerMeta, type SpaceHandle, type SpaceRegistry, type StartRunInput, type WorkflowCatalog } from './types.js'
 
 /** 宿主行创建管理器；catalog 可由隔离 e2e 注入，生产只用随包目录。 */
 export interface RunManagerDeps {
@@ -46,6 +46,8 @@ interface ManagedRun extends RunRuntime {
   autonomyAttempts: Set<string>
   /** 在途自主代答的取消信号；stop 先 abort 再等任务。 */
   autonomyAbort?: AbortController
+  /** 已要求暂停：core 的 Runtime 可能还没进入 active，调度边界补一次 suspend（同 cancelRequested）。 */
+  suspendRequested?: boolean
   /** 正在跑自主判定；stopActive 用它决定 waiting_human 是否也要取消。 */
   autonomyDriving: boolean
   /** 已登记的通知抑制；stop/fail/dispose 统一释放。 */
@@ -103,7 +105,14 @@ export class DshRunManager implements RunManager {
       }
       return this.exclusive(keyFor(input.space, `requirement:${input.requirementId}`), async () => {
         const active = await input.space.stores.runs.list({ requirementId: input.requirementId })
-        if (active.some((run) => run.status === 'running' || run.status === 'waiting_human')) throw busy('该需求已有执行中或等待审批的运行')
+        const blocking = active.find((run) => run.status === 'running' || run.status === 'waiting_human')
+        if (blocking !== undefined) {
+          // 磁盘上 running、本进程没在跑：是被打断（宿主退出 / 崩溃 / Lead 离线）等着继续的运行
+          const interrupted = blocking.status === 'running' && !this.records.get(keyFor(input.space, blocking.runId))?.task
+          throw interrupted
+            ? new TaktToolError('TAKT_RUN_BUSY', `该需求的运行 ${blocking.runId} 被打断，正等待从断点继续`, `takt_run action="resume" runId="${blocking.runId}" 从断点继续（已完成的节点保留）；确实不要了再 takt_run cancel 后重新启动。`)
+            : busy('该需求已有执行中或等待审批的运行')
+        }
         const workflow = await this.deps.workflows.load(input.workflowId, input.space)
         const runtime = await loadRunRuntime(input.space, workflow, {
           autonomy: this.deps.config?.autonomy,
@@ -388,10 +397,12 @@ export class DshRunManager implements RunManager {
           }
           const result = await original.events.append(runId, safe)
           // create 的 requirement 锁已释放；卸载早于调度时在这里补取消。
-          if (safe.type === 'run.started' && this.disposed) await this.stop(managed, 'host_lost')
+          // 宿主正在退出时刚起步的运行同样只暂停，之后从断点继续
+          if (safe.type === 'run.started' && this.disposed) await this.suspend(managed, 'host_exit')
           // core.cancel 可能在 Runtime 放入 active 之前读到旧状态；调度边界补取消，
           // 不能只复用 stopping，否则旧 Runtime 仍会继续启动节点。
           if (managed.cancelRequested && ['run.started', 'node.ready', 'node.started'].includes(safe.type)) await managed.engine.cancel(runId)
+          if (managed.suspendRequested && !managed.cancelRequested && ['run.started', 'node.ready', 'node.started'].includes(safe.type)) await managed.engine.suspend?.(runId)
           return result
         }) as ProjectStores['events']['append'],
         read: original.events.read.bind(original.events), subscribe: original.events.subscribe.bind(original.events), verify: original.events.verify.bind(original.events),
@@ -562,11 +573,94 @@ export class DshRunManager implements RunManager {
     return record.stopping
   }
 
+  /**
+   * 暂停在途运行（宿主退出 / Lead 离线）：core 中止执行但不取消，被打断的节点回到 pending；
+   * 归属记录标上 interrupted，之后从断点继续。旧 core / 替身不支持暂停时按旧语义取消。
+   */
+  private async suspend(record: ManagedRun, reason: RunInterruption['reason']): Promise<void> {
+    if (!record.runId) return
+    const ownership = this.deps.ownership
+    if (record.engine.suspend === undefined || ownership.markInterrupted === undefined) {
+      return this.stop(record, reason === 'lead_offline' ? 'lead_offline' : 'host_lost')
+    }
+    record.suspendRequested = true
+    record.autonomyAbort?.abort(new Error('运行暂停'))
+    this.releaseAutonomy(record)
+    await record.engine.suspend(record.runId)
+    await ownership.markInterrupted(record.space, record.runId, reason)
+  }
+
+  resumeInterrupted(space: SpaceHandle, runId: RunId, by: Actor): Promise<void> {
+    return this.track(this.resumeInterruptedOnce(space, runId, by))
+  }
+
+  private async resumeInterruptedOnce(space: SpaceHandle, runId: RunId, by: Actor): Promise<void> {
+    this.assertOpen()
+    this.spaces.set(space.root, space)
+    // 持有租约才能接过别的宿主进程留下的运行（单写者）；本机旧宿主已退出时 ensureLease 会自动接管
+    await this.deps.ownership.ensureLease(space)
+    const existing = this.records.get(keyFor(space, runId))
+    if (existing?.task) await existing.task
+    await this.exclusive(keyFor(space, `operation:${runId}`), async () => {
+      this.assertOpen()
+      const state = await space.stores.runs.get(runId)
+      const meta = await this.deps.ownership.readRun(space, runId)
+      if (!state || state.status !== 'running' || !meta || meta.endReason) throw busy('只有被打断、尚未终止的运行可以从断点继续')
+      if (this.records.get(keyFor(space, runId))?.task) throw busy('运行正在本宿主推进，不需要继续')
+      if (this.deps.ctx?.agents.get(meta.ownerSessionId) === undefined) {
+        throw new TaktToolError('TAKT_RUN_BUSY', '运行所属的 Lead 会话没有打开', '打开发起这个运行的 Lead 会话，打开后会自动从断点继续。')
+      }
+      const definition = await this.deps.workflows.load(state.workflowId, space)
+      const runtime = await loadRunRuntime(space, definition, {
+        // 与 waiting_human 冷恢复相同：历史运行缺 autonomy 时按 manual 保守恢复
+        autonomy: meta.autonomy ?? 'manual',
+        roleHarness: meta.roleHarness ?? this.deps.config?.roleHarness,
+      })
+      await assertRuntimeIdentity(runtime, runId)
+      this.assertOpen()
+      const next: RunOwnerMeta = { ...meta, owner: this.deps.ownership.hostOwner, interrupted: undefined }
+      const record = await this.build(runtime, next)
+      record.runId = runId
+      this.records.set(keyFor(space, runId), record)
+      await this.deps.ownership.recordRun(space, runId, next)
+      const why = meta.interrupted?.reason === 'lead_offline' ? 'Lead 会话离线' : meta.interrupted?.reason === 'host_crash' ? '宿主异常退出' : '宿主退出'
+      await space.stores.events.append(runId, { type: 'log', actor: by, data: { level: 'info', message: `从断点继续运行（之前因${why}暂停）：已完成的节点保留，被打断的节点重跑` } })
+      this.assertOpen()
+      this.launch(record, () => record.engine.resume(runId, record.workflow))
+    })
+  }
+
+  /** Lead 会话上线（App 重启后打开会话等）时调用：继续它名下被打断的运行。失败只记日志，不影响会话。 */
+  async resumeForSession(sessionId: string, cwd: string | undefined): Promise<RunId[]> {
+    if (this.disposed || cwd === undefined) return []
+    let space: SpaceHandle
+    try { space = await this.deps.spaces.forSession(cwd) } catch { return [] }
+    const resumed: RunId[] = []
+    for (const run of await space.stores.runs.list()) {
+      if (run.status !== 'running' || this.records.get(keyFor(space, run.runId))?.task) continue
+      const meta = await this.deps.ownership.readRun(space, run.runId).catch(() => undefined)
+      if (meta === undefined || meta.endReason || meta.ownerSessionId !== sessionId) continue
+      try {
+        await this.resumeInterrupted(space, run.runId, system)
+        resumed.push(run.runId)
+      } catch (error) {
+        this.log(space, `继续被打断的运行 ${run.runId} 失败：${error instanceof Error ? error.message : String(error)}`)
+        await space.stores.events.append(run.runId, { type: 'log', actor: system, data: { level: 'warn', message: `没能从断点继续：${error instanceof Error ? error.message : String(error)}；可以 takt_run resume 重试，或 cancel 后重新启动` } }).catch(() => undefined)
+      }
+    }
+    return resumed
+  }
+
   private async stopActive(space: SpaceHandle): Promise<void> {
     const tasks = [...this.records.values()].filter((record) => record.space.root === space.root).map(async (record) => {
       const state = record.runId ? await space.stores.runs.get(record.runId) : undefined
-      // waiting_human 上仍有 AI 代答在途时也必须取消，不能留下孤儿子会话。
-      if (state?.status === 'running' || (state?.status === 'waiting_human' && record.autonomyDriving)) await this.stop(record, 'host_lost')
+      // 宿主退出（App 退出 / 重启 / 插件重载）只暂停：已完成的节点保留，Lead 会话重新打开后从断点继续。
+      if (state?.status === 'running') await this.suspend(record, 'host_exit')
+      // 等人的运行本来就能恢复；在途的 AI 代答停掉，不能留下孤儿子会话，但不取消运行。
+      else if (state?.status === 'waiting_human' && record.autonomyDriving) {
+        record.autonomyAbort?.abort(new Error('宿主退出'))
+        this.releaseAutonomy(record)
+      }
       await record.task
       await record.harness.drain()
     })
@@ -575,6 +669,12 @@ export class DshRunManager implements RunManager {
   }
 
   private async leadOffline(record: ManagedRun, nodeRef: { runId: string; nodeId: string; attempt: number }): Promise<void> {
+    if (record.engine.suspend !== undefined && this.deps.ownership.markInterrupted !== undefined) {
+      // Lead 会话不在线（会话被关掉或还没打开）：暂停而不是取消，Lead 会话重新打开后自动从断点继续
+      await this.suspend(record, 'lead_offline')
+      await record.space.stores.events.append(nodeRef.runId, { type: 'log', actor: system, nodeId: nodeRef.nodeId, data: { level: 'warn', message: 'Lead 会话不在线，运行已暂停；重新打开 Lead 会话后自动从断点继续' } })
+      return
+    }
     await this.stop(record, 'lead_offline')
     const state = await record.space.stores.runs.get(nodeRef.runId)
     if (!state) throw new Error('离线运行不存在')

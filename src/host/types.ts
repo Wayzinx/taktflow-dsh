@@ -103,6 +103,11 @@ export interface EndReason {
 }
 
 /** 运行所有权元数据，落在空间的租约/运行元数据里（执行层实现）。 */
+export interface RunInterruption {
+  at: string
+  reason: 'host_exit' | 'host_crash' | 'lead_offline'
+}
+
 export interface RunOwnerMeta {
   /** 宿主实例标识，格式 dsh:<hostId>；与审计用的人（Config.user）无关。 */
   owner: string
@@ -114,6 +119,11 @@ export interface RunOwnerMeta {
   presets?: Record<string, { id: string; cfgHash: string }>
   /** 有值表示该运行因离线/宿主丢失终止，不能再 resume。 */
   endReason?: EndReason
+  /**
+   * 运行被打断但没有终止（宿主退出 / 崩溃 / Lead 会话离线）：磁盘状态仍是 running，
+   * 已完成节点保留。Lead 会话重新打开时自动从断点继续，也可 takt_run resume / cancel。
+   */
+  interrupted?: RunInterruption
   /**
    * M-J 增量：运行时冻结的自主程度。
    *
@@ -147,6 +157,8 @@ export interface Ownership {
   readRun(space: SpaceHandle, runId: RunId): Promise<RunOwnerMeta | undefined>
   /** 重复写入同一原因幂等；不同原因抛 TAKT_RUN_BUSY。 */
   setEndReason(space: SpaceHandle, runId: RunId, endReason: EndReason): Promise<void>
+  /** 运行被打断但未终止；旧实现 / 测试替身可省略（省略时按旧语义取消）。 */
+  markInterrupted?(space: SpaceHandle, runId: RunId, reason: RunInterruption['reason']): Promise<void>
 }
 
 /** RunManager.start 的输入；requestKey 由 Lead 工具生成，用于同会话重复提交去重。 */
@@ -177,6 +189,13 @@ export interface RunManager {
    * 避免把这些已审计的写入算成正在执行节点的越界。paths 相对空间根。
    */
   withHostWrites?<T>(space: SpaceHandle, paths: string[], fn: () => Promise<T>): Promise<T>
+  /**
+   * 增量（可选）：从断点继续被打断的运行（宿主退出 / 崩溃 / Lead 会话离线；磁盘仍是 running、
+   * 本进程没在跑）。Lead 会话必须在线；已完成节点保留，被打断的那次尝试重跑。
+   */
+  resumeInterrupted?(space: SpaceHandle, runId: RunId, by: Actor): Promise<void>
+  /** 增量（可选）：Lead 会话上线时调用，继续它名下被打断的运行；返回已继续的 runId。 */
+  resumeForSession?(sessionId: string, cwd: string | undefined): Promise<RunId[]>
 }
 
 /** 一个子 Agent 的权限范围；执行器在启动子 Agent 前登记。 */

@@ -274,7 +274,7 @@ export function createDshHarness(deps?: DshHarnessDeps): DshHarness {
         const parent = ctx.agents.get(deps.ownerSessionId)
         if (parent !== undefined) return parent
         await deps.onLeadOffline(nodeRef)
-        throw new TaktToolError('TAKT_RUN_BUSY', 'Lead Agent 已离线，本次运行已取消', '重新打开 Lead 会话后发起新运行')
+        throw new TaktToolError('TAKT_RUN_BUSY', 'Lead 会话不在线，运行已暂停', '重新打开 Lead 会话后自动从断点继续')
       }
       await requireParent()
       const childId = randomUUID()

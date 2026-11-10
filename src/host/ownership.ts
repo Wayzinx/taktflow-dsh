@@ -7,7 +7,7 @@ import {
 } from '@taktflow/core'
 import type { HostContext, Disposer } from './dsh-types.js'
 import { TaktToolError } from './types.js'
-import type { EndReason, Ownership, RunOwnerMeta, SpaceHandle } from './types.js'
+import type { EndReason, Ownership, RunInterruption, RunOwnerMeta, SpaceHandle } from './types.js'
 
 interface LeaseHeartbeat {
   active: boolean
@@ -49,8 +49,10 @@ export class FsOwnership implements Ownership {
       } else {
         const acquired = await acquireLease(space.stores.taktDir, this.hostOwner)
         if (!acquired.ok) {
-          if (!acquired.stale || !deadLocalHost(acquired.held)) throw heldError(acquired.held, acquired.stale)
-          await this.takeoverLocked(space)
+          // 同机持有者进程已不存在就接管，不等心跳过期（崩溃后马上重开 App）；跨机器 / 进程还在仍然拒绝
+          if (!deadLocalHost(acquired.held)) throw heldError(acquired.held, acquired.stale)
+          // 本机旧宿主已确认退出（崩溃 / 强退）：它的在途运行只是被打断，留着从断点继续，不取消
+          await this.takeoverLocked(space, 'host_crash')
           return
         }
       }
@@ -100,7 +102,7 @@ export class FsOwnership implements Ownership {
   }
 
   /** 接管主体：调用方已在 serial 队列里。 */
-  private async takeoverLocked(space: SpaceHandle): Promise<void> {
+  private async takeoverLocked(space: SpaceHandle, keepRuns?: 'host_crash'): Promise<void> {
     {
       await this.checkLeasePath(space)
       const previous = await readLease(space.stores.taktDir)
@@ -114,8 +116,9 @@ export class FsOwnership implements Ownership {
       if (!previous) {
         throw new TaktToolError('TAKT_LEASE_HELD', '当前没有可接管的失效外部租约', '空闲空间请直接启动；已持有时无需接管。')
       }
-      if (!staleSnapshot(previous)) throw heldError(previous, false)
-      const result = await acquireLease(space.stores.taktDir, this.hostOwner, { takeover: true })
+      // 自动接管（同机旧进程已退出）不等心跳过期；人工接管仍要求租约失效
+      if (keepRuns !== undefined ? !deadLocalHost(previous) : !staleSnapshot(previous)) throw heldError(previous, false)
+      const result = await acquireLease(space.stores.taktDir, this.hostOwner, { takeover: true, ...(keepRuns === undefined ? {} : { allowDeadLocalHolder: true }) })
       if (!result.ok) throw heldError(result.held, result.stale)
       this.spaces.set(space.root, space)
       this.startHeartbeat(space)
@@ -124,7 +127,8 @@ export class FsOwnership implements Ownership {
         if (run.status !== 'running') continue
         const meta = await this.readRun(space, run.runId)
         if (!meta || meta.owner === this.hostOwner) continue
-        await this.setEndReason(space, run.runId, { reason: 'host_lost', at: new Date().toISOString() })
+        if (keepRuns !== undefined) await this.markInterrupted(space, run.runId, keepRuns)
+        else await this.setEndReason(space, run.runId, { reason: 'host_lost', at: new Date().toISOString() })
       }
       await this.repairAbandonedRuns(space)
     }
@@ -158,7 +162,8 @@ export class FsOwnership implements Ownership {
       if (previous && previous.owner !== meta.owner) {
         const lease = await readLease(space.stores.taktDir)
         const state = await space.stores.runs.get(runId)
-        if (meta.owner !== this.hostOwner || previous.endReason || meta.endReason || state?.status !== 'waiting_human' ||
+        // 持有租约时才能接过归属：等人的运行，或被打断（宿主退出 / 崩溃）后从断点继续的运行
+        if (meta.owner !== this.hostOwner || previous.endReason || meta.endReason || (state?.status !== 'waiting_human' && state?.status !== 'running') ||
           lease?.owner !== this.hostOwner || lease.host !== hostname()) {
           throw new TaktToolError('TAKT_RUN_BUSY', `运行 ${runId} 不允许转移归属`)
         }
@@ -197,6 +202,17 @@ export class FsOwnership implements Ownership {
       }
       await assertNoSymlinks(space.root, file)
       await writeFileAtomic(file, toJsonText({ ...meta, endReason }))
+    })
+  }
+
+  /** 运行被打断但未终止时调用；已有终止原因的不改，首次打断时间保留。 */
+  async markInterrupted(space: SpaceHandle, runId: RunId, reason: RunInterruption['reason']): Promise<void> {
+    const file = await this.ownerPath(space, runId)
+    await withFileLock(file, async () => {
+      const meta = await this.readRun(space, runId)
+      if (!meta || meta.endReason) return
+      await assertNoSymlinks(space.root, file)
+      await writeFileAtomic(file, toJsonText({ ...meta, interrupted: { at: meta.interrupted?.at ?? new Date().toISOString(), reason } }))
     })
   }
 
@@ -308,6 +324,10 @@ function assertOwner(value: unknown): asserts value is RunOwnerMeta {
       typeof meta.createdAt !== 'string' || !Number.isFinite(Date.parse(meta.createdAt)) ||
       (meta.requestKey !== undefined && typeof meta.requestKey !== 'string')) throw new Error('运行归属记录损坏')
   if (meta.endReason !== undefined) assertEndReason(meta.endReason)
+  const interrupted = meta.interrupted as unknown
+  if (interrupted !== undefined && (!interrupted || typeof interrupted !== 'object'
+    || !['host_exit', 'host_crash', 'lead_offline'].includes(String((interrupted as RunInterruption).reason))
+    || !Number.isFinite(Date.parse(String((interrupted as RunInterruption).at))))) throw new Error('运行归属记录损坏')
 }
 
 function logFailure(error: unknown): void {

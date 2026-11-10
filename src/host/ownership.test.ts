@@ -62,6 +62,31 @@ describe('FsOwnership 租约', () => {
     expect((await readLease(space.stores.taktDir))?.owner).toBe('dsh:second')
   })
 
+  it('App 崩溃后自动接管时不取消旧宿主的在途运行：标记被打断（host_crash），留着从断点继续；人工接管仍取消', async () => {
+    const requirement = await space.stores.workspaces.createRequirement({ title: '崩溃' })
+    const workflow = defineWorkflow({ id: 'approval', title: '审批', version: '1', stages: [], nodes: [human({ id: 'ask', title: '询问', ask: '确认', form: 'approve' })] })
+    const engine = createEngine({ stores: space.stores, profiles: {}, harnesses: {}, knowledge: [] })
+    const orphan = await engine.start({ requirementId: requirement.id, workflow })
+    orphan.status = 'running'
+    await space.stores.runs.save(orphan)
+    const ownership = own('second')
+    await ownership.recordRun(space, orphan.runId, meta('dsh:crashed'))
+    // 崩溃后马上重开：旧心跳仍在有效期内，但写它的进程已经没了
+    await writeFile(path.join(space.stores.taktDir, 'lease.json'), JSON.stringify({
+      owner: 'dsh:crashed', pid: 4_194_303, host: hostname(), acquiredAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), ttlMs: 60_000,
+    }))
+    await ownership.ensureLease(space)
+    expect((await readLease(space.stores.taktDir))?.owner).toBe('dsh:second')
+    expect((await space.stores.runs.get(orphan.runId))?.status).toBe('running')
+    const after = await ownership.readRun(space, orphan.runId)
+    expect(after?.endReason).toBeUndefined()
+    expect(after?.interrupted).toMatchObject({ reason: 'host_crash' })
+    // 已有终止原因的不再标记；重复标记保留首次时间
+    const first = after!.interrupted!.at
+    await ownership.markInterrupted(space, orphan.runId, 'host_exit')
+    expect((await ownership.readRun(space, orphan.runId))?.interrupted).toEqual({ at: first, reason: 'host_exit' })
+  })
+
   it('stale 不自动接管，人工 takeover 只允许失效的外部租约', async () => {
     const ownership = own()
     await expect(ownership.takeover(space, actor)).rejects.toMatchObject({ code: 'TAKT_LEASE_HELD' })

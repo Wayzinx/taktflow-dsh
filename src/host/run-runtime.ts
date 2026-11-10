@@ -12,6 +12,7 @@ import {
   createGitHistorySource, createGrepSource, createWikiSource, createWorkspaceSource,
 } from '@taktflow/knowledge'
 import { BUNDLED_ROLE_FILES } from '../roles/defaults.js'
+import { workflowSourceHash } from '../workflows/source-hash.js'
 import { loadRoleSkills, type RoleSkillSnapshots } from './role-skills.js'
 import { TaktToolError, type Autonomy, type RoleHarness, type SpaceHandle } from './types.js'
 
@@ -37,6 +38,8 @@ export interface RunRuntime {
   /** 自主程度与角色 harness 在执行期间冻结，重启恢复必须完全一致。 */
   autonomy: Autonomy
   roleHarness: RoleHarness
+  /** 空间流程的依赖闭包哈希（流程文件 + 本地引用）；随包流程没有。冷恢复含函数的流程靠它证明源码未变。 */
+  workflowSource?: string
 }
 
 /** loadRunRuntime 的调用方覆盖项；空间配置优先于这里，非法值不静默降级。 */
@@ -56,6 +59,8 @@ interface RuntimeIdentity {
   workflow: string
   autonomy: Autonomy
   roleHarness: RoleHarness
+  /** 流程源码闭包哈希；旧记录没有。 */
+  sources?: string
 }
 
 /**
@@ -172,6 +177,8 @@ export async function loadRunRuntime(
   const loaded = await loadRunProfilesDetailed(frozenSpace)
   const autonomy = resolveAutonomy(frozenSpace, options.autonomy)
   const roleHarness = resolveRoleHarness(options.roleHarness)
+  // 依赖闭包哈希挂在 catalog 返回的原对象上，克隆前取
+  const source = workflowSourceHash(workflow)
   const definition = cloneDefinition(workflow)
   // full 模式必须关闭评审人工签字，包括 loop body、subflow 和 planner 动态展开。
   if (autonomy === 'full') sanitizeReviewSignoff(definition)
@@ -193,6 +200,7 @@ export async function loadRunRuntime(
     knowledge: knowledgeForRun(frozenSpace),
     autonomy,
     roleHarness,
+    ...(source === undefined ? {} : { workflowSource: source }),
   }
 }
 
@@ -478,6 +486,7 @@ function identity(runtime: RunRuntime): RuntimeIdentity {
     workflow: sha256(canonicalJson(workflow)),
     autonomy: runtime.autonomy,
     roleHarness: runtime.roleHarness,
+    ...(runtime.workflowSource === undefined ? {} : { sources: runtime.workflowSource }),
   }
 }
 
@@ -502,11 +511,17 @@ export async function assertRuntimeIdentity(runtime: RunRuntime, runId: string):
   const file = runtimeFile(runtime.space, runId)
   await assertNoSymlinks(runtime.space.stores.taktDir, file)
   const saved = await readJsonFile<RuntimeIdentity>(file)
-  // 函数源码相同不能证明闭包或外部依赖相同；P0 不据此恢复新进程执行。
-  if (saved?.hasFunctions || containsFunction(runtime.workflow)) {
-    throw new TaktToolError('TAKT_RUN_BUSY', '当前版本不能在新宿主恢复包含函数的流程', '在原宿主继续等待中的运行；原宿主已退出时，请取消旧运行并重新启动。')
+  const current = identity(runtime)
+  // 只有函数文本相同不能证明闭包或外部依赖相同；空间流程有依赖闭包哈希（流程文件 + 本地引用），
+  // 开始时记过且现在一致，才允许在新宿主恢复含函数的流程。随包流程和旧记录没有哈希，仍拒绝。
+  if ((saved?.hasFunctions || current.hasFunctions) && (saved?.sources === undefined || saved.sources !== current.sources)) {
+    throw new TaktToolError('TAKT_RUN_BUSY', saved?.sources === undefined
+      ? '这个运行开始时没有记录流程源码指纹，不能在新宿主恢复包含函数的流程'
+      : '流程源码（含 hooks 等本地引用）和运行开始时不一致，不能恢复', '恢复原流程文件后重试；不要了就取消旧运行并重新启动。')
   }
-  if (!saved || canonicalJson(saved) !== canonicalJson(identity(runtime))) {
+  // 旧记录没有 sources 字段：不含函数的流程按原规则比较其余身份
+  if (saved !== undefined && saved.sources === undefined) delete current.sources
+  if (!saved || canonicalJson(saved) !== canonicalJson(current)) {
     throw new TaktToolError('TAKT_RUN_BUSY', '运行配置、角色或流程与开始时不一致，不能恢复', '恢复原配置及插件版本，或重新启动一个运行。')
   }
 }
