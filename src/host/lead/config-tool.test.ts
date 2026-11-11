@@ -184,6 +184,42 @@ describe('去掉质量关口要当场确认', () => {
   })
 })
 
+describe('自建流程和默认流程', () => {
+  it('自建流程从默认流程复制：从更轻的模板 / 流程起步要确认；从默认复制不拦，修订原因记下基于哪个流程', async () => {
+    const h = await harness()
+    await h.call({ action: 'upgrade', dryRun: false, confirmed: true, reason: '准备' })
+    const fromTemplate = await h.call({ action: 'workflow_create', id: 'my-lite', template: 'quick-fix', reason: '用户：小改动' })
+    expect(fromTemplate).toMatchObject({ ok: false, error: { code: 'TAKT_FORBIDDEN_FOR_LEAD', message: expect.stringContaining('默认流程 taktflow-standard') } })
+    expect(fromTemplate.error?.hint).toContain('from="taktflow-standard"')
+    const fromLite = await h.call({ action: 'workflow_create', id: 'my-lite', from: 'quick-fix', reason: '用户：小改动' })
+    expect(fromLite.error?.code).toBe('TAKT_FORBIDDEN_FOR_LEAD')
+    const copy = await h.call({ action: 'workflow_create', id: 'std-security', from: 'taktflow-standard', reason: '用户：支付需求加安全评审' })
+    expect(copy).toMatchObject({ ok: true })
+    const log = await readFile(path.join(h.root, '.takt', 'workflow-revisions', 'std-security', 'log.jsonl'), 'utf8')
+    expect(JSON.parse(log.split('\n')[0]!).reason).toBe('用户：支付需求加安全评审（Lead 新建，基于 taktflow-standard）')
+    const shown = (await h.call({ action: 'show' })).workflows as Array<Record<string, unknown>>
+    expect(shown.find((w) => w.id === 'std-security')).toMatchObject({ lighterThanDefault: [], createdByLead: { reason: expect.stringContaining('基于 taktflow-standard') } })
+  })
+
+  it('把默认流程换成更轻的要确认；带 confirmed、或换成更重的不拦；show 列出每个流程比默认少了什么', async () => {
+    const h = await harness()
+    await h.call({ action: 'upgrade', dryRun: false, confirmed: true, reason: '准备' })
+    const shown = (await h.call({ action: 'show' })).workflows as Array<Record<string, unknown>>
+    expect(shown.find((w) => w.id === 'taktflow-standard')).toMatchObject({ default: true, lighterThanDefault: [], useWhen: expect.any(String), createdByLead: null })
+    expect(shown.find((w) => w.id === 'quick-fix')).toMatchObject({ default: false, lighterThanDefault: expect.arrayContaining([expect.stringContaining('评审节点')]) })
+
+    const meta = await h.call({ action: 'workflow_meta', id: 'quick-fix', default: true, reason: '用户：默认用轻量' })
+    expect(meta).toMatchObject({ ok: false, error: { code: 'TAKT_FORBIDDEN_FOR_LEAD', message: expect.stringContaining('从 taktflow-standard 换成 quick-fix') } })
+    const patch = await h.call({ action: 'set_config', patch: { defaultWorkflow: 'quick-fix' }, reason: '用户：默认用轻量' })
+    expect(patch.error?.code).toBe('TAKT_FORBIDDEN_FOR_LEAD')
+    const confirmed = await h.call({ action: 'set_config', patch: { defaultWorkflow: 'quick-fix' }, confirmed: true, reason: '用户刚确认默认用轻量' })
+    expect(confirmed.ok).toBe(true)
+    // 默认已是 quick-fix：换回标准流程是往重了换，不用确认
+    const back = await h.call({ action: 'workflow_meta', id: 'taktflow-standard', default: true, reason: '用户：默认还是用标准流程' })
+    expect(back.ok).toBe(true)
+  })
+})
+
 describe('checkRoleScopes', () => {
   it('按默认分支顶层对照代码写范围：bare 副本也能读；有一条能匹配就不报；产物范围和只读角色不查', async () => {
     const work = await realpath(await mkdtemp(path.join(tmpdir(), 'taktflow-scope-')))

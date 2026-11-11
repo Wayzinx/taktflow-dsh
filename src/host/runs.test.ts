@@ -122,6 +122,20 @@ describe('RunManager 真实 core 生命周期', () => {
     await expect(f.manager.resume(f.space, first.runId, by)).rejects.toMatchObject({ code: 'TAKT_RUN_BUSY' })
   })
 
+  it('启动说明（例如为什么不用默认流程）写进运行日志', async () => {
+    const f = await fixture()
+    const result = deferred<SubagentResult>()
+    f.ctx.subagents.startActivation = vi.fn(async (spec) => {
+      f.ctx.activations.push(spec)
+      return { childId: spec.childId!, result: result.promise, dispose: async () => { result.resolve({ stopReason: 'cancelled', output: [] }) } }
+    })
+    const { runId } = await f.manager.start({ ...f.input, note: '选用流程 test（默认流程是 std）：涉及支付，需要安全评审' })
+    const events = await f.space.stores.events.read(runId)
+    expect(events.filter((event) => event.type === 'log').map((event) => (event.data as { message: string }).message)).toContain('选用流程 test（默认流程是 std）：涉及支付，需要安全评审')
+    await f.manager.cancel(f.space, runId, by)
+    await status(f.space, runId, 'cancelled')
+  })
+
   it('缺角色在发布前拒绝；owner写失败在发布后把已创建状态收敛failed', async () => {
     const f = await fixture()
     // 随包默认角色始终存在，只有既非随包也未落盘的角色才算缺失。

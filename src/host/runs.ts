@@ -146,7 +146,11 @@ export class DshRunManager implements RunManager {
           requirementId: input.requirementId,
           args: prepareRunArgs(structuredClone(input.args ?? {}), managed.autonomy),
         }), reject)
-        return { runId: await published, deduped: false }
+        const runId = await published
+        if (input.note !== undefined) {
+          await input.space.stores.events.append(runId, { type: 'log', actor: system, data: { level: 'info', message: input.note } }).catch(() => undefined)
+        }
+        return { runId, deduped: false }
       })
     })
   }

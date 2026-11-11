@@ -1290,6 +1290,7 @@ describe('takt_run', () => {
       action: 'start',
       requestKey: 'run-req-space',
       workflow: 'standard',
+      reason: '用户：用 standard 跑',
     })
     expect(result.ok).toBe(true)
     expect(h.runs.starts).toHaveLength(1)
@@ -1625,5 +1626,86 @@ describe('createLeadServices', () => {
     ) as LeadToolResult
     expect(written.ok).toBe(true)
     expect((written.audit as { actor: Actor }).actor).toMatchObject({ onBehalfOf: 'ConfigUser' })
+  })
+})
+
+describe('选流程：默认流程是用户的偏好，往重了换自己定，往轻了换要同意', () => {
+  const source = (id: string, nodes: string, useWhen?: string) => [
+    "import { defineWorkflow, review, gate } from '@taktflow/core'",
+    'export default defineWorkflow({',
+    `  id: '${id}', title: '${id} 流程', version: '1',${useWhen === undefined ? '' : ` useWhen: '${useWhen}',`}`,
+    '  stages: [],',
+    `  nodes: [${nodes}],`,
+    '})',
+    '',
+  ].join('\n')
+  const STD = "review({ id: 'r1' }), review({ id: 'r2' }), gate({ id: 'g', checks: [{ id: 'a', kind: 'acceptance' }] })"
+
+  async function choiceHarness(): Promise<Harness> {
+    const ids = ['std', 'lite', 'heavy']
+    const h = await makeHarness({ workflows: { ids: () => ids, list: async () => ids, defaultId: async () => 'std', load: async () => { throw new Error('测试不加载流程') } } })
+    const dir = h.space.stores.paths.workflows
+    await mkdir(dir, { recursive: true })
+    await writeFile(path.join(dir, 'std.workflow.ts'), source('std', STD, '多模块交付'))
+    await writeFile(path.join(dir, 'lite.workflow.ts'), source('lite', "review({ id: 'r1' })", '单文件小改动'))
+    await writeFile(path.join(dir, 'heavy.workflow.ts'), source('heavy', `${STD}, review({ id: 'security' })`))
+    // Lead 自建的流程：修订历史第一条是 Lead 的“新建流程”（和 workflow_create 落盘的格式一致）
+    const history = path.join(h.space.stores.taktDir, 'workflow-revisions', 'lite')
+    await mkdir(history, { recursive: true })
+    const lead: Actor = { type: 'agent', role: 'lead', harness: 'dsh', onBehalfOf: 'wayne' }
+    await writeFile(path.join(history, 'log.jsonl'), `${JSON.stringify({ rev: 'a'.repeat(64), author: lead, reason: '用户：小改动走短流程（Lead 为需求 REQ-001 新建，基于 std）', summary: '新建流程', at: '2026-11-10T00:00:00.000Z' })}\n`)
+    await seedRequirement(h, 'REQ-001')
+    await bindRequirement(h, 'REQ-001')
+    return h
+  }
+
+  it('takt_status 给出默认流程和每个流程的适用场景、检查数、比默认少了什么、是不是 Lead 建的', async () => {
+    const h = await choiceHarness()
+    const status = await h.call('takt_status', {})
+    expect(status.ok).toBe(true)
+    expect(status.defaultWorkflow).toBe('std')
+    expect(status.workflowChoices).toEqual([
+      { id: 'std', title: 'std 流程', default: true, useWhen: '多模块交付', checks: { reviews: 2, gates: 1, acceptance: 1 }, lighterThanDefault: [], createdByLead: null },
+      { id: 'lite', title: 'lite 流程', default: false, useWhen: '单文件小改动', checks: { reviews: 1, gates: 0, acceptance: 0 }, lighterThanDefault: ['1 个评审节点', '1 个门禁 / 交付校验节点', '1 个 acceptance 交付校验'], createdByLead: { at: '2026-11-10T00:00:00.000Z', reason: expect.stringContaining('REQ-001') } },
+      { id: 'heavy', title: 'heavy 流程', default: false, useWhen: null, checks: { reviews: 3, gates: 1, acceptance: 1 }, lighterThanDefault: [], createdByLead: null },
+    ])
+  })
+
+  it('默认流程直接启动；换流程要写 reason，往重了换不用问，原因写进运行日志说明', async () => {
+    const h = await choiceHarness()
+    expect((await h.call('takt_run', { action: 'start', requestKey: 'k-default' })).ok).toBe(true)
+    expect(h.runs.starts[0]).toMatchObject({ workflowId: 'std' })
+    expect(h.runs.starts[0]!.note).toBeUndefined()
+
+    const missing = await h.call('takt_run', { action: 'start', requestKey: 'k-heavy', workflow: 'heavy' })
+    expect(missing).toMatchObject({ ok: false, error: { code: 'TAKT_INVALID_INPUT', message: expect.stringContaining('reason') } })
+    expect(h.runs.starts).toHaveLength(1)
+
+    const heavy = await h.call('takt_run', { action: 'start', requestKey: 'k-heavy', workflow: 'heavy', reason: '涉及支付回调，需要安全评审' })
+    expect(heavy).toMatchObject({ ok: true, workflow: 'heavy', defaultWorkflow: 'std', choice: { reason: '涉及支付回调，需要安全评审', lighterThanDefault: [] } })
+    expect(h.runs.starts[1]!.note).toBe('选用流程 heavy（默认流程是 std）：涉及支付回调，需要安全评审')
+  })
+
+  it('比默认轻的流程：没同意就拒绝且不启动；同意后启动并记住，同一需求再启动不再问；少的关口变了要重新问', async () => {
+    const h = await choiceHarness()
+    const refused = await h.call('takt_run', { action: 'start', requestKey: 'k-lite', workflow: 'lite', reason: '只改一个文件' })
+    expect(refused).toMatchObject({ ok: false, error: { code: 'TAKT_FORBIDDEN_FOR_LEAD', message: expect.stringContaining('1 个 acceptance 交付校验') } })
+    expect(h.runs.starts).toHaveLength(0)
+
+    const confirmed = await h.call('takt_run', { action: 'start', requestKey: 'k-lite', workflow: 'lite', reason: '用户刚同意：只改一个文件', confirmed: true })
+    expect(confirmed.ok).toBe(true)
+    expect(h.runs.starts[0]!.note).toContain('用户已同意')
+    const consents = JSON.parse(await readFile(path.join(h.space.stores.taktDir, 'dsh', 'workflow-consents.json'), 'utf8')) as { consents: Array<Record<string, unknown>> }
+    expect(consents.consents).toEqual([expect.objectContaining({ requirementId: 'REQ-001', workflowId: 'lite', reason: '用户刚同意：只改一个文件' })])
+
+    // 同一需求同一流程：不用再问
+    expect((await h.call('takt_run', { action: 'start', requestKey: 'k-lite-2', workflow: 'lite', reason: '接着用短流程' })).ok).toBe(true)
+    expect(h.runs.starts).toHaveLength(2)
+
+    // 流程又被删掉评审：少的不一样了，要重新问
+    await writeFile(path.join(h.space.stores.paths.workflows, 'lite.workflow.ts'), source('lite', ''))
+    const again = await h.call('takt_run', { action: 'start', requestKey: 'k-lite-3', workflow: 'lite', reason: '接着用短流程' })
+    expect(again).toMatchObject({ ok: false, error: { code: 'TAKT_FORBIDDEN_FOR_LEAD', message: expect.stringContaining('2 个评审节点') } })
+    expect(h.runs.starts).toHaveLength(2)
   })
 })

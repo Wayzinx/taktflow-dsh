@@ -169,6 +169,8 @@ export interface StartRunInput {
   args?: Record<string, unknown>
   ownerSessionId: string
   requestKey: string
+  /** 写进运行日志的启动说明（例如为什么不用默认流程）。 */
+  note?: string
 }
 
 /**

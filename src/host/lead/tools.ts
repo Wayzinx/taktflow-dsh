@@ -54,6 +54,7 @@ import {
   type CreateRequestRecord,
 } from './ledger.js'
 import { taktConfigTool } from './config-tool.js'
+import { hasConsent, recordConsent, workflowChoices, type WorkflowChoice } from './workflow-choice.js'
 import { jsonSafeToolValue } from './json-safe.js'
 
 const QUICK_WORKFLOW_FILE = 'quick-fix.workflow.ts'
@@ -322,6 +323,7 @@ function taktStatusTool(deps: ToolDeps): DefineToolOptions {
           ? deps.service.workflows.ids()
           : await deps.service.workflows.list(space)
         const lease = await leaseInfo(deps.service, space)
+        const choices = await statusChoices(deps, space, workflows)
         if (bound === undefined) {
           return success(
             `空间 ${space.root} 尚未绑定需求；可用流程：${formatList(workflows)}`,
@@ -329,6 +331,7 @@ function taktStatusTool(deps: ToolDeps): DefineToolOptions {
               bound: false,
               space: { root: space.root },
               workflows,
+              ...choices,
               lease,
               initialization: {
                 steps: [
@@ -381,6 +384,7 @@ function taktStatusTool(deps: ToolDeps): DefineToolOptions {
             runStatus,
             lease,
             workflows,
+            ...choices,
           },
           nextActions,
         )
@@ -1257,6 +1261,8 @@ function taktRunTool(deps: ToolDeps): DefineToolOptions {
       '何时用：需求已绑定且需要推进流程时；用 get 查看节点状态和待办。',
       '何时不用：不要用未支持的 action 绕过审批；cancel 只用于确实要终止的运行。',
       '示例：{"action":"start","requestKey":"run-20261105-01"}',
+      '选流程：默认流程合适就省略 workflow；换流程时传 workflow 和 reason（默认流程哪里不适合，会记进运行日志）。往重了换自己决定；比默认流程少评审 / 交付校验的流程（takt_status 的 lighterThanDefault 非空）先 takt_ask_human 征得同意，再带 confirmed=true，同一需求同意一次即可。',
+      '示例：{"action":"start","requestKey":"run-20261105-02","workflow":"standard-security","reason":"涉及支付回调，默认流程没有安全评审"}',
       '运行被打断（App 退出、重启或 Lead 会话离线）时不会作废：Lead 会话打开后自动从断点继续；没自动继续时用 resume，不要重新 start 从头跑。',
       '示例：{"action":"get","runId":"run-20261105-0001"}',
       '示例：{"action":"resume","runId":"run-20261105-0001"}',
@@ -1268,7 +1274,9 @@ function taktRunTool(deps: ToolDeps): DefineToolOptions {
         required: true,
         description: 'start / cancel / get / resume；resume 从断点继续被打断（App 退出 / 重启 / Lead 离线）的运行。rerun_from、dispatch、ask 是 P1。',
       },
-      workflow: { type: 'string', description: 'start 可选：流程 ID，默认当前空间配置的第一个流程（无空间流程时 p0-delivery）。' },
+      workflow: { type: 'string', description: 'start 可选：流程 ID；省略时用空间默认流程（用户在流程列表设的偏好）。' },
+      reason: { type: 'string', description: 'start 用的不是默认流程时必填：默认流程哪里不适合这个需求；用户点名的流程就引用用户原话。' },
+      confirmed: { type: 'boolean', description: 'start 的流程比默认流程少评审 / 交付校验、且这个需求还没同意过时必填 true：表示已经在这次 takt_ask_human 里得到用户同意。' },
       requestKey: { type: 'string', description: 'start 必填：稳定幂等键；重试必须相同。' },
       runId: { type: 'string', description: 'cancel / resume 必填；get 可选（不填取最近一次运行）。' },
       args: { type: 'json', description: 'start 可选：传给流程的参数对象。' },
@@ -1301,10 +1309,11 @@ async function startRun(
 ): Promise<LeadToolResult> {
   const requestKey = requestKeyArg(requiredString(args, 'requestKey'))
   const requested = optionalString(args, 'workflow')
-  // 省略 workflow 时取当前空间目录的首个流程；旧 catalog 没有 defaultId 时保留 p0 兼容。
-  const workflowId = requested ?? (deps.service.workflows.defaultId === undefined
+  // 省略 workflow 时取空间默认流程（route.defaultWorkflow，否则登记的第一个）；旧 catalog 没有 defaultId 时保留 p0 兼容。
+  const defaultId = deps.service.workflows.defaultId === undefined
     ? 'p0-delivery'
-    : await deps.service.workflows.defaultId(caller.space))
+    : await deps.service.workflows.defaultId(caller.space)
+  const workflowId = requested ?? defaultId
   // 有效目录必须按空间动态读取（list），不能依赖 ids() 的进程内缓存。
   const ids = deps.service.workflows.list === undefined
     ? deps.service.workflows.ids()
@@ -1317,7 +1326,11 @@ async function startRun(
     )
   }
   const runArgs = optionalJsonObject(args, 'args') ?? {}
+  const choice = workflowId === defaultId ? undefined : await checkWorkflowChoice(caller, args, ids, defaultId, workflowId)
   await deps.service.ownership.ensureLease(caller.space)
+  if (choice?.consent === 'given') {
+    await recordConsent(caller.space, { requirementId: caller.requirementId, workflowId, dropped: choice.dropped, reason: choice.reason, by: leadActor(caller.agent, caller.human) })
+  }
   const started = await deps.service.runs.start({
     space: caller.space,
     requirementId: caller.requirementId,
@@ -1325,6 +1338,9 @@ async function startRun(
     args: runArgs,
     ownerSessionId: caller.sessionId,
     requestKey,
+    ...(choice === undefined ? {} : {
+      note: `选用流程 ${workflowId}（默认流程是 ${defaultId}）：${choice.reason}${choice.dropped.length > 0 ? `；比默认流程少了${choice.dropped.join('、')}，用户已同意` : ''}`,
+    }),
   })
   return success(
     `${started.deduped ? '复用' : '已启动'}运行 ${started.runId}`,
@@ -1332,10 +1348,55 @@ async function startRun(
       runId: started.runId,
       deduped: started.deduped,
       workflow: workflowId,
+      defaultWorkflow: defaultId,
+      ...(choice === undefined ? {} : { choice: { reason: choice.reason, lighterThanDefault: choice.dropped } }),
       audit: { by: caller.human, actor: leadActor(caller.agent, caller.human) },
     },
     [`takt_run get runId="${started.runId}"`, `takt_trace audit runId="${started.runId}"`],
   )
+}
+
+/** takt_status 里的选流程信息；读不出来不影响状态查询。 */
+async function statusChoices(deps: ToolDeps, space: SpaceHandle, ids: readonly string[]): Promise<{ defaultWorkflow: string | null; workflowChoices: WorkflowChoice[] | null }> {
+  try {
+    const defaultId = deps.service.workflows.defaultId === undefined ? undefined : await deps.service.workflows.defaultId(space)
+    return { defaultWorkflow: defaultId ?? null, workflowChoices: await workflowChoices(space, ids, defaultId) }
+  } catch {
+    return { defaultWorkflow: null, workflowChoices: null }
+  }
+}
+
+/**
+ * 不用默认流程时：必须写原因；比默认流程少评审 / 门禁 / 交付校验的，要用户在这次提问里同意（同一需求同意一次即可）。
+ * 往重了换不用问。面板上人自己选流程启动不走这里。
+ */
+async function checkWorkflowChoice(
+  caller: BoundCaller,
+  args: Record<string, unknown>,
+  ids: readonly string[],
+  defaultId: string,
+  workflowId: string,
+): Promise<{ reason: string; dropped: string[]; consent: 'none' | 'remembered' | 'given' }> {
+  const reason = optionalString(args, 'reason')
+  if (reason === undefined) {
+    throw new LeadToolFailure(
+      'TAKT_INVALID_INPUT',
+      `用的不是默认流程 ${defaultId}，要写 reason`,
+      '说明默认流程哪里不适合这个需求（会记进运行日志、给用户看）；用户点名要这个流程就引用用户原话。默认流程合适就省略 workflow。',
+    )
+  }
+  const picked = (await workflowChoices(caller.space, ids, defaultId)).find((item) => item.id === workflowId)
+  const dropped = picked?.lighterThanDefault ?? []
+  if (dropped.length === 0) return { reason, dropped, consent: 'none' }
+  if (await hasConsent(caller.space, caller.requirementId, workflowId, dropped)) return { reason, dropped, consent: 'remembered' }
+  if (args.confirmed !== true) {
+    throw new TaktToolError(
+      'TAKT_FORBIDDEN_FOR_LEAD',
+      `流程 ${workflowId} 比默认流程 ${defaultId} 少了${dropped.join('、')}，需要用户同意`,
+      '先用 takt_ask_human 说明默认流程哪里不合适、换成它少了哪些检查和保障，用户在这次提问里同意后带 confirmed=true 再 start（同一需求同意一次后不再问）。也可以按默认流程跑，或从默认流程复制一份只加不减。',
+    )
+  }
+  return { reason, dropped, consent: 'given' }
 }
 
 async function resumeRun(
