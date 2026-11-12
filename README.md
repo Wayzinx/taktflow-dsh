@@ -1,45 +1,51 @@
-# taktflow for DeepSeek Harness
+<div align="center">
 
-> 🚧 M-J 开发中：历史 P0 演示流程（`p0-delivery`）的真实 dsh + 真实模型批次 25/25 通过；新版标准流程（`taktflow-standard`）的真实 e2e 已执行 5 批，前 4 批未通过（第 1 批 Lead 动态流程目录遗漏已修；第 2/3 批 sandbox 包解析失败已修；第 4 批跑到研发测试 loop，因 REG-001 缺基线环境变量被 judge 升级），第 5 批在研发测试 loop 后升级给人、整体 `ok=false`，标准全链成功尚未验证。模块实现和构建、类型检查与单测为 35 文件 / 548 项通过。P1（从节点重跑、产物回退、配方指纹、归因视图）仍在计划中。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/banner-dark.svg">
+  <img src="docs/assets/readme/banner-light.svg" alt="taktflow for DeepSeek Harness：装一个插件，就多一条 AI 需求交付线" width="100%">
+</picture>
 
-把 [taktflow](https://github.com/Wayzinx/taktflow) 做成 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件：**装一个插件，dsh 就多了一条"需求交付线"**。
+[![taktflow 宣传片：一句话需求，一群 AI 按流程交付（B 站）](docs/assets/readme/promo-preview.webp)](https://www.bilibili.com/video/BV1BPW96kEPg)
 
-- **一个项目一个空间，可承载多个需求。** PRD、设计、用例、证据、报告都放在需求目录里，带版本和来源。
-- **需求群就是 Lead 的会话。** 你和 Lead Agent 对话；Lead 按流程派发职责 Agent（dsh 原生子会话），自己不写代码。
-- **人工入口只接受人，AI 代答不冒充人。** 审批卡片用 dsh 原生的提问卡片，人工入口写入的 actor 是 `human`；`full` 档普通 human 节点由宿主 AI 按冻结证据代答，actor 是 `agent` 且 `onBehalfOf` 是需求绑定的人。主面板看进度、产物和运行。
-- **可追溯、可审计。** 产物版本和声明依赖、运行事件哈希链（带链尾锚点）；从节点重跑、产物回退、配方指纹、归因视图在 P1 计划中。
+### 一句话提需求，一群 AI 按流程交付。<br>Lead 派活，职责 Agent 干活，交叉评审把关，每一步都有据可查。
 
-## 文档
+**[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，开源，MIT。** 装上之后，会话里多一个 taktflow 模式，侧边栏多一个 Taktflow 面板。[开始用](#快速开始)
 
-- [产品方案](docs/01-产品方案.md)：定位、用户旅程、界面、范围与里程碑
-- [技术方案](docs/02-技术方案.md)：架构、dsh 接口用法、权限与生命周期、审计口径、实施计划
-- [spike 记录](docs/spike-notes.md)：在真实 dsh 上的验证结果和踩坑
-- [开发说明](docs/development.md)：内部接口、构建、隔离 e2e
+[![host: DeepSeek Harness](docs/assets/readme/badge-host.svg)](https://github.com/deepseek-ai/deepseek-harness) [![flow: taktflow-standard](docs/assets/readme/badge-flow.svg)](#工作原理) [![agents: 14 roles](docs/assets/readme/badge-agents.svg)](#功能) [![autonomy: full · checkpoints · manual](docs/assets/readme/badge-autonomy.svg)](#自主审批档位) [![license: MIT](docs/assets/readme/badge-license.svg)](LICENSE) [![video: Bilibili](docs/assets/readme/badge-video.svg)](https://www.bilibili.com/video/BV1BPW96kEPg)
 
-## 状态
+[功能](#功能) · [工作原理](#工作原理) · [快速开始](#快速开始) · [信任边界](#信任边界) · [文档](#文档)
 
-| 里程碑 | 内容 | 状态 |
-|---|---|---|
-| P0 骨架 | 打包、安装、宿主加载、Lead preset、最小面板；隔离 profile 下的真实安装验证（S4） | ✅ |
-| P0 业务（历史演示流程） | dsh 原生职责 Agent、权限守卫、单写者租约、审批链路、Lead 工具、主面板；真实 dsh + 真实模型跑 `p0-delivery` 演示流程，最终批次 25/25 | ✅ 历史批次 |
-| M-J 标准流程 | `taktflow-standard`、角色能力、autonomy、run-status、状态工具与文档；构建/类型/单测 35 文件 548 项通过；真实 dsh + 模型 standard e2e 已执行 5 批，前 4 批未通过（目录遗漏与 sandbox 包解析已修；第 4 批跑到 loop，5 轮评审、9 条生成用例 8 过 1 失败，因缺基线环境变量升级）；第 5 批跑到 loop 后升级给人（34 项 26 过 8 失败，`ok=false`） | 🚧 到人工升级，未全链通过 |
-| M-K 评测与缺陷归因宿主 | 复用 M3，接入 Lead 缺陷动作（defects / why / report / attribute / scorecard）、人工归因原生卡片、通知及 recipe 追溯；可写角色的受控自测工具 `takt_selftest`（见 [docs/controlled-selftest.md](docs/controlled-selftest.md)）；构建/类型/单测 39 文件 665 项通过。真实 dsh + 模型用 quick-fix 跑完需求 → 自测 → 独立评审 → 交付校验 → 报缺陷 → auditor 归因 → 卡片人工确认 → Lead 汇报，第 7 批 25/25 | ✅ 归因确认闭环；回放评测与前端未真实验收 |
-| M-L 可视化与对话式配置 | 设置页改成表单（运行策略、角色、技能、知识源），新建 / 复制 / 删除，修改记录可恢复；Workflow 页新建（模板 / 复制）、改名、设默认、删除；面板“告诉 Lead”与 Lead 的 `takt_config`（第 7 个工具）走同一套操作；dsh 下不显示模型与 Harness、成员；角色可选 App 里的模型；多空间与旧空间一键升级；本机旧宿主进程已退出时自动接管租约；面板在 App 常见宽度下的布局修复 | ✅ 单测 41 文件 676 项；隔离 dsh web 实测设置、流程新建、升级、告诉 Lead（真实模型对话待模型服务恢复后补测） |
-| 普通会话交给 Taktflow、Lead 绑定代码仓库 | 标准模式等普通会话里有 `taktflow_handoff`：遇到需求开发类任务时弹原生卡片征求同意，同意后在空间目录新开 Taktflow 会话并带上需求和仓库；Lead 和职责角色看不到它。Lead 的 `takt_config` 新增 `repo_add` / `repo_sync`：给 git 地址或本机路径即可绑定（id 默认 app）并立即同步，失败当场说明 | ✅ 单测 52 文件 795 项；隔离 dsh web + 真实模型：标准会话自主转交 → 卡片确认 → Lead 依次 init、repo_add、建需求、写 inputs/request.md、启动流程 |
-| P1 / P2 | 从节点重跑、产物回退、配方与归因完整视图；M3 宿主接入以 M-K 行及 spike 新节为准 | 后续及前端整合范围 |
+</div>
 
-第 5 批最终结果：run `run-20261106-124857-4d67`，34 项验收 26 通过 / 8 失败、整体 `ok=false`；生成 12 条业务用例首轮 9 过 3 失败，独立 6 项产品 AC 通过；研发测试 loop 的 judge 停在 `waiting_human`，最终升级待办保持未回答。未到质量报告/准出/知识回流，不宣称标准全链通过。证据归档见 `e2e/out/standard-history/`。
+<br>
 
-## 信任边界
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/hero-dark.webp">
+  <img src="docs/assets/readme/hero-light.webp" alt="taktflow 在 DeepSeek Harness 里：Lead 会话建需求并启动流程，运行页上职责 Agent 沿交付线推进，代码评审抓到混进 diff 的空测试文件" width="100%">
+</picture>
 
-- **人工入口不允许 AI 冒充人。** 原生审批卡片和主面板入口写入的 actor 都是 `human`；`takt_ask_human` 不能由子 Agent 直接调用。AI 代答只发生在 `autonomy` 允许的普通 human answer 和 `full` 档 approve，actor 是 `agent` 且 `onBehalfOf` 必须是需求绑定的人，决策正文写到 `decisions/auto-answers/`，事件链可校验。
-- **AI 不伪造人工决定。** 低置信度、blocker、未解决项、准出材料缺失/截断、loop 耗尽、judge 路由到 human 时一律升级给人，待办保持未回答；不会用固定答案冒充 AI 判断。
-- **dsh-host 下的职责 Agent 默认没有 shell。** 声明了 `readScope`/`writeScope` 的角色按声明限制，未声明 `readScope` 表示不额外限读；路径先规范化再 realpath，越界、符号链接和未知工具类型 fail closed。`dsh-host` 模式统一用 App 模型；`profile` 模式走外部 CLI/fallback，shell 能力由 CLI 自身决定，不由 dsh 工具守卫保证。流程模块和函数型 `script` 回调在宿主进程内执行；字符串形式 `script` 与环境命令由宿主以 `sh -c` 子进程执行，但没有额外安全沙箱。
-- **技能按角色隔离。** 角色档案只看到自己声明的 skills；运行开始时冻结 SKILL.md 正文，等待期间改文件不会改变已启动节点的能力，实际注册的技能会写进 trace。
-- **单写者。** 每个空间同一时间只有一个宿主持有租约；审批落账、运行推进和卸载清理都先校验租约，避免 CLI 与插件同时写。
-- **仓库隔离。** 每个任务使用独立 worktree；标准流程按 `app` 引用主仓库，只有“唯一 legacy main”会追加别名并保留 `main`，多仓库不会被改名合并。
+<p align="center"><sub>演示项目 tiny-todo（命令行待办清单）的真实运行截图：DeepSeek Harness + taktflow + deepseek-v4.1-flash。</sub></p>
 
-## 标准流程
+## 视频介绍
+
+1 分 44 秒看完：从一句话需求，到 AI 拿不准就升级给人、交叉评审打回、代码评审抓到“假绿”，全是真实运行录屏，流水线部分为延时摄影。**[在 B 站观看](https://www.bilibili.com/video/BV1BPW96kEPg)**
+
+## 功能
+
+- **一句话，Lead 接单。** 在 taktflow 模式里说需求，Lead Agent 初始化空间、建需求、选流程、启动运行，跑完回来汇报。它只派活，不写代码。普通会话遇到开发类需求时，也会弹卡片问你要不要交给 Taktflow。
+- **一条完整的交付线。** 默认流程 `taktflow-standard`：需求澄清 → PRD → 系分 → 测分 → 对齐冻结 → 研发 → 用例自动化 → 研发测试 Loop → 影响面评估 → 准出，9 个阶段、30 个节点。[工作原理](#工作原理)
+- **职责 Agent 分工，互相把关。** 产品、架构、测试设计、开发、自动化、评审、判决、准出等 14 个角色，每个节点交给 dsh 原生子 Agent。PRD、设计、用例、脚本和代码都要过交叉评审，不过就打回重做；用例失败先判决根因，再决定修代码、修脚本还是修用例。
+- **不瞎猜，人只在关键处出场。** 需求有歧义先澄清；AI 代答拿不准就升级给人，用 dsh 原生卡片问你，回答一次，流水线自动继续。审批档位分 full、checkpoints、manual 三档。[自主审批档位](#自主审批档位)
+- **职责隔离。** 测试 Agent 看不到产品代码，只按 PRD 和接口契约写用例；读写范围和技能都按角色隔离，越界即拦截；每个开发任务用独立 worktree。[信任边界](#信任边界)
+- **全程可追溯。** 产物带版本、作者和溯源；每个节点有配方指纹（角色档案、Prompt、技能、模型）；运行事件是带链尾锚点的哈希链；缺陷能归因到引入它的环节。
+- **流程即代码。** 流程是 TypeScript 文件，也能在面板里可视化编辑，改动都有修订记录。默认流程是你的偏好：Lead 换更重的流程要写明原因，换更轻的要你同意。
+- **不怕中断。** App 退出、重启或崩溃后，运行从断点继续，已完成的节点保留。
+
+<p align="center"><img src="docs/assets/readme/screens.webp" alt="四张真实截图：AI 代答拿不准时升级给人；测试设计角色限制可读范围；节点配方指纹；可视化编辑流程" width="100%"></p>
+
+## 工作原理
+
+一个项目一个 taktflow 空间：`takt.config.json` 加上 `agents/`、`workflows/`、`skills/`、`knowledge/`、`requirements/` 几个目录，PRD、设计、用例、证据和报告都放在需求目录里，带版本和来源。需求群就是 Lead 的会话；插件在 dsh 宿主里跑流程引擎，把每个节点派给对应角色的子 Agent，主面板看进度、产物、待办和运行。
 
 ```mermaid
 flowchart LR
@@ -54,9 +60,9 @@ flowchart LR
   I --> R[准出<br/>质量报告/准出评审/知识回流]
 ```
 
-角色按各自声明的 `readScope`/`writeScope` 读写（未声明 `readScope` 表示不额外限读）：`pm` 负责需求与知识回流，`architect` 负责系分与实现拆分，`test-designer` 负责测分/用例，`dev` 只改产品代码，`reviewer` 做代码与架构评审，`release-reviewer` 只读准出材料。评审节点先由多个 reviewer 交叉评审，`humanSignoff` 打开时再弹原生审批卡；打回会进入 rework 或按耗尽策略升级。
+角色按各自声明的 `readScope` / `writeScope` 读写（未声明 `readScope` 表示不额外限读）：`pm` 负责需求与知识回流，`architect` 负责系分与实现拆分，`test-designer` 负责测分和用例，`dev` 只改产品代码，`reviewer` 做代码与架构评审，`release-reviewer` 只读准出材料。评审节点先由多个 reviewer 交叉评审，`humanSignoff` 打开时再弹原生审批卡；打回会进入 rework，或按耗尽策略升级给人。
 
-## 自主审批档位
+### 自主审批档位
 
 | `autonomy` | 普通 human `answer` | 普通 human `approve` | review `humanSignoff` | 适用 |
 |---|---|---|---|---|
@@ -64,21 +70,55 @@ flowchart LR
 | `checkpoints` | AI（`pm`） | 人 | 保持流程定义 | 半自动，准出必须人批 |
 | `manual` | 人 | 人 | 保持流程定义 | 全程人工把关 |
 
-空间 `takt.config.json` 的 `autonomy` 覆盖插件默认值；非法值明确失败，不静默降级。Lead `takt_status` / `takt_run get` 的 `runStatus` 会列出当前阶段、评审轮次、loop 轮次、待办以及真实升级原因/来源（决策产物路径@版本）；HTTP GET `p=run` 仍返回 core `RunDetail`。
+空间 `takt.config.json` 的 `autonomy` 覆盖插件默认值；非法值明确失败，不静默降级。Lead 的 `takt_status` / `takt_run get` 会列出当前阶段、评审轮次、loop 轮次、待办，以及真实的升级原因和来源。
 
-## 在 dsh 里怎么用
+## 快速开始
 
-1. 安装插件（构建和打包见“开发”）：
+1. **构建并打包插件**（需要 Node 20.12+）：
 
    ```bash
+   git clone --recursive https://github.com/Wayzinx/taktflow-dsh.git
+   cd taktflow-dsh
+   npm install
    npm run build && npm run pack:takt
+   ```
+
+2. **安装到 dsh。** dsh Web：
+
+   ```bash
    dsh plugin --profile web add /absolute/path/to/taktflow-0.0.0.tgz
    ```
 
-2. 打开 dsh Web，在侧边栏新建一个 **taktflow** preset 会话，工作目录指向你的项目根。
-3. 直接对 Lead 说人话，例如：“这个目录还不是 taktflow 空间，帮我初始化，然后建一个需求：给 `src/add.js` 增加 `sub(a, b)` 函数并补测试，建好后直接启动标准交付流程。”
-4. Lead 会依次初始化空间、创建并绑定需求、启动 `taktflow-standard`。默认 `full` 档：普通澄清和准出由宿主 AI（`pm` / `release-reviewer`）按冻结证据代答或判定，低置信、blocker、证据不足才升级给人；需要人工检查点时把 `autonomy` 设为 `checkpoints` 或 `manual`。
-5. 在主面板看需求、运行、待办和产物版本；运行结束后 Lead 会收到 `[taktflow]` 通知并汇报结果。`dsh-host` 下职责 Agent 默认没有 shell，代码改动由 dsh 子 Agent 完成；流程的字符串 `script` 与环境命令由宿主以子进程执行 shell；函数型 `script` 在宿主进程内执行，都不是安全沙箱。
+   DeepSeek Harness 桌面 App 的 profile 由 App 管理，要用 App 自带的命令行安装（macOS 示例），装完退出并重开 App：
+
+   ```bash
+   "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh" plugin --profile desktop add /absolute/path/to/taktflow-0.0.0.tgz
+   ```
+
+3. **新建一个 taktflow 模式的会话**，工作目录指向你的项目根，直接对 Lead 说人话，例如：
+
+   > 这个目录还不是 taktflow 空间，帮我初始化，然后建一个需求：给 `src/add.js` 增加 `sub(a, b)` 函数并补测试，建好后直接按默认流程开始。
+
+4. **在 Taktflow 面板看进度**：需求、运行、待办和产物版本都在这里；运行结束后 Lead 会收到通知并汇报结果。
+
+<sub>模型网关较慢时，给 dsh 的模型提供方配置 `timeoutMs`（例如 `600000`），避免长上下文请求超时；设了 HTTP 代理时，把模型端点的确切主机名加进 `NO_PROXY`（dsh 不认网段写法）。详见 [开发说明](docs/development.md)。</sub>
+
+## 信任边界
+
+- **人工入口不允许 AI 冒充人。** 原生审批卡片和主面板入口写入的 actor 都是 `human`；`takt_ask_human` 不能由子 Agent 直接调用。AI 代答只发生在 `autonomy` 允许的普通 human answer 和 `full` 档 approve，actor 是 `agent` 且 `onBehalfOf` 必须是需求绑定的人，决策正文写到 `decisions/auto-answers/`，事件链可校验。
+- **AI 不伪造人工决定。** 低置信度、blocker、未解决项、准出材料缺失或截断、loop 耗尽、judge 路由到 human 时一律升级给人，待办保持未回答。
+- **职责 Agent 默认没有 shell。** 声明了 `readScope` / `writeScope` 的角色按声明限制；路径先规范化再 realpath，越界、符号链接和未知工具类型 fail closed。流程模块和函数型 `script` 在宿主进程内执行，字符串 `script` 与环境命令由宿主以 `sh -c` 子进程执行，都不是安全沙箱。
+- **技能按角色隔离。** 角色只看到自己声明的 skills；运行开始时冻结 SKILL.md 正文，实际注册的技能写进 trace。
+- **单写者。** 每个空间同一时间只有一个宿主持有租约；审批落账、运行推进和卸载清理都先校验租约。
+- **仓库隔离。** 每个任务使用独立 worktree，不动你的主分支。
+
+## 当前状态
+
+早期开发中。P0 骨架、缺陷归因、可视化配置、普通会话转交、断点续跑已经完成；标准流程 `taktflow-standard` 在真实 dsh + 真实模型上已能跑到研发测试 Loop，全链端到端通过还没有验证。里程碑和每批真实验证的结果见 [docs/status.md](docs/status.md)。
+
+## 文档
+
+[产品方案](docs/01-产品方案.md) · [技术方案](docs/02-技术方案.md) · [真实流程说明](docs/real-flow.md) · [受控自测](docs/controlled-selftest.md) · [spike 记录](docs/spike-notes.md) · [开发说明](docs/development.md) · [里程碑与验证](docs/status.md)
 
 ## 开发
 
@@ -89,20 +129,26 @@ npm install
 npm run build && npm run typecheck && npm test
 ```
 
-`vendor/taktflow` 是 taktflow 的 git 子模块，构建时直接打包它的源码，所以插件没有运行时依赖。联调本地的 taktflow checkout 可以设 `TAKTFLOW_DIR=/path/to/taktflow`。
+`vendor/taktflow` 是 [taktflow](https://github.com/Wayzinx/taktflow) 的 git 子模块，构建时直接打包它的源码，所以插件没有运行时依赖。联调本地的 taktflow checkout 可以设 `TAKTFLOW_DIR=/path/to/taktflow`。
 
 在隔离的 dsh profile 里做端到端验证（不会动你自己的 `~/.dsh`），需要一个兼容 OpenAI chat completions 的模型端点：
 
 ```bash
-TAKT_E2E_BASE_URL=... TAKT_E2E_MODEL=... TAKT_E2E_API_KEY=... npm run e2e       # profile + boot
-TAKT_E2E_BASE_URL=... TAKT_E2E_MODEL=... TAKT_E2E_API_KEY=... node e2e/p0.mjs  # 完整 P0（历史演示流程）
-TAKT_E2E_BASE_URL=... TAKT_E2E_MODEL=... TAKT_E2E_API_KEY=... node e2e/standard.mjs  # 完整 standard
+TAKT_E2E_BASE_URL=... TAKT_E2E_MODEL=... TAKT_E2E_API_KEY=... npm run e2e           # profile + boot
+TAKT_E2E_BASE_URL=... TAKT_E2E_MODEL=... TAKT_E2E_API_KEY=... node e2e/p0.mjs        # 完整 P0（历史演示流程）
+TAKT_E2E_BASE_URL=... TAKT_E2E_MODEL=... TAKT_E2E_API_KEY=... node e2e/standard.mjs  # 完整标准流程
 ```
 
-P0 脚本会跑初始化、建需求、启动、人工审批、产物/测试/审计/面板/通知，脱敏结果写到 `e2e/out/p0-result.json`。standard 脚本跑完整标准流程；真实 e2e 已执行 5 批，前 4 批未通过，第 5 批跑到研发测试 loop 后升级给人、整体 `ok=false`，标准全链成功尚未验证；批次证据归档在 `e2e/out/standard-history/`。
+## Star History
 
-如果环境里设了 HTTP 代理，记得把模型端点的确切主机名加进 `NO_PROXY`（dsh 不认网段写法），见 [开发说明](docs/development.md)。
+<a href="https://www.star-history.com/#Wayzinx/taktflow-dsh&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Wayzinx/taktflow-dsh&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Wayzinx/taktflow-dsh&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Wayzinx/taktflow-dsh&type=Date" />
+  </picture>
+</a>
 
 ## 许可
 
-MIT
+[MIT](LICENSE)

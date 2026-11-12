@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="300" viewBox="0 0 1280 300" lang="zh-CN">
+<title>taktflow for DeepSeek Harness：装一个插件，就多一条 AI 需求交付线</title>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0b1020"/><stop offset="1" stop-color="#111827"/></linearGradient>
+  <radialGradient id="g1" cx="360" cy="80" r="420" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4d6bfe" stop-opacity="0.28"/><stop offset="1" stop-color="#4d6bfe" stop-opacity="0"/></radialGradient>
+  <radialGradient id="g2" cx="980" cy="260" r="460" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#38bdf8" stop-opacity="0.16"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0"/></radialGradient>
+  <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="1"/></pattern>
+  <radialGradient id="fade" cx="640" cy="150" r="560" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fff" stop-opacity="1"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>
+  <mask id="m"><rect width="1280" height="300" fill="url(#fade)"/></mask>
+  <filter id="lift" x="-30%" y="-30%" width="160%" height="170%"><feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#0f172a" flood-opacity="0.45"/></filter>
+  <clipPath id="frame"><rect width="1280" height="300" rx="20"/></clipPath>
+</defs>
+<g clip-path="url(#frame)">
+  <rect width="1280" height="300" fill="url(#bg)"/>
+  <rect width="1280" height="300" fill="url(#grid)" mask="url(#m)"/>
+  <rect width="1280" height="300" fill="url(#g1)"/>
+  <rect width="1280" height="300" fill="url(#g2)"/>
+  <g filter="url(#lift)"><g transform="translate(318,58) scale(2.0625)"><rect width="64" height="64" rx="14" fill="#0f172a" stroke="#334155" stroke-width="1"/><path d="M16 20h32M32 20v26" fill="none" stroke="#38bdf8" stroke-width="6" stroke-linecap="round"/><circle cx="16" cy="46" r="5" fill="#38bdf8"/><circle cx="48" cy="46" r="5" fill="#38bdf8"/><path d="M16 46h32" fill="none" stroke="#38bdf8" stroke-width="4" stroke-linecap="round"/></g></g>
+  <text x="482" y="140" font-family="-apple-system, 'SF Pro Display', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="86" font-weight="700" letter-spacing="-2" fill="#f8fafc">taktflow</text>
+  <text x="486" y="186" font-family="-apple-system, 'SF Pro Display', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="30" font-weight="500" fill="#94a3b8">for DeepSeek Harness</text>
+  <text x="640" y="256" text-anchor="middle" font-family="-apple-system, 'SF Pro Display', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="28" font-weight="600" fill="#cbd5e1">装一个插件，就多一条 <tspan fill="#8ea2ff">AI 需求交付线</tspan></text>
+</g>
+</svg>
