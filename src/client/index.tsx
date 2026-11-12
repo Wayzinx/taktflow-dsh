@@ -85,16 +85,31 @@ function hostOpenSession(): ((sessionId: string) => void) | undefined {
   return (sessionId) => workspace.openSession!(sessionId)
 }
 
-/** 把作用域化后的样式挂到 head，面板卸载时移除。 */
-function useScopedStyle(): void {
+/** 把样式挂到 head，组件卸载时移除。默认是作用域化后的面板样式。 */
+function useScopedStyle(css: string = __taktflowCss): void {
   useEffect(() => {
     const style = document.createElement('style')
     style.dataset.taktflow = 'true'
-    style.textContent = __taktflowCss
+    style.textContent = css
     document.head.append(style)
     return () => style.remove()
-  }, [])
+  }, [css])
 }
+
+/**
+ * 会话 Tab 的外层标记。`data-conversation-composer-overlay` 是 dsh 给自己管滚动的 View 的约定（轨迹、统计 View 也这样用）：
+ * View 撑满对话区、在内部滚动，不随内容把对话区撑高；`data-taktflow-view` 给下面的规则认出本 Tab。
+ */
+const SESSION_VIEW_ATTRS = { 'data-conversation-composer-overlay': '', 'data-taktflow-view': '' }
+
+/**
+ * dsh 的对话输入框对每个 View 都显示；在 Taktflow Tab 里藏起来：页面有自己的入口，输入框浮在底部只会挡住内容。
+ * 只藏默认输入框（composer chain 的 fallback，dsh 用内联 display 切换，所以要 !important）；
+ * 审批 / 提问卡片是 takeover，照常显示。规则只在本 Tab 挂载时命中，切回“对话”就恢复。
+ * 不经过作用域转换：选择的是 dsh 自己的节点。
+ */
+const HIDE_COMPOSER_CSS =
+  '[data-conversation-scroll]:has([data-taktflow-view]) > [data-composer-seat] [data-chain-overlay-fallback="conversation.composer"] { display: none !important; }'
 
 function Notice({ title, children }: { title: string; children?: ReactNode }): ReactElement {
   return (
@@ -222,9 +237,11 @@ type SessionViewState =
  *
  * 绑定了需求就打开需求页；会话目录是空间但还没绑定就打开总览；都不是就给出引导。
  * 还没有空间时每 5 秒重查一次，Lead 初始化或绑定后自动切过去。
+ * 这个 Tab 不显示 dsh 的对话输入框（见 HIDE_COMPOSER_CSS）。
  */
 function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement {
   useScopedStyle()
+  useScopedStyle(HIDE_COMPOSER_CSS)
   const [state, setState] = useState<SessionViewState>({ status: 'loading' })
   const [attempt, setAttempt] = useState(0)
 
@@ -261,11 +278,19 @@ function TaktflowSessionView({ sessionId }: { sessionId: string }): ReactElement
   const info = state.status === 'ready' ? state.info : undefined
   const source = useMemo(() => (info?.space ? createDshSource(info.space, { openSession: hostOpenSession() }) : undefined), [info?.space])
 
-  if (info && source) {
-    // key：需求变化（刚绑定）或空间变化时重新挂载，让内存路由回到需求页且不串空间数据。
-    const path = info.requirementId ? `/req/${encodeURIComponent(info.requirementId)}` : '/'
-    return <TaktflowEmbed key={`${info.space}:${path}`} source={source} theme={dshTheme} initialPath={path} draftScope={`session:${sessionId}:${info.space}`} />
-  }
+  // key：需求变化（刚绑定）或空间变化时重新挂载，让内存路由回到需求页且不串空间数据。
+  const path = info?.requirementId ? `/req/${encodeURIComponent(info.requirementId)}` : '/'
+  return (
+    // 撑满 dsh 的 View 区（flex 列），里面的嵌入根 / 提示页按 100% 高度排。
+    <div {...SESSION_VIEW_ATTRS} style={{ display: 'flex', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
+      {info && source
+        ? <TaktflowEmbed key={`${info.space}:${path}`} source={source} theme={dshTheme} initialPath={path} draftScope={`session:${sessionId}:${info.space}`} />
+        : <SessionViewNotice state={state} onRetry={retry} />}
+    </div>
+  )
+}
+
+function SessionViewNotice({ state, onRetry: retry }: { state: SessionViewState; onRetry: () => void }): ReactElement {
   return (
     <div className="takt-root">
       {state.status === 'loading' && (
