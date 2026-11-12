@@ -41,7 +41,10 @@
 - **流程即代码。** 流程是 TypeScript 文件，也能在面板里可视化编辑，改动都有修订记录。默认流程是你的偏好：Lead 换更重的流程要写明原因，换更轻的要你同意。
 - **不怕中断。** App 退出、重启或崩溃后，运行从断点继续，已完成的节点保留。
 
-<p align="center"><img src="docs/assets/readme/screens.webp" alt="四张真实截图：AI 代答拿不准时升级给人；测试设计角色限制可读范围；节点配方指纹；可视化编辑流程" width="100%"></p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/screens-dark.webp">
+  <img src="docs/assets/readme/screens.webp" alt="四张真实截图：AI 代答拿不准时升级给人；测试设计角色限制可读范围；节点配方指纹；可视化编辑流程" width="100%">
+</picture>
 
 ## 工作原理
 
